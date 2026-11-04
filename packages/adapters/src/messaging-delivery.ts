@@ -8,7 +8,12 @@ import type {
 } from "@rakazo/adapter-kit";
 import { messagingDeliverJob, runContinueJob } from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
-import { botMessageHopExhausted, nextBotMessageHop, pageLinksAsTitles } from "@rakazo/core";
+import {
+  botMessageHopExhausted,
+  chatAppAskText,
+  nextBotMessageHop,
+  pageLinksAsTitles,
+} from "@rakazo/core";
 import type { PrismaClient, ThreadEvents } from "@rakazo/db";
 import {
   appendEventInTransaction,
@@ -133,7 +138,8 @@ async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<vo
   const linkedPages = linkedPageIds(messages);
   const rows = messages
     .flatMap((message) => {
-      const body = extractText(message.blocks, linkedPages);
+      // A 1:1 chat also gets the run's pending questions as text (chat apps cannot show cards).
+      const body = extractText(message.blocks, linkedPages, { asks: true });
       const parts = body ? splitOutboundBody(identity.provider, body) : [];
       return [
         ...parts.map((part, index) => ({
@@ -758,13 +764,21 @@ function linkedPageIds(messages: readonly { blocks: unknown }[]): Set<string> {
  * The text other channels get. A page card cannot travel, so a page the reply does not name goes
  * as its title.
  */
-function extractText(blocks: unknown, linkedPages: ReadonlySet<string>): string {
+function extractText(
+  blocks: unknown,
+  linkedPages: ReadonlySet<string>,
+  options: { asks?: boolean } = {},
+): string {
   if (!Array.isArray(blocks)) return "";
   return blocks
     .flatMap(
       (block: { kind?: unknown; text?: unknown; pageId?: unknown; title?: unknown } | null) => {
         if (block?.kind === "text" && typeof block.text === "string")
           return [pageLinksAsTitles(block.text)];
+        if (options.asks && block?.kind === "ask") {
+          const ask = chatAppAskText(block as Parameters<typeof chatAppAskText>[0]);
+          return ask ? [ask] : [];
+        }
         if (
           block?.kind === "page" &&
           typeof block.title === "string" &&

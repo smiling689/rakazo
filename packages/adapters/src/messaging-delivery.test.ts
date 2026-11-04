@@ -275,6 +275,47 @@ describe("deliverMessagingOutbound", () => {
     });
   });
 
+  it("sends a pending question as numbered options, and an approval as a pointer to the app", async () => {
+    const deps = createDeps({
+      messages: [
+        {
+          id: "m-1",
+          blocks: [
+            {
+              kind: "ask",
+              text: "Which one?",
+              status: "pending",
+              actions: [
+                { id: "choice-1", label: "Red" },
+                { id: "choice-2", label: "Blue" },
+              ],
+            },
+          ],
+        },
+        {
+          id: "m-2",
+          blocks: [
+            {
+              kind: "ask",
+              text: "Send the email?",
+              approvalEffectId: "eff-1",
+              actions: [
+                { id: "allow", label: "Allow" },
+                { id: "deny", label: "Deny" },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    await deliverMessagingOutbound(deps, { runId: "run-1" }, context);
+
+    expect(sentBodies(deps)).toEqual([
+      "Which one?\n1. Red\n2. Blue\nReply with a number to choose.",
+      "Send the email?\n(This waits for you in the app.)",
+    ]);
+  });
+
   it("sends a page the bot named as its title, never as an app-only page link", async () => {
     const deps = createDeps({
       messages: [

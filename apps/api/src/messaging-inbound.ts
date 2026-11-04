@@ -9,6 +9,7 @@ import type { MessageBlock } from "@rakazo/contracts";
 import { ATTACHMENT_MAX_COUNT, isAttachmentAudioMimeType } from "@rakazo/contracts";
 import type { MessagingCommand } from "@rakazo/core";
 import {
+  chatAppAskChoice,
   displayName,
   messageBlockForArtifact,
   normalizeVoiceTranscript,
@@ -47,7 +48,8 @@ import {
 
 export interface MessagingInboundDeps {
   prisma: PrismaClient;
-  events: Pick<ThreadEvents, "sendUserMessage" | "notify">;
+  events: Pick<ThreadEvents, "sendUserMessage" | "notify"> &
+    Partial<Pick<ThreadEvents, "answerRunInput">>;
   jobs: Pick<JobPublisher, "enqueue">;
   sandbox: SandboxProvider;
   provision: (
@@ -194,6 +196,9 @@ async function handleDirectEvent(
       deps.signupPolicy,
     );
   }
+
+  if (existing && attachments.length === 0 && (await answerPendingChoice(deps, ids, event.content)))
+    return;
 
   const stored = await storeInboundMedia(deps, ids, event);
 
@@ -928,6 +933,49 @@ async function handleChannelEvent(
       });
     }
   }
+}
+
+/**
+ * A reply that picks an option of the bot's pending question (its number or its exact label) answers that
+ * question, as tapping it in the app would. Anything else, and approvals or secret requests, stay ordinary
+ * messages.
+ */
+async function answerPendingChoice(
+  deps: MessagingInboundDeps,
+  ids: ProvisionedMessagingIdentity,
+  reply: string,
+): Promise<boolean> {
+  if (!deps.events.answerRunInput || !reply.trim() || reply.length > 200) return false;
+  const waiting = await deps.prisma.run.findMany({
+    where: { threadId: ids.threadId, botId: ids.botId, status: "waiting_input" },
+    select: { id: true },
+  });
+  if (waiting.length === 0) return false;
+  const latest = await deps.prisma.message.findFirst({
+    where: { threadId: ids.threadId, role: "bot", runId: { in: waiting.map((run) => run.id) } },
+    orderBy: { seq: "desc" },
+    select: { id: true, runId: true, blocks: true },
+  });
+  if (!latest?.runId || !Array.isArray(latest.blocks)) return false;
+  const ask = (latest.blocks as MessageBlock[]).find(
+    (block) => block.kind === "ask" && block.status !== "answered",
+  );
+  const choice = ask ? chatAppAskChoice(ask, reply) : undefined;
+  if (!choice) return false;
+  const answered = await deps.events.answerRunInput({
+    spaceId: ids.spaceId,
+    threadId: ids.threadId,
+    runId: latest.runId,
+    messageId: latest.id,
+    answeredByUserId: ids.userId,
+    answer: choice.label,
+  });
+  if (!answered) return false;
+  await deps.jobs.enqueue(runContinueJob(latest.runId)).catch((error) => {
+    // The answer is durable; the reconciler repairs a missed wake.
+    getLogger().error("messaging answer enqueue", error);
+  });
+  return true;
 }
 
 async function inviteMember(
