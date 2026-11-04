@@ -299,10 +299,12 @@ export const fleetTools: ToolHandlers = {
     let readOffset = 0;
     if (argumentGiven(instructionsOffsetArg)) {
       const parsedOffset = Number(instructionsOffsetArg);
-      if (!read)
+      if (!read) {
+        const extra = Object.keys(writeArgs).filter((key) => argumentGiven(writeArgs[key]));
         return call.finish({
-          error: "instructions_offset only works on a read: call update_bot with no other fields.",
+          error: `instructions_offset only works on a read: call update_bot with no other fields (you also passed ${extra.join(", ")}).`,
         });
+      }
       if (!Number.isInteger(parsedOffset) || parsedOffset < 0)
         return call.finish({ error: "instructions_offset must be a whole number of 0 or more." });
       readOffset = parsedOffset;
