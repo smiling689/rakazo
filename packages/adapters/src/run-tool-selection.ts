@@ -82,13 +82,19 @@ export function selectBuiltinToolsForRun(options: {
   fleetManagement?: boolean;
   /** A follow-up run whose source message the user wrote. */
   followUpFromUser?: boolean;
+  /** The owner's own direct message from a linked chat app (see isOwnerStartedRun). */
+  ownerDirectMessage?: boolean;
   /** The person who started this run has their desktop connected (see userComputerOwner). */
   userComputer?: boolean;
   /** That desktop can look at and drive its apps. */
   userComputerScreen?: boolean;
 }) {
   const disabled = disabledBuiltinToolSet(options.disabledBuiltinTools);
-  const ownerStartedRun = isOwnerStartedRun(options.trigger, Boolean(options.followUpFromUser));
+  const ownerStartedRun = isOwnerStartedRun(
+    options.trigger,
+    Boolean(options.followUpFromUser),
+    Boolean(options.ownerDirectMessage),
+  );
   return selectCloudAgentTools(
     selectMemoryTools(
       filterBuiltinToolsForRun(

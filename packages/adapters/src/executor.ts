@@ -1167,8 +1167,11 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
             ));
           }
         }
+        // The owner's own direct message from a linked chat app counts like one sent in the app.
+        const ownerDirectMessage = run.trigger === "messaging" && !nonOwnerChatRun;
         const sourceMessage =
-          (run.trigger === "user" || run.trigger === "follow_up") && run.sourceMessageId
+          (run.trigger === "user" || run.trigger === "follow_up" || ownerDirectMessage) &&
+          run.sourceMessageId
             ? await deps.prisma.message.findUnique({
                 where: { id: run.sourceMessageId },
                 select: { clientNonce: true, role: true, blocks: true, threadId: true },
@@ -1177,7 +1180,11 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
         // Calls carry no schema flag: the sending client encodes them in the clientNonce.
         const sourceClientNonce = sourceMessage?.clientNonce ?? null;
         // A follow-up can be queued by a bot (group handoffs); only the user's own counts.
-        const ownerStartedRun = isOwnerStartedRun(run.trigger, sourceMessage?.role === "user");
+        const ownerStartedRun = isOwnerStartedRun(
+          run.trigger,
+          sourceMessage?.role === "user",
+          ownerDirectMessage && sourceMessage?.role === "user",
+        );
         // A hang-up run has no source message: its own nonce carries the call it closes.
         const callEndRun = run.trigger === "call_end";
         const callClientNonceForRun = callEndRun ? run.clientNonce : sourceClientNonce;
@@ -1227,6 +1234,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
             disabledBuiltinTools: bot.disabledBuiltinTools,
             fleetManagement: bot.fleetManagement,
             followUpFromUser: sourceMessage?.role === "user",
+            ownerDirectMessage: ownerDirectMessage && sourceMessage?.role === "user",
             userComputer: userComputer === "connected",
             userComputerScreen,
           }),

@@ -182,11 +182,17 @@ export function toolRequiresExplicitApproval(toolName: string): boolean {
 }
 
 /**
- * A run the owner started: their own message, a follow-up they wrote, or the close of their call.
+ * A run the owner started: their own message, a follow-up they wrote, the close of their call, or
+ * their direct message from a linked chat app (`ownerDirectMessage`: no channel, no team chat).
  * Bot messages, channels, spawns, tickets, webhooks and routines are not, nor is anything new.
  */
-export function isOwnerStartedRun(trigger: string, followUpFromUser: boolean): boolean {
+export function isOwnerStartedRun(
+  trigger: string,
+  followUpFromUser: boolean,
+  ownerDirectMessage = false,
+): boolean {
   if (trigger === "follow_up") return followUpFromUser;
+  if (trigger === "messaging") return ownerDirectMessage;
   return trigger === "user" || trigger === "call_end";
 }
 
