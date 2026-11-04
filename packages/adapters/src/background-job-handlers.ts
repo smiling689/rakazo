@@ -19,6 +19,7 @@ import {
 import type { PrismaClient, ThreadEvents } from "@rakazo/db";
 import { runAsSystem, runAsTenant } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
+import { relayPeerAsk, retireStaleRelays, settleApprovalRelay } from "./approval-relay.js";
 import { settleCallRequest } from "./call-request.js";
 import type { CloudAgentConnection } from "./cloud-agent-factory.js";
 import { pollCloudAgent } from "./cloud-agent-poll.js";
@@ -84,6 +85,7 @@ export function createBackgroundJobHandlers(deps: {
         artifacts: deps.artifacts,
       }
     : undefined;
+  const relayDeps = { prisma: deps.prisma, events: deps.events, jobs: deps.jobs };
   // The outbox holds every Space's pending sends, so draining it is cross-tenant.
   const drainMessaging = async () => {
     if (!messagingDeps) return;
@@ -125,9 +127,18 @@ export function createBackgroundJobHandlers(deps: {
 
   return {
     "run.continue": asOwner(run, async (payload, execution) => {
+      // A relay card the owner answered: hand the answer on; no model call.
+      if (await settleApprovalRelay(relayDeps, payload.runId)) return;
       if (execution)
         await deps.executor.continueRun(payload.runId, deps.workerId, execution.onRunStarted);
       else await deps.executor.continueRun(payload.runId, deps.workerId);
+      // A bot another bot woke now waits on the owner: show its card where the owner is.
+      await relayPeerAsk(relayDeps, payload.runId).catch((error) => {
+        getLogger().error("approval relay", error);
+      });
+      await retireStaleRelays(relayDeps, payload.runId).catch((error) => {
+        getLogger().error("approval relay retire", error);
+      });
       // Automatic messaging mirror: once the run's bot messages are durable,
       // copy them into the outbox. Never let mirror failures fail the run.
       if (messagingDeps) {
