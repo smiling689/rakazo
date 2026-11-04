@@ -785,8 +785,9 @@ export type MemoryPromptBudget = z.infer<typeof MemoryPromptBudgetSchema>;
 
 /** Every bot and Space keeps its MEMORY.md index; other memory documents can be deleted. */
 export const MEMORY_INDEX_PATH = "MEMORY.md";
-/** What a bot may write to its memory. People can still write more by hand. */
-export const BOT_MEMORY_MAX_BYTES = 4 * 1024;
+/** What a bot may write to its memory. People can still write more by hand. 16 KB (raised from upstream's 4 KB):
+ * the cap counts UTF-8 bytes, so 4 KB held only ~1,300 Chinese characters. */
+export const BOT_MEMORY_MAX_BYTES = 16 * 1024;
 export function isDeletableMemoryDocument(path: string): boolean {
   return path !== MEMORY_INDEX_PATH;
 }

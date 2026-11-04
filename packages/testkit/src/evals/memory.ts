@@ -115,7 +115,7 @@ export const MEMORY_JUDGE_CALIBRATION = [
   },
 ];
 
-export const FULL_MEMORY_SEED = `# Assistant
+const FULL_MEMORY_NOTES = `# Assistant
 
 ${[
   "During our first long conversation the user explained that they work as a product designer at a company called Fernhill Studio, where they mostly design mobile apps for clients.",
@@ -146,6 +146,20 @@ ${[
   "The user said they were going to make a cup of tea before continuing our conversation, and came back a few minutes later to finish reviewing the client brief with me together.",
 ].join("\n")}
 `;
+/**
+ * The notes above filled upstream's 4 KB cap. Small-talk lines (and dots on the last one) bring the seed to
+ * within a few bytes of whatever BOT_MEMORY_MAX_BYTES is, so any appended fact is still refused.
+ */
+function fillToMemoryCap(seed: string): string {
+  let filled = seed;
+  for (let i = 1; ; i++) {
+    const line = `Small talk ${i}: the user chatted briefly and asked for nothing to be remembered.\n`;
+    if (bytes(filled + line) > BOT_MEMORY_MAX_BYTES) break;
+    filled += line;
+  }
+  return `${filled.slice(0, -1)}${".".repeat(BOT_MEMORY_MAX_BYTES - bytes(filled))}\n`;
+}
+export const FULL_MEMORY_SEED = fillToMemoryCap(FULL_MEMORY_NOTES);
 export const MEMORY_EVAL_CASES: EvalCase[] = [
   {
     id: "memory-moved-city",
