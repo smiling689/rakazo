@@ -56,6 +56,56 @@ export function parseUpdateBotPatch(
   return { patch };
 }
 
+/** The bot's current values that an own `update_bot` call can repeat. */
+export type OwnBotCurrentValues = {
+  name: string;
+  description: string | null;
+  instructions: string;
+  color: string;
+  notifyOnFinish: boolean;
+  dailyCheckIns: boolean;
+  modelId: string | null;
+  thinkingLevel: string | null;
+  autoSpeak: boolean;
+  voiceId: string | null;
+};
+
+/**
+ * Some models fill in every field of a tool call, repeating current values and `false` for
+ * switches they mean to leave alone. A value the bot already has is not a change, so drop it:
+ * otherwise a plain read looks like a write and is refused or held.
+ */
+export function dropUnchangedOwnBotArgs(
+  args: Record<string, unknown>,
+  current: OwnBotCurrentValues,
+): Record<string, unknown> {
+  const same: Record<string, unknown> = {
+    name: current.name,
+    description: current.description ?? "",
+    instructions: current.instructions,
+    color: current.color,
+    notifyOnFinish: current.notifyOnFinish,
+    notify_on_finish: current.notifyOnFinish,
+    dailyCheckIns: current.dailyCheckIns,
+    model: current.modelId ?? undefined,
+    thinkingLevel: current.thinkingLevel ?? undefined,
+    readAloud: current.autoSpeak,
+    voice: current.voiceId ?? "default",
+    use_attached_image: false,
+  };
+  const kept: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    const repeated =
+      key in same &&
+      same[key] !== undefined &&
+      (typeof value === "string" && typeof same[key] === "string"
+        ? value.trim() === (same[key] as string).trim()
+        : value === same[key]);
+    if (!repeated) kept[key] = value;
+  }
+  return kept;
+}
+
 /** Providers send omitted optional fields as null or blank; only anything else counts as given. */
 export function argumentGiven(value: unknown): boolean {
   if (value === undefined || value === null) return false;
