@@ -183,6 +183,12 @@ describe("isOwnerStartedRun", () => {
   ])("treats %s (follow-up from user: %s) as owner-started: %s", (trigger, fromUser, expected) => {
     expect(isOwnerStartedRun(trigger, fromUser)).toBe(expected);
   });
+
+  it("treats the owner's direct chat-app message as owner-started", () => {
+    expect(isOwnerStartedRun("messaging", false, true)).toBe(true);
+    expect(isOwnerStartedRun("messaging", true, false)).toBe(false);
+    expect(isOwnerStartedRun("bot_message", true, true)).toBe(false);
+  });
 });
 
 describe("unattendedTriggerToolRequiresApproval", () => {

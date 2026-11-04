@@ -20,7 +20,7 @@ export function historyMyChatsAllowed(
 ): boolean {
   return (
     !external &&
-    (run.trigger === "user" || run.trigger === "follow_up") &&
+    (run.trigger === "user" || run.trigger === "follow_up" || run.trigger === "messaging") &&
     source?.role === "user" &&
     source.threadId === run.threadId
   );

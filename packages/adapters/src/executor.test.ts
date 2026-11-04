@@ -4376,15 +4376,19 @@ describe("call_user availability", () => {
 });
 
 describe("cross-chat history grant", () => {
-  it.each(["user", "follow_up"])("allows only human %s requests in the app thread", (trigger) => {
-    const run = { trigger, threadId: "thread" };
-    expect(historyMyChatsAllowed(run, { role: "user", threadId: "thread" }, false)).toBe(true);
-    expect(historyMyChatsAllowed(run, { role: "user", threadId: "thread" }, true)).toBe(false);
-    expect(historyMyChatsAllowed(run, { role: "bot", threadId: "thread" }, false)).toBe(false);
-    expect(historyMyChatsAllowed(run, { role: "user", threadId: "other" }, false)).toBe(false);
-    expect(historyMyChatsAllowed(run, null, false)).toBe(false);
-  });
-  it.each(["bot_message", "routine", "schedule", "messaging", "webhook", "created", "call_end"])(
+  // A messaging source is loaded only for the owner's direct chat-app message; channels pass external.
+  it.each(["user", "follow_up", "messaging"])(
+    "allows only human %s requests in the own thread",
+    (trigger) => {
+      const run = { trigger, threadId: "thread" };
+      expect(historyMyChatsAllowed(run, { role: "user", threadId: "thread" }, false)).toBe(true);
+      expect(historyMyChatsAllowed(run, { role: "user", threadId: "thread" }, true)).toBe(false);
+      expect(historyMyChatsAllowed(run, { role: "bot", threadId: "thread" }, false)).toBe(false);
+      expect(historyMyChatsAllowed(run, { role: "user", threadId: "other" }, false)).toBe(false);
+      expect(historyMyChatsAllowed(run, null, false)).toBe(false);
+    },
+  );
+  it.each(["bot_message", "routine", "schedule", "webhook", "created", "call_end"])(
     "denies %s even with a human-looking source",
     (trigger) => {
       expect(
