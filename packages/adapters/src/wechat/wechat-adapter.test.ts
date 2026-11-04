@@ -12,6 +12,7 @@ import {
   decodeWechatThreadId,
   encodeWechatThreadId,
   WECHAT_EXPIRED_PAUSE_MS,
+  WECHAT_UNSUPPORTED_REPLY,
   WechatAdapter,
 } from "./wechat-adapter.js";
 
@@ -142,6 +143,24 @@ describe("WechatAdapter", () => {
     expect(headers.get("authorization")).toBe("Bearer bot-token");
     expect(headers.get("authorizationtype")).toBe("ilink_bot_token");
     expect(headers.get("ilink-app-id")).toBe("bot");
+  });
+
+  it("tells the sender when a message has nothing readable instead of dropping it", async () => {
+    const server = fakeIlink();
+    server.batches.push({
+      ret: 0,
+      get_updates_buf: "cursor-1",
+      msgs: [inbound({ message_id: 7, item_list: [{ type: 19 } as never] })],
+    });
+    const received = await chatWith(adapterFor(server, true));
+    await vi.waitFor(() =>
+      expect(server.requests.some((request) => request.path === "ilink/bot/sendmessage")).toBe(
+        true,
+      ),
+    );
+    const sent = server.requests.find((request) => request.path === "ilink/bot/sendmessage")!;
+    expect(JSON.stringify(sent.body)).toContain(WECHAT_UNSUPPORTED_REPLY);
+    expect(received).toHaveLength(0);
   });
 
   it("resumes from the saved cursor and replies with the saved context from any process", async () => {
