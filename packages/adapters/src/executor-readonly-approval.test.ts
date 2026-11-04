@@ -1646,7 +1646,8 @@ describe("own instructions through update_bot", () => {
       { error: "instructions_offset must be a whole number of 0 or more." },
       { error: "instructions_offset must be a whole number of 0 or more." },
       {
-        error: "instructions_offset only works on a read: call update_bot with no other fields.",
+        error:
+          "instructions_offset only works on a read: call update_bot with no other fields (you also passed name).",
       },
       { error: "instructions_offset is past the end of your instructions." },
     ]);
