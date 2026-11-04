@@ -399,6 +399,53 @@ describe("createMessagingInboundHandler DM routing", () => {
     );
   });
 
+  it("answers the bot's pending question when the reply picks one of its options", async () => {
+    const deps = createDeps();
+    const answerRunInput = vi.fn(async () => true);
+    Object.assign(deps.events, { answerRunInput });
+    Object.assign(deps.prisma.run, {
+      findMany: vi.fn(async () => [{ id: "run-waiting" }]),
+    });
+    Object.assign(deps.prisma.message, {
+      findFirst: vi.fn(async () => ({
+        id: "msg-ask",
+        runId: "run-waiting",
+        blocks: [
+          {
+            kind: "ask",
+            text: "Which one?",
+            status: "pending",
+            actions: [
+              { id: "choice-1", label: "Red" },
+              { id: "choice-2", label: "Blue" },
+            ],
+          },
+        ],
+      })),
+    });
+    const handle = createMessagingInboundHandler(deps);
+    await handle({ ...dmEvent, content: "2" });
+
+    expect(answerRunInput).toHaveBeenCalledWith({
+      spaceId: "ws-1",
+      threadId: "thread-1",
+      runId: "run-waiting",
+      messageId: "msg-ask",
+      answeredByUserId: "user-1",
+      answer: "Blue",
+    });
+    expect(deps.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "run.continue", payload: { runId: "run-waiting" } }),
+    );
+    expect(deps.sendUserMessage).not.toHaveBeenCalled();
+
+    // A reply that picks nothing, or a pending approval, stays an ordinary message.
+    answerRunInput.mockClear();
+    await handle({ ...dmEvent, handle: "handle-2", content: "something else" });
+    expect(answerRunInput).not.toHaveBeenCalled();
+    expect(deps.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
   it("stores a photo-only DM as an image artifact instead of dropping it", async () => {
     const storeAttachment = vi.fn(
       async ({ attachment }: { attachment: { name: string; mimeType: string } }) => ({
