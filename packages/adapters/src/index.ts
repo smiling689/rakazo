@@ -209,4 +209,6 @@ export * from "./web-limits.js";
 export * from "./web-provider-factory.js";
 export * from "./web-ssrf.js";
 export * from "./web-tools.js";
+export type { WechatLogin, WechatLoginIo } from "./wechat/login.js";
+export { wechatQrLogin } from "./wechat/login.js";
 export * from "./wrapped-env.js";
