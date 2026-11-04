@@ -42,6 +42,10 @@ export interface WechatAdapterConfig {
 const THREAD_PREFIX = "wechat:";
 
 /** Processing failures are retried here: the cursor has already moved past the message. */
+/** Sent back when a message has nothing the bot can read (forwarded chat records, link cards, ...). */
+export const WECHAT_UNSUPPORTED_REPLY =
+  "这条消息我收不到内容：微信的 bot 接口只转发文字、语音、图片、文件和视频，合并转发的聊天记录、链接卡片和小程序都过不来。可以把文字复制过来，或者截图发我。";
+
 export const WECHAT_RETRY_DELAYS_MS = [5_000, 30_000, 120_000];
 /** After this many failed polls in a row, wait before polling again. */
 const POLL_FAILURES_BEFORE_BACKOFF = 3;
@@ -152,12 +156,22 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     if (raw.message_type === 2 || raw.group_id || !raw.from_user_id) return;
     const chat = this.chat;
     if (!chat) return;
+    const message = this.parseMessage(raw);
+    if (attempt === 0 && !message.text && message.attachments.length === 0) {
+      // iLink carries text, voice, image, file and video only; a forwarded chat record, a link card or
+      // a mini program arrives without anything readable. Tell the sender instead of dropping it.
+      getLogger().info("wechat message without readable content", {
+        itemTypes: (raw.item_list ?? []).map((item) => item.type),
+      });
+      void this.replyUnsupported(raw.from_user_id);
+      return;
+    }
     const options: WebhookOptions = { waitUntil: (task) => void task.catch(() => undefined) };
     chat
       .processMessage(
         this,
         encodeWechatThreadId(raw.from_user_id),
-        this.parseMessage(raw),
+        message,
         // The first attempt already marked the message seen.
         attempt ? { ...options, deduplicate: false } : options,
       )
@@ -175,6 +189,18 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
         timer.unref?.();
         this.retries.add(timer);
       });
+  }
+
+  private async replyUnsupported(userId: string) {
+    try {
+      await this.client.sendText(
+        userId,
+        WECHAT_UNSUPPORTED_REPLY,
+        await this.store.context(userId),
+      );
+    } catch (error) {
+      getLogger().warn("wechat unsupported-message reply failed", { error: String(error) });
+    }
   }
 
   parseMessage(raw: IlinkMessage): Message<IlinkMessage> {
