@@ -3,8 +3,9 @@ import type { MemoryPromptBudget, MemoryPromptDocumentUse } from "@rakazo/contra
 import { BOT_MEMORY_MAX_BYTES, MEMORY_INDEX_PATH } from "@rakazo/contracts";
 import { byteLength, truncateUtf8 } from "./utf8.js";
 
-/** How much durable memory a prompt carries before the rest is left out. */
-export const AGENT_MEMORY_MAX_BYTES = 32 * 1024;
+/** How much durable memory a prompt carries before the rest is left out. 48 KB (upstream 32 KB) so the
+ * raised bot cap (BOT_MEMORY_MAX_BYTES) still leaves room for shared memory and other documents. */
+export const AGENT_MEMORY_MAX_BYTES = 48 * 1024;
 
 export type MemoryPromptDocument = {
   scope: "bot" | "user";

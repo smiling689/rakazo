@@ -425,7 +425,7 @@ The five synthetic cases check that the bot's own memory stays short and correct
 across conversations: a move from London to Berlin replaces the old home and a
 fresh conversation recalls Berlin, a forgotten code leaves memory, a preference
 restated in other words is kept once, chatty personal details become short
-entries, and a save into memory seeded close to its 4 KB limit consolidates the
+entries, and a save into memory seeded close to its 16 KB limit consolidates the
 existing notes instead of dropping them. Conversations are separated by clearing
 history, so only durable memory carries over. The full-memory seed is written
 through the memory API before the first step; no model authors it.

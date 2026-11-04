@@ -1,6 +1,10 @@
 import type { AdapterContext, MemorySnapshot, MemoryStore } from "@rakazo/adapter-kit";
 import { describe, expect, it, vi } from "vitest";
-import { buildAgentMemoryPrompt, loadAgentMemoryContext } from "./memory-context.js";
+import {
+  AGENT_MEMORY_MAX_BYTES,
+  buildAgentMemoryPrompt,
+  loadAgentMemoryContext,
+} from "./memory-context.js";
 
 const context: AdapterContext = {
   operationId: "run-1",
@@ -69,7 +73,7 @@ describe("agent memory context", () => {
               document(
                 "bot",
                 "MEMORY.md",
-                `old fact\n${"🙂".repeat(10_000)}\nrecent fact`,
+                `old fact\n${"🙂".repeat(AGENT_MEMORY_MAX_BYTES / 4 + 2_000)}\nrecent fact`,
                 2,
                 "2026-08-14T12:00:00.000Z",
               ),
@@ -80,7 +84,7 @@ describe("agent memory context", () => {
 
     const result = await loadAgentMemoryContext(storeWith(read), "bot-1", context);
 
-    expect(Buffer.byteLength(result ?? "", "utf8")).toBeLessThanOrEqual(32 * 1024);
+    expect(Buffer.byteLength(result ?? "", "utf8")).toBeLessThanOrEqual(AGENT_MEMORY_MAX_BYTES);
     expect(result).toContain("shared fact");
     expect(result).toContain("recent fact");
     expect(result).not.toContain("old fact");
