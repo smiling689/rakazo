@@ -57,8 +57,8 @@ describe("built-in tool bridge", () => {
     ]);
     // request_secret carries the card and contact kinds; update_bot carries instructions paging.
     // +1 byte over upstream: feat/memory-size makes remember say "Holds 16 KB" instead of "Holds 4 KB".
-    // +15 bytes: the deferred catalog names post_to_group. +32: update_bot says any field is a change.
-    expect(definitionBytes(listed)).toBeLessThanOrEqual(31_926);
+    // +15 bytes: the deferred catalog names post_to_group. +32: update_bot says any field is a change. +23: the catalog names update_default_models.
+    expect(definitionBytes(listed)).toBeLessThanOrEqual(31_949);
     expect(deferred.map((tool) => tool.name)).toEqual(
       expect.arrayContaining(["render_plot", "create_space", "generate_secret", "scratchpad_add"]),
     );
