@@ -43,8 +43,6 @@ export interface WechatAdapterConfig {
   fetch?: typeof fetch;
   /** Test seam: replace the sticker library. */
   stickers?: Pick<StickerLibrary, "pick" | "collect" | "remove">;
-  /** Test seam: pick the "on it" note. */
-  random?: () => number;
 }
 
 /** WeChat shows these as pictures; anything else goes out as a file. */
@@ -68,10 +66,6 @@ const TYPING_TICKET_TTL_MS = 10 * 60_000;
 export const WECHAT_TYPING_REFRESH_MS = 5_000;
 /** Stop showing "typing" when no reply came for this long (the bot may have chosen not to answer). */
 export const WECHAT_TYPING_MAX_MS = 5 * 60_000;
-/** A reply still not out after this long gets a short note first: replies only go out once a run ends. */
-export const WECHAT_ACK_AFTER_MS = 30_000;
-// Plain on purpose: a cute stock line repeated every few days reads as forced.
-export const WECHAT_ACK_NOTES = ["收到，我看一下", "在弄了，稍等", "有点多，等我一会儿"];
 /** `[收藏表情:...]` keeps the picture the owner sent within this long. */
 const COLLECT_MAX_AGE_MS = 30 * 60_000;
 /** `[删除表情]` removes the sticker sent within this long. */
@@ -236,13 +230,12 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
   }
 
   /**
-   * Until a reply to `userId` goes out (from any process): keep "typing" showing, and after
-   * WECHAT_ACK_AFTER_MS send one short note, since a run's replies only go out when it ends.
+   * Until a reply to `userId` goes out (from any process), keep "typing" showing: a run's reply
+   * only goes out when it ends. The bot's own first line (message_user) stops it like a reply.
    */
   private watchReply(userId: string) {
     this.watchers.get(userId)?.();
     const since = Date.now();
-    let acked = false;
     let busy = false;
     const timer = setInterval(() => {
       if (busy) return;
@@ -252,14 +245,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
         if (elapsed >= WECHAT_TYPING_MAX_MS || (await this.activity.repliedSince(userId, since))) {
           stop();
           return;
-        }
-        if (!acked && elapsed >= WECHAT_ACK_AFTER_MS) {
-          acked = true;
-          const notes = WECHAT_ACK_NOTES;
-          const note = notes[Math.floor((this.config.random ?? Math.random)() * notes.length)]!;
-          await this.client
-            .sendText(userId, note, await this.store.context(userId))
-            .catch((error: unknown) => getLogger().warn("wechat ack failed", { error: String(error) }));
         }
         await this.startTyping(encodeWechatThreadId(userId));
       })()

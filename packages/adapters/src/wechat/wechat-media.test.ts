@@ -17,8 +17,6 @@ import {
 } from "./stickers.js";
 import {
   encodeWechatThreadId,
-  WECHAT_ACK_AFTER_MS,
-  WECHAT_ACK_NOTES,
   WECHAT_TYPING_MAX_MS,
   WECHAT_TYPING_REFRESH_MS,
   WechatAdapter,
@@ -92,7 +90,6 @@ function adapterFor(
     pollInboundMessages: options.poll ?? false,
     fetch: server.fetch,
     stickers: options.stickers ?? { pick: async () => undefined, collect: async () => true, remove: async () => {} },
-    random: () => 0,
   });
   adapters.push(adapter);
   return adapter;
@@ -415,44 +412,26 @@ describe("WeChat reply watch", () => {
     return adapter;
   }
 
-  it("keeps typing, then sends one note after a while, until a reply goes out", async () => {
+  it("keeps typing until a reply goes out, and never sends words of its own", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
     const server = fakeServer();
     server.batches.push({ ret: 0, msgs: [inbound(1)], get_updates_buf: "c1" });
     const adapter = await pollingAdapter(server);
     await vi.waitFor(() => expect(server.requests).toContain("ilink/bot/getupdates"));
+    const typing = () => server.requests.filter((path) => path === "ilink/bot/sendtyping").length;
+    // Each check reads a file, so step the clock until typing has been re-sent a few times.
     await vi.waitFor(async () => {
       await vi.advanceTimersByTimeAsync(WECHAT_TYPING_REFRESH_MS);
-      expect(server.requests.filter((path) => path === "ilink/bot/sendtyping").length).toBeGreaterThan(0);
+      expect(typing()).toBeGreaterThan(3);
     });
     expect(server.sent).toEqual([]);
 
-    // Each check reads a file, so step the clock until the note is out.
-    await vi.waitFor(async () => {
-      await vi.advanceTimersByTimeAsync(WECHAT_TYPING_REFRESH_MS);
-      expect(server.sent).toEqual([{ type: 1, text_item: { text: WECHAT_ACK_NOTES[0] } }]);
-    });
-
-    // The reply goes out (from any process); typing stops and no second note follows.
+    // The reply goes out (from any process); typing stops.
     await adapter.postMessage(encodeWechatThreadId(user), "查好了");
-    const typingBefore = server.requests.filter((path) => path === "ilink/bot/sendtyping").length;
-    await vi.advanceTimersByTimeAsync(WECHAT_TYPING_MAX_MS);
-    expect(server.requests.filter((path) => path === "ilink/bot/sendtyping").length).toBe(typingBefore);
-    expect(server.sent.map((item) => (item.text_item as { text: string }).text)).toEqual([
-      WECHAT_ACK_NOTES[0],
-      "查好了",
-    ]);
-  });
-
-  it("sends no note when the reply comes quickly", async () => {
-    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
-    const server = fakeServer();
-    server.batches.push({ ret: 0, msgs: [inbound(2)], get_updates_buf: "c2" });
-    const adapter = await pollingAdapter(server);
-    await vi.waitFor(() => expect(server.requests).toContain("ilink/bot/getupdates"));
     await vi.advanceTimersByTimeAsync(WECHAT_TYPING_REFRESH_MS * 2);
-    await adapter.postMessage(encodeWechatThreadId(user), "好的");
-    await vi.advanceTimersByTimeAsync(WECHAT_ACK_AFTER_MS * 2);
-    expect(server.sent).toEqual([{ type: 1, text_item: { text: "好的" } }]);
+    const typingAfter = typing();
+    await vi.advanceTimersByTimeAsync(WECHAT_TYPING_MAX_MS);
+    expect(typing()).toBe(typingAfter);
+    expect(server.sent).toEqual([{ type: 1, text_item: { text: "查好了" } }]);
   });
 });
