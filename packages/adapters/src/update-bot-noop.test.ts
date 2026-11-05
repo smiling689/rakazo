@@ -46,6 +46,15 @@ describe("dropUnchangedOwnBotArgs", () => {
     ).toEqual({});
   });
 
+  it("reads switches sent as text and the default thinking level", () => {
+    expect(
+      dropUnchangedOwnBotArgs(
+        { dailyCheckIns: "false", notifyOnFinish: "true", thinkingLevel: "default" },
+        { ...current, thinkingLevel: null },
+      ),
+    ).toEqual({ notifyOnFinish: true });
+  });
+
   it("keeps real changes", () => {
     expect(
       dropUnchangedOwnBotArgs(

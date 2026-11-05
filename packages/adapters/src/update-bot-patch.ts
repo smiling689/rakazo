@@ -91,13 +91,16 @@ export function dropUnchangedOwnBotArgs(
     notify_on_finish: current.notifyOnFinish,
     dailyCheckIns: current.dailyCheckIns,
     model: modelId,
-    thinkingLevel: current.thinkingLevel ?? running.thinkingLevel ?? undefined,
+    thinkingLevel: current.thinkingLevel ?? running.thinkingLevel ?? "default",
     readAloud: current.autoSpeak,
     voice: current.voiceId ?? "default",
     use_attached_image: false,
   };
   const kept: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(args)) {
+  for (const [key, raw] of Object.entries(args)) {
+    // Switches sometimes arrive as the text "true" or "false".
+    const value =
+      typeof same[key] === "boolean" && (raw === "true" || raw === "false") ? raw === "true" : raw;
     const repeated =
       key in same &&
       same[key] !== undefined &&

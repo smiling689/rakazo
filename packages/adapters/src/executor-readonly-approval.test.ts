@@ -1631,7 +1631,7 @@ describe("own instructions through update_bot", () => {
       long,
     );
   });
-  it("rejects an instructions offset that is not a plain read", async () => {
+  it("reads when an instructions offset comes with other fields, and names them", async () => {
     const f = fixture({ name: "update_bot", builtin: true });
     const long = "x".repeat(19_000);
     f.instructionState.instructions = long;
@@ -1645,10 +1645,11 @@ describe("own instructions through update_bot", () => {
     expect(f.results).toEqual([
       { error: "instructions_offset must be a whole number of 0 or more." },
       { error: "instructions_offset must be a whole number of 0 or more." },
-      {
-        error:
-          "instructions_offset only works on a read: call update_bot with no other fields (you also passed name).",
-      },
+      expect.objectContaining({
+        name: "Assistant",
+        instructionsOffset: 0,
+        ignoredFields: expect.stringContaining('name="New name"'),
+      }),
       { error: "instructions_offset is past the end of your instructions." },
     ]);
     expect(f.instructionState.instructions).toBe(long);
