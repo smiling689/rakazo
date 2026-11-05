@@ -511,7 +511,7 @@ async function prepareOwnBotUpdate(
       voiceId: true,
     },
   });
-  const args = current ? dropUnchangedOwnBotArgs(given, current) : given;
+  const args = current ? dropUnchangedOwnBotArgs(given, current, run) : given;
   request.args = args;
   const settingsOnly = Object.keys(args).filter(
     (key) => !OWN_FIELDS.has(key) && argumentGiven(args[key]),
