@@ -88,6 +88,25 @@ export async function mirrorMessagingOutbound(
   });
 }
 
+/**
+ * Queues what a 1:1 chat-app run has posted so far (a message_user heads-up) while it is still
+ * going. The run is not marked mirrored: that still means its reply is out. The outbox keys rows
+ * by message, so the end-of-run mirror never sends these twice. Group channel runs post once.
+ */
+export async function mirrorMessagingProgress(
+  deps: MessagingDeliveryDeps,
+  runId: string,
+): Promise<void> {
+  const run = await deps.prisma.run.findUnique({
+    where: { id: runId },
+    include: { sourceMessage: true },
+  });
+  if (run?.trigger !== "messaging") return;
+  const sourceBlocks = (run.sourceMessage?.blocks ?? []) as MessageBlock[];
+  if (sourceBlocks.some((block) => block.kind === "channel_message")) return;
+  await mirrorRun(deps, runId);
+}
+
 async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<void> {
   const run = await deps.prisma.run.findUnique({
     where: { id: runId },

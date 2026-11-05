@@ -1,3 +1,4 @@
+import { messagingProgressJob } from "@rakazo/adapter-kit";
 import { isBackgroundRunTrigger, redactSecrets } from "@rakazo/core";
 import {
   connectAgent,
@@ -97,6 +98,10 @@ export const messagingTools: ToolHandlers = {
       });
     }
     await publishMessage(deps, run, "bot", [{ kind: "text", text }], true, nextProgressNonce(ctx));
+    // A chat app otherwise sees run messages only when the run ends.
+    if (run.trigger === "messaging") {
+      await deps.jobs.enqueue(messagingProgressJob(run.id)).catch(() => undefined);
+    }
     reply.midTurnUserTexts.push(text);
     reply.publishedMidTurnUserMessage = true;
     return call.finish(

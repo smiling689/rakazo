@@ -29,7 +29,11 @@ import type { createRunExecutor } from "./executor.js";
 import type { ExpoPushProvider } from "./expo-push.js";
 import { compactHistory } from "./history-compaction.js";
 import type { MemoryProviderResolver } from "./memory-provider-factory.js";
-import { deliverMessagingOutbound, mirrorMessagingOutbound } from "./messaging-delivery.js";
+import {
+  deliverMessagingOutbound,
+  mirrorMessagingOutbound,
+  mirrorMessagingProgress,
+} from "./messaging-delivery.js";
 import { pollPurchase } from "./purchase-poll.js";
 import { expireTaughtSkillTeaching } from "./teaching-session.js";
 
@@ -151,9 +155,10 @@ export function createBackgroundJobHandlers(deps: {
         });
       });
     },
-    "messaging.deliver": async ({ runId }) => {
+    "messaging.deliver": async ({ runId, progress }) => {
       if (runId && messagingDeps) {
-        await asOwner(run, () => mirrorMessagingOutbound(messagingDeps, runId))({ runId });
+        const mirror = progress ? mirrorMessagingProgress : mirrorMessagingOutbound;
+        await asOwner(run, () => mirror(messagingDeps, runId))({ runId });
       }
       await drainMessaging();
     },

@@ -6,6 +6,7 @@ export function messagingDmSurfaceNote(): string {
     "Chat surface: the owner also reaches you over a messaging app (iMessage/SMS, Slack, WhatsApp, or similar).",
     "That conversation and this one are the same thread; anything you reply here is mirrored to their chat.",
     "Keep replies concise. They arrive as chat messages.",
+    "A reply reaches their chat only when your turn ends. So when a turn that came from their chat app needs real work first (searching, asking another bot, several tool calls), start with one short message_user line in your own words that fits what they said, then do the work; answer quick questions directly.",
   ].join(" ");
 }
 

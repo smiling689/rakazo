@@ -306,6 +306,7 @@ async function runTurn(
       }
     }),
   };
+  const jobs = { enqueue: vi.fn(async (_job: { name: string; payload: unknown }) => undefined) };
   const finalizeRun = vi.fn(async (_input: { blocks: MessageBlock[]; markUnread?: boolean }) => ({
     continuationRunId: null,
   }));
@@ -339,7 +340,7 @@ async function runTurn(
     memory: { read: async () => ({ documents: [] }) },
     memoryProviders: { resolve: async () => null },
     events: { append, finalizeRun, pauseRunForInput, notify: vi.fn(async () => undefined) },
-    jobs: { enqueue: vi.fn(async () => undefined) },
+    jobs,
     secrets,
     ...(options.graphical
       ? {
@@ -360,7 +361,17 @@ async function runTurn(
   expect(runtimeRun).toHaveBeenCalled();
   if (!options.runtimeFailure)
     expect(finalizeRun).not.toHaveBeenCalledWith(expect.objectContaining({ outcome: "failed" }));
-  return { finalizeRun, append, pauseRunForInput, messages, savedEvents, prisma, runtimeRun, run };
+  return {
+    finalizeRun,
+    append,
+    pauseRunForInput,
+    messages,
+    savedEvents,
+    prisma,
+    runtimeRun,
+    run,
+    jobs,
+  };
 }
 
 /** Notes saved on the final reply's steps, in order. */
@@ -833,6 +844,32 @@ describe("notes that can't be posted as messages", () => {
     expect(await sent("user", "browser_snapshot", false)).toEqual([]);
     for (const trigger of ["routine", "webhook", "reaction", "bot_message"])
       expect(await sent(trigger, "browser_snapshot")).toEqual([]);
+  });
+
+  it("lets a chat-app turn post one heads-up at once and delivers it before the turn ends", async () => {
+    const run = async (trigger: string) => {
+      const { messages, jobs } = await runTurn("", false, undefined, [], "fyi", {
+        trigger,
+        runtime: async function* (request) {
+          for (const [index, message] of ["我瞅瞅日志", "还在查"].entries())
+            await request.executeTool!("message_user", { message }, `call-${index}`);
+          yield { type: "text", text: "查好了" };
+          yield { type: "done", text: "" };
+        },
+      });
+      const progress = jobs.enqueue.mock.calls
+        .map(([job]) => job)
+        .filter((job) => job.name === "messaging.deliver");
+      return { sent: sentTexts(messages), progress };
+    };
+    const chat = await run("messaging");
+    // Only the first line goes out early; the next one waits for the usual fresh-turn rule.
+    expect(chat.sent).toEqual(["我瞅瞅日志"]);
+    expect(chat.progress).toEqual([
+      expect.objectContaining({ payload: { runId: expect.any(String), progress: true } }),
+    ]);
+    const app = await run("user");
+    expect(app).toEqual({ sent: [], progress: [] });
   });
 });
 

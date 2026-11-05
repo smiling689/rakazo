@@ -23,7 +23,11 @@ const payloadSchemas = {
   "skill.teaching-expire": z.object({ skillId: z.string().min(1) }),
   "call.expire": z.object({ threadId: z.string().min(1), callId: z.string().min(1) }),
   "history.compact": z.object({ threadId: z.string().min(1) }),
-  "messaging.deliver": z.object({ runId: z.string().min(1).optional() }),
+  "messaging.deliver": z.object({
+    runId: z.string().min(1).optional(),
+    /** Send what the run has posted so far; the run is still going and is not marked mirrored. */
+    progress: z.boolean().optional(),
+  }),
   "messaging.credential-cleanup": z.object({
     installationId: z.string().min(1),
     ref: z.string().min(1),
@@ -159,6 +163,15 @@ export function historyCompactJobKey(threadId: string): string {
  * provider errors without storming.
  */
 export const HISTORY_COMPACT_MAX_ATTEMPTS = 4;
+
+/** Delivers an interim message of a run a chat app started, while the run is still going. */
+export function messagingProgressJob(runId: string): BackgroundJob {
+  return {
+    name: "messaging.deliver",
+    payload: { runId, progress: true },
+    replaceKey: `messaging.deliver:progress:${runId}`,
+  };
+}
 
 export function messagingDeliverJob(runId?: string, availableAt?: Date): BackgroundJob {
   return {
