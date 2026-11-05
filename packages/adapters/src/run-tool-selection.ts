@@ -117,7 +117,10 @@ export function selectBuiltinToolsForRun(options: {
       (options.trigger !== "created" || CREATED_RUN_TOOL_NAMES.has(tool.name)) &&
       (!FLEET_TOOL_NAMES_SET.has(tool.name) ||
         (Boolean(options.fleetManagement) && ownerStartedRun)) &&
-      (ownerStartedRun || (tool.name !== "update_preferences" && tool.name !== "feedback")) &&
+      (ownerStartedRun ||
+        (tool.name !== "update_preferences" &&
+          tool.name !== "update_default_models" &&
+          tool.name !== "feedback")) &&
       (options.paymentWalletEnabled || !PURCHASE_TOOL_NAMES.has(tool.name)) &&
       (options.mediaImagesEnabled || tool.name !== "generate_image") &&
       (options.mediaVideoEnabled || tool.name !== "generate_video") &&

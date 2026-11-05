@@ -97,6 +97,7 @@ export const BUILTIN_TOOL_NAMES = [
   "post_to_group",
   "handoff_to_bot",
   "update_preferences",
+  "update_default_models",
   "feedback",
   "connect_agent",
   "respond_agent_connection",
