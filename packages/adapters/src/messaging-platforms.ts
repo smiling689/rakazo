@@ -538,7 +538,39 @@ function splitWhatsAppPart(body: string): string[] {
 const WECHAT_PART_LIMIT = 3000;
 
 /** Split at a paragraph or line break when one falls in the second half of the window. */
+/**
+ * A short chatty reply in two or three one-line paragraphs goes out as that many bubbles, the
+ * way people text. Lists, numbered choices and anything longer stay one message. A paragraph
+ * that is only a sticker tag (`[表情:...]`) rides along without counting.
+ */
+export function wechatChatBubbles(body: string): string[] | undefined {
+  if (body.length > WECHAT_BUBBLES_MAX_CHARS) return undefined;
+  const paragraphs = body
+    .split(/\n[ \t]*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  const sticker = /^[[［【](收藏)?表情[:：][^\]］】\n]{1,40}[\]］】]$/;
+  const spoken = paragraphs.filter((paragraph) => !sticker.test(paragraph));
+  if (spoken.length < 2 || spoken.length > 3) return undefined;
+  const plain = (paragraph: string) =>
+    !paragraph.includes("\n") &&
+    paragraph.length <= WECHAT_BUBBLE_MAX_CHARS &&
+    !/^\s*(\d+[.、)）]|[-*•·>])/.test(paragraph);
+  if (!spoken.every(plain)) return undefined;
+  // A tag-only paragraph joins the one before it, so it never costs a bubble of its own.
+  const bubbles: string[] = [];
+  for (const paragraph of paragraphs) {
+    if (sticker.test(paragraph) && bubbles.length > 0) bubbles[bubbles.length - 1] += ` ${paragraph}`;
+    else bubbles.push(paragraph);
+  }
+  return bubbles;
+}
+const WECHAT_BUBBLES_MAX_CHARS = 240;
+const WECHAT_BUBBLE_MAX_CHARS = 100;
+
 function splitWechatPart(body: string): string[] {
+  const bubbles = wechatChatBubbles(body);
+  if (bubbles) return bubbles;
   const parts: string[] = [];
   let rest = body;
   while (rest.length > WECHAT_PART_LIMIT) {
