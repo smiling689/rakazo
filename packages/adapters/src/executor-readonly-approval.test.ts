@@ -1638,7 +1638,7 @@ describe("own instructions through update_bot", () => {
     f.setCalls([
       { args: { instructions_offset: -1 }, executionId: "call-1" },
       { args: { instructions_offset: 1.5 }, executionId: "call-2" },
-      { args: { instructions_offset: 0, name: "New name" }, executionId: "call-3" },
+      { args: { instructions_offset: 8000, name: "New name" }, executionId: "call-3" },
       { args: { instructions_offset: 19_000 }, executionId: "call-4" },
     ]);
     await f.run();
@@ -1647,7 +1647,7 @@ describe("own instructions through update_bot", () => {
       { error: "instructions_offset must be a whole number of 0 or more." },
       expect.objectContaining({
         name: "Assistant",
-        instructionsOffset: 0,
+        instructionsOffset: 8000,
         ignoredFields: expect.stringContaining('name="New name"'),
       }),
       { error: "instructions_offset is past the end of your instructions." },

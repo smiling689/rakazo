@@ -33,7 +33,7 @@ describe("dropUnchangedOwnBotArgs", () => {
         },
         current,
       ),
-    ).toEqual({ instructions_offset: 0 });
+    ).toEqual({});
   });
 
   it("treats the model and thinking this run uses as the bot's own when it is on the defaults", () => {

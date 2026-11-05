@@ -134,3 +134,29 @@ describe("resolveModelChoice", () => {
     if (!nowhere.ok) expect(nowhere.error.length).toBeLessThan(400);
   });
 });
+
+describe("hyphenated versions in ids", () => {
+  const compatible = (id: string): ModelChoice => ({
+    provider: "openai-compatible",
+    providerName: "OpenAI-compatible",
+    id,
+    label: id,
+  });
+  const ids = ["claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5", "gpt-6.1-sol"].map(
+    compatible,
+  );
+
+  it.each(["sonnet5.5", "Sonnet 5.5", "claude sonnet 5.5"])(
+    "matches %s to claude-sonnet-5-5",
+    (query) => {
+      expect(matchModelChoice(ids, query).match?.id).toBe("claude-sonnet-5-5");
+    },
+  );
+
+  it("still tells Sonnet 5 from Sonnet 5.5 and prefers the newest for a bare family", () => {
+    expect(matchModelChoice(ids, "sonnet 5").ranked.map((choice) => choice.id)).toContain(
+      "claude-sonnet-5",
+    );
+    expect(matchModelChoice(ids, "sonnet").match?.id).toBe("claude-sonnet-5-5");
+  });
+});
