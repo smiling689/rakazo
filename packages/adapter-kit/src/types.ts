@@ -773,7 +773,7 @@ export interface BackgroundJobPayloads {
   /** The bot's call rang out: mark it missed if nobody answered. */
   "call.expire": { threadId: string; callId: string };
   "history.compact": { threadId: string };
-  "messaging.deliver": { runId?: string };
+  "messaging.deliver": { runId?: string; progress?: boolean };
   "messaging.credential-cleanup": { installationId: string; ref: string };
   /** Reconcile durable remote-agent intent; scope is loaded from the database. */
   "cloud_agent.poll": { agentId: string };

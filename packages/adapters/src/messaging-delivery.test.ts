@@ -8,6 +8,7 @@ import {
   deliverMessagingOutbound,
   MESSAGING_DM_OUTBOUND_CAP,
   MESSAGING_OUTBOUND_MAX_ATTEMPTS,
+  mirrorMessagingProgress,
 } from "./messaging-delivery.js";
 import { messagingPlatformsFromEnv } from "./messaging-platforms.js";
 
@@ -421,6 +422,28 @@ describe("deliverMessagingOutbound", () => {
 
     expect(deps.rows).toHaveLength(0);
     expect(deps.sendToThread).not.toHaveBeenCalled();
+  });
+
+  it("queues a running chat run's heads-up without marking the run mirrored", async () => {
+    const deps = createDeps({});
+    await mirrorMessagingProgress(deps, "run-1");
+    expect(deps.rows).toEqual([
+      expect.objectContaining({ idempotencyKey: "msg:m-1", sourceMessageId: "m-1" }),
+    ]);
+    // Mirrored still means the reply is out; the end-of-run mirror skips the queued row.
+    expect(deps.prisma.run.updateMany).not.toHaveBeenCalled();
+
+    const channel = createDeps({
+      run: {
+        ...messagingRun,
+        sourceMessage: { blocks: [{ kind: "channel_message", channelId: "c-1" }] },
+      },
+    });
+    await mirrorMessagingProgress(channel, "run-1");
+    expect(channel.rows).toEqual([]);
+    const app = createDeps({ run: { ...messagingRun, trigger: "user" } });
+    await mirrorMessagingProgress(app, "run-1");
+    expect(app.rows).toEqual([]);
   });
 
   it("ignores in-app runs and runs without a messaging identity", async () => {

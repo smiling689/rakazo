@@ -109,12 +109,14 @@ export function noteComputerTaskStep(reply: ReplyState, toolName: string) {
 
 /**
  * Browser and desktop tasks often take minutes, so the run's first interim message may tell
- * the person so at once. Runs nobody is waiting on keep the fresh-turn rule.
+ * the person so at once. So may any run a chat app started: a chat app shows the reply only
+ * when the run ends, and this line is delivered right away (see mirrorMessagingProgress).
+ * Runs nobody is waiting on keep the fresh-turn rule.
  */
 export function canPostLongTaskHeadsUp(ctx: RunContext) {
   const { reply } = ctx.state;
   return (
-    reply.computerTaskStarted &&
+    (reply.computerTaskStarted || ctx.run.trigger === "messaging") &&
     reply.midTurnProgressCount === 0 &&
     isConversationalRun(ctx.run.trigger) &&
     !runAllowsSilentEmpty(ctx.run.trigger)
