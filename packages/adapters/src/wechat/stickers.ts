@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, normalize, sep } from "node:path";
 
 /**
  * Meme stickers (表情包) for WeChat replies. iLink has no sticker message type, so a sticker
  * goes out as a picture. A bot asks for one by writing `[表情:关键词]` in a reply and adds the
- * picture the owner just sent to their collection with `[收藏表情:标签]`; the adapter strips the
- * tags. Pictures come from two local libraries under the data directory, each an index.json of
+ * picture the owner just sent to their collection with `[收藏表情:标签]`; `[删除表情]` takes the
+ * sticker it sent last out of use (see StickerLibrary.remove). The adapter strips the tags. Pictures come from two local libraries under the data directory, each an index.json of
  * `{file, label, text, family}` next to the files:
  * - `messaging/stickers`: built by the deployment from public sticker sets, cute ones only;
  * - `messaging/stickers-collected`: the owner's own collection, which this module writes.
@@ -29,6 +29,8 @@ const MIME_BY_EXTENSION: Record<string, string> = {
 const STICKER_TAG = /[[［【]表情[:：]\s*([^\]］】\n]{1,40}?)\s*[\]］】]/g;
 /** `[收藏表情:猫猫 开心]`: keep the picture the owner just sent, under these words. */
 const COLLECT_TAG = /[[［【]收藏表情[:：]\s*([^\]］】\n]{1,40}?)\s*[\]］】]/g;
+/** `[删除表情]`: the owner does not want the sticker sent to them last. */
+const REMOVE_TAG = /[[［【]删除表情[\]］】]/g;
 
 export interface StickerEntry {
   file: string;
@@ -37,21 +39,34 @@ export interface StickerEntry {
   family: string;
 }
 
+/** Which picture a sticker was, so it can be taken out of use later. */
+export interface StickerRef {
+  file: string;
+  collected: boolean;
+}
+
 export interface Sticker {
   name: string;
   mimeType: string;
   data: Uint8Array;
+  ref: StickerRef;
 }
 
-/** Removes sticker and collect tags from a reply; returns the text and each tag's words in order. */
+/** Removes sticker tags from a reply; returns the text, each tag's words in order, and whether to remove. */
 export function extractStickerTags(text: string): {
   text: string;
   queries: string[];
   collect: string[];
+  remove: boolean;
 } {
   const queries: string[] = [];
   const collect: string[] = [];
+  let remove = false;
   const stripped = text
+    .replace(REMOVE_TAG, () => {
+      remove = true;
+      return "";
+    })
     .replace(COLLECT_TAG, (_tag, label: string) => {
       collect.push(label.trim());
       return "";
@@ -60,14 +75,14 @@ export function extractStickerTags(text: string): {
       queries.push(query.trim());
       return "";
     });
-  if (queries.length === 0 && collect.length === 0) return { text, queries, collect };
+  if (queries.length === 0 && collect.length === 0 && !remove) return { text, queries, collect, remove };
   const tidied = stripped
     .split("\n")
     .map((line) => line.replace(/[ \t]{2,}/g, " ").trimEnd())
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  return { text: tidied, queries, collect };
+  return { text: tidied, queries, collect, remove };
 }
 
 function words(query: string): string[] {
@@ -148,6 +163,7 @@ export class StickerLibrary {
   private readonly random: () => number;
   private readonly libraryDir: string;
   private readonly collectedDir: string;
+  private readonly blockedPath: string;
   private readonly loaded = new Map<string, LoadedIndex>();
   private collecting: Promise<unknown> = Promise.resolve();
 
@@ -155,15 +171,19 @@ export class StickerLibrary {
     this.random = options.random ?? Math.random;
     this.libraryDir = join(options.dataDir, "messaging", "stickers");
     this.collectedDir = join(options.dataDir, "messaging", "stickers-collected");
+    // Outside the library directory, which the deployment rebuilds; its file names stay the same.
+    this.blockedPath = join(options.dataDir, "messaging", "stickers-blocked.json");
   }
 
   /** One picture for `query`, or undefined when nothing matches. */
   async pick(query: string): Promise<Sticker | undefined> {
-    const [library, collected] = await Promise.all([
+    const [library, collected, blocked] = await Promise.all([
       this.index(this.libraryDir),
       this.index(this.collectedDir),
+      this.blocked(),
     ]);
-    const ranked = rankStickers([...collected, ...library], query);
+    const usable = library.filter((entry) => !blocked.has(entry.file));
+    const ranked = rankStickers([...collected, ...usable], query);
     // A picture that has gone missing is skipped for the next choice.
     for (let attempt = 0; attempt < 3 && ranked.length > 0; attempt++) {
       const entry = chooseSticker(ranked, this.random);
@@ -188,14 +208,47 @@ export class StickerLibrary {
       await writeFile(join(this.collectedDir, file), data, { mode: 0o640 });
       const entries = (await this.index(this.collectedDir)).filter((entry) => entry.file !== file);
       entries.push({ file, label: label.trim(), text: label.trim(), family: COLLECTED_FAMILY });
-      const path = join(this.collectedDir, "index.json");
-      await writeFile(`${path}.tmp`, JSON.stringify(entries), { mode: 0o640 });
-      await rename(`${path}.tmp`, path);
-      this.loaded.delete(this.collectedDir);
+      await this.writeIndex(entries);
     });
     this.collecting = next.catch(() => undefined);
     await next;
     return true;
+  }
+
+  /**
+   * Takes a sticker out of use: a collected one is deleted from the collection, a library one is
+   * listed in stickers-blocked.json, which pick skips (a rebuild of the library keeps it out too).
+   */
+  async remove(ref: StickerRef): Promise<void> {
+    const next = this.collecting.then(async () => {
+      if (ref.collected) {
+        const entries = await this.index(this.collectedDir);
+        await this.writeIndex(entries.filter((entry) => entry.file !== ref.file));
+        await rm(join(this.collectedDir, ref.file), { force: true });
+        return;
+      }
+      const blocked = await this.blocked();
+      if (blocked.has(ref.file)) return;
+      await mkdir(join(this.blockedPath, ".."), { recursive: true, mode: 0o750 });
+      await writeFile(`${this.blockedPath}.tmp`, JSON.stringify([...blocked, ref.file]), { mode: 0o640 });
+      await rename(`${this.blockedPath}.tmp`, this.blockedPath);
+    });
+    this.collecting = next.catch(() => undefined);
+    await next;
+  }
+
+  private async blocked(): Promise<Set<string>> {
+    const raw = await readFile(this.blockedPath, "utf8")
+      .then((text) => JSON.parse(text) as unknown)
+      .catch(() => []);
+    return new Set(Array.isArray(raw) ? raw.filter((file) => typeof file === "string") : []);
+  }
+
+  private async writeIndex(entries: StickerEntry[]): Promise<void> {
+    const path = join(this.collectedDir, "index.json");
+    await writeFile(`${path}.tmp`, JSON.stringify(entries), { mode: 0o640 });
+    await rename(`${path}.tmp`, path);
+    this.loaded.delete(this.collectedDir);
   }
 
   /** A directory's index, re-read when the file changes (the deployment rebuilds the library). */
@@ -216,7 +269,8 @@ export class StickerLibrary {
   }
 
   private async read(entry: StickerEntry): Promise<Sticker | undefined> {
-    const dir = entry.family === COLLECTED_FAMILY ? this.collectedDir : this.libraryDir;
+    const collected = entry.family === COLLECTED_FAMILY;
+    const dir = collected ? this.collectedDir : this.libraryDir;
     const path = normalize(join(dir, entry.file));
     if (!path.startsWith(dir + sep)) return undefined;
     const extension = entry.file.split(".").pop()?.toLowerCase() ?? "";
@@ -224,7 +278,7 @@ export class StickerLibrary {
     if (!mimeType) return undefined;
     const data = await readFile(path).catch(() => undefined);
     if (!data || data.byteLength === 0 || data.byteLength > STICKER_MAX_BYTES) return undefined;
-    return { name: entry.file.split("/").pop() ?? entry.file, mimeType, data };
+    return { name: entry.file.split("/").pop() ?? entry.file, mimeType, data, ref: { file: entry.file, collected } };
   }
 }
 
