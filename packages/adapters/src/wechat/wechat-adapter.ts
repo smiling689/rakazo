@@ -4,6 +4,7 @@ import type {
   AdapterPostableMessage,
   Attachment,
   ChatInstance,
+  FileUpload,
   FormattedContent,
   WebhookOptions,
 } from "chat";
@@ -22,10 +23,12 @@ import {
   ILINK_ITEM,
   ILINK_LONG_POLL_TIMEOUT_MS,
   ILINK_SESSION_EXPIRED,
+  ILINK_UPLOAD,
   IlinkClient,
   IlinkError,
 } from "./ilink-client.js";
 import { WechatStateStore } from "./state.js";
+import { extractStickerTags, StickerLibrary } from "./stickers.js";
 
 export interface WechatAdapterConfig {
   /** Bot token from the QR-code login (`wechat-login` CLI). */
@@ -37,7 +40,12 @@ export interface WechatAdapterConfig {
   pollInboundMessages: boolean;
   /** Test seam: replace the HTTP boundary. */
   fetch?: typeof fetch;
+  /** Test seam: replace the sticker library. */
+  stickers?: Pick<StickerLibrary, "pick">;
 }
+
+/** WeChat shows these as pictures; anything else goes out as a file. */
+const WECHAT_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"]);
 
 const THREAD_PREFIX = "wechat:";
 
@@ -68,8 +76,9 @@ export function decodeWechatThreadId(threadId: string): string {
 /**
  * Personal WeChat through Tencent's iLink bot API. Direct messages only: an
  * iLink bot is its own contact and is not delivered group traffic. Inbound is
- * long-polled, so the server needs no public webhook. Replies are plain text,
- * since WeChat renders no Markdown.
+ * long-polled, so the server needs no public webhook. Replies are plain text
+ * (WeChat renders no Markdown), plus the pictures and files a reply attaches and
+ * a meme picture for a `[表情:...]` tag (see stickers.ts).
  */
 export class WechatAdapter implements Adapter<string, IlinkMessage> {
   readonly name = "wechat";
@@ -80,6 +89,7 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
   private polling: AbortController | undefined;
   private readonly retries = new Set<ReturnType<typeof setTimeout>>();
   private readonly typingTickets = new Map<string, { ticket: string; expires: number }>();
+  private readonly stickers: Pick<StickerLibrary, "pick">;
 
   constructor(readonly config: WechatAdapterConfig) {
     this.client = new IlinkClient({
@@ -88,6 +98,9 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
       ...(config.fetch ? { fetch: config.fetch } : {}),
     });
     this.store = new WechatStateStore(config.dataDir, config.token);
+    this.stickers =
+      config.stickers ??
+      new StickerLibrary({ dataDir: config.dataDir, ...(config.fetch ? { fetch: config.fetch } : {}) });
   }
 
   async initialize(chat: ChatInstance) {
@@ -267,12 +280,51 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     return [];
   }
 
+  /**
+   * Text, then each file (a picture when WeChat can show it), then at most one sticker for a
+   * `[表情:...]` tag. One bubble per item; a sticker that cannot be found or sent is dropped
+   * quietly so a retry never repeats the text.
+   */
   async postMessage(threadId: string, message: AdapterPostableMessage) {
     const userId = decodeWechatThreadId(threadId);
-    const body = outboundText(message).trim();
-    if (!body) throw new Error("WeChat message content is empty or unsupported");
-    const id = await this.client.sendText(userId, body, await this.store.context(userId));
+    const context = await this.store.context(userId);
+    const { text: body, queries } = extractStickerTags(outboundText(message).trim());
+    const files = typeof message === "object" && "files" in message ? (message.files ?? []) : [];
+    if (!body && files.length === 0 && queries.length === 0) {
+      throw new Error("WeChat message content is empty or unsupported");
+    }
+    let id = "";
+    if (body) id = await this.client.sendText(userId, body, context);
+    for (const file of files) id = await this.sendUpload(userId, file, context);
+    const query = queries[0];
+    if (query) {
+      try {
+        const sticker = await this.stickers.pick(query);
+        if (sticker) {
+          id = await this.sendUpload(
+            userId,
+            { data: Buffer.from(sticker.data), filename: sticker.name, mimeType: sticker.mimeType },
+            context,
+          );
+        }
+      } catch (error) {
+        getLogger().warn("wechat sticker failed", { error: String(error) });
+      }
+    }
     return { id, threadId, raw: { client_id: id } as IlinkMessage };
+  }
+
+  private async sendUpload(userId: string, file: FileUpload, context: string | undefined) {
+    const data = await uploadBytes(file.data);
+    const image = WECHAT_IMAGE_TYPES.has(file.mimeType ?? "");
+    const uploaded = await this.client.uploadMedia(
+      userId,
+      data,
+      image ? ILINK_UPLOAD.image : ILINK_UPLOAD.file,
+    );
+    return image
+      ? this.client.sendImage(userId, uploaded, context)
+      : this.client.sendFile(userId, file.filename, uploaded, context);
   }
 
   async startTyping(threadId: string) {
@@ -357,6 +409,12 @@ function outboundText(message: AdapterPostableMessage): string {
   if ("ast" in message && message.ast) return toPlainText(message.ast);
   if ("raw" in message && typeof message.raw === "string") return message.raw;
   return "";
+}
+
+async function uploadBytes(data: FileUpload["data"]): Promise<Uint8Array> {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  return new Uint8Array(await data.arrayBuffer());
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

@@ -393,7 +393,8 @@ export function messagingPlatformsFromEnv(
   if (env.wechatBotToken) {
     platforms.push({
       provider: "wechat",
-      capabilities: { direct: true, groups: false, receipt: "typing" },
+      // Pictures and files a reply attaches are uploaded to WeChat's CDN and sent after the text.
+      capabilities: { direct: true, groups: false, receipt: "typing", files: true },
       adapter: new WechatAdapter({
         token: env.wechatBotToken,
         baseUrl: env.wechatBaseUrl,

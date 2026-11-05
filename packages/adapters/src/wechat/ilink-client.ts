@@ -1,4 +1,4 @@
-import { createDecipheriv, randomBytes, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 
 /**
  * Direct client for Tencent's iLink bot API, which connects a personal WeChat
@@ -35,6 +35,20 @@ export interface IlinkMedia {
   encrypt_query_param?: string;
   aes_key?: string;
   full_url?: string;
+  /** 1 on media this client uploads (AES-128-ECB). */
+  encrypt_type?: number;
+}
+
+/** What `getuploadurl` calls media_type. */
+export const ILINK_UPLOAD = { image: 1, video: 2, file: 3 } as const;
+
+/** One file on the CDN, ready to go into an image or file item. */
+export interface IlinkUploaded {
+  media: IlinkMedia;
+  /** Plaintext bytes. */
+  size: number;
+  /** Ciphertext bytes (an image item's mid_size). */
+  cipherSize: number;
 }
 
 export interface IlinkMessage {
@@ -105,6 +119,41 @@ export class IlinkClient {
 
   /** Sends one text message; returns the client id the message was sent under. */
   async sendText(toUserId: string, text: string, contextToken?: string): Promise<string> {
+    return this.sendItem(toUserId, { type: ILINK_ITEM.text, text_item: { text } }, contextToken);
+  }
+
+  /** Sends an uploaded image (a photo, a chart, a sticker). */
+  async sendImage(toUserId: string, uploaded: IlinkUploaded, contextToken?: string): Promise<string> {
+    return this.sendItem(
+      toUserId,
+      { type: ILINK_ITEM.image, image_item: { media: uploaded.media, mid_size: uploaded.cipherSize } },
+      contextToken,
+    );
+  }
+
+  /** Sends an uploaded file under `fileName`. */
+  async sendFile(
+    toUserId: string,
+    fileName: string,
+    uploaded: IlinkUploaded,
+    contextToken?: string,
+  ): Promise<string> {
+    return this.sendItem(
+      toUserId,
+      {
+        type: ILINK_ITEM.file,
+        file_item: { media: uploaded.media, file_name: fileName, len: String(uploaded.size) },
+      },
+      contextToken,
+    );
+  }
+
+  /** One message with one item (WeChat shows one bubble per message). */
+  private async sendItem(
+    toUserId: string,
+    item: IlinkMessageItem,
+    contextToken?: string,
+  ): Promise<string> {
     const clientId = `rakazo-${randomUUID()}`;
     const body = await this.post(
       "ilink/bot/sendmessage",
@@ -116,7 +165,7 @@ export class IlinkClient {
           message_type: 2,
           message_state: 2,
           ...(contextToken ? { context_token: contextToken } : {}),
-          item_list: [{ type: ILINK_ITEM.text, text_item: { text } }],
+          item_list: [item],
         },
       },
       ILINK_REQUEST_TIMEOUT_MS,
@@ -126,6 +175,80 @@ export class IlinkClient {
       throw new IlinkError(`sendmessage failed: ${code} ${stringOf(body.errmsg)}`.trim(), code);
     }
     return clientId;
+  }
+
+  /**
+   * Encrypts `data` with a fresh AES-128-ECB key and uploads it to the CDN for `toUserId`
+   * (getuploadurl, then a POST of the ciphertext; the CDN answers with the download parameter).
+   */
+  async uploadMedia(
+    toUserId: string,
+    data: Uint8Array,
+    mediaType: (typeof ILINK_UPLOAD)[keyof typeof ILINK_UPLOAD],
+  ): Promise<IlinkUploaded> {
+    if (data.byteLength > ILINK_MEDIA_MAX_BYTES) throw new IlinkError("media is too large");
+    const plain = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    const key = randomBytes(16);
+    const cipher = createCipheriv("aes-128-ecb", key, null);
+    const encrypted = Buffer.concat([cipher.update(plain), cipher.final()]);
+    const filekey = randomBytes(16).toString("hex");
+    const body = await this.post(
+      "ilink/bot/getuploadurl",
+      {
+        filekey,
+        media_type: mediaType,
+        to_user_id: toUserId,
+        rawsize: plain.byteLength,
+        rawfilemd5: createHash("md5").update(plain).digest("hex"),
+        filesize: encrypted.byteLength,
+        no_need_thumb: true,
+        aeskey: key.toString("hex"),
+      },
+      ILINK_REQUEST_TIMEOUT_MS,
+    );
+    const code = failureCode(body);
+    if (code !== undefined) {
+      throw new IlinkError(`getuploadurl failed: ${code} ${stringOf(body.errmsg)}`.trim(), code);
+    }
+    const full = stringOf(body.upload_full_url).trim();
+    const param = stringOf(body.upload_param);
+    if (!full && !param) throw new IlinkError("getuploadurl returned no upload URL");
+    const url =
+      full ||
+      `${ILINK_CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(param)}&filekey=${encodeURIComponent(filekey)}`;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await this.fetchImpl(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: new Uint8Array(encrypted),
+          signal: AbortSignal.timeout(60_000),
+        });
+        if (response.status >= 400 && response.status < 500) {
+          // A client error will not get better on retry.
+          throw new IlinkError(`media upload refused: HTTP ${response.status}`, response.status);
+        }
+        const download = response.headers.get("x-encrypted-param");
+        if (response.status !== 200 || !download) {
+          throw new Error(`media upload failed: HTTP ${response.status}`);
+        }
+        return {
+          // aes_key is base64 of the 32-character hex string, as the reference client sends it.
+          media: {
+            encrypt_query_param: download,
+            aes_key: Buffer.from(key.toString("hex")).toString("base64"),
+            encrypt_type: 1,
+          },
+          size: plain.byteLength,
+          cipherSize: encrypted.byteLength,
+        };
+      } catch (error) {
+        if (error instanceof IlinkError) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new IlinkError("media upload failed");
   }
 
   /** A typing ticket for one peer, needed by sendTyping. */

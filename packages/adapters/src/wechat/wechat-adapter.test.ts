@@ -257,7 +257,7 @@ describe("WeChat platform wiring", () => {
     expect(messagingPlatformsFromEnv({}).map((platform) => platform.provider)).toEqual([]);
     const [platform] = messagingPlatformsFromEnv({ wechatBotToken: "t", dataDir: "/tmp/x" });
     expect(platform!.provider).toBe("wechat");
-    expect(platform!.capabilities).toEqual({ direct: true, groups: false, receipt: "typing" });
+    expect(platform!.capabilities).toEqual({ direct: true, groups: false, receipt: "typing", files: true });
   });
 
   it("splits long replies at line breaks under the part limit", () => {
