@@ -139,6 +139,16 @@ async function commitOwnInstructions(
 }
 
 /** This bot's own settings, Spaces and the bots this bot manages. */
+/** Own settings only the owner changes (see update_bot). */
+const OWNER_ONLY_SETTINGS = [
+  "model",
+  "thinkingLevel",
+  "readAloud",
+  "voice",
+  "notifyOnFinish",
+  "dailyCheckIns",
+] as const;
+
 export const fleetTools: ToolHandlers = {
   async create_space(ctx, call) {
     const { deps, run } = ctx;
@@ -272,6 +282,39 @@ export const fleetTools: ToolHandlers = {
           reason: String(args.reason),
           previousInstructions: args.previousInstructions,
         }),
+      );
+    }
+    // Only the owner changes a bot's own settings. Asked by another bot which model it was on,
+    // every bot once filled in each optional field and rewrote its own settings. A turn another
+    // bot or a routine started still reads them, and may still edit its name or instructions.
+    const ownerTurn = ctx.source.ownerStartedRun || run.trigger === "created";
+    const refused = ownerTurn
+      ? []
+      : OWNER_ONLY_SETTINGS.filter((key) => argumentGiven(args[key])).map(
+          (key) => `${key}=${JSON.stringify(args[key])}`,
+        );
+    if (refused.length) {
+      const others = Object.entries(args).filter(
+        ([key, value]) =>
+          !(OWNER_ONLY_SETTINGS as readonly string[]).includes(key) &&
+          key !== "instructions_offset" &&
+          key !== "instructionsOffset" &&
+          argumentGiven(value),
+      );
+      if (others.length) {
+        return call.finish({
+          error: `Not applied: ${refused.join(", ")}. Another bot or a routine started this turn, so only the owner can change these settings. Send the other fields again without them.`,
+        });
+      }
+      const live = await deps.prisma.bot.findUniqueOrThrow({ where: { id: bot.id } });
+      const settings = await readOwnBotSettings(await fleetPrepareDeps(deps, run), run, live, 0);
+      return call.finish(
+        settings && typeof settings === "object" && !("error" in settings)
+          ? {
+              ...settings,
+              ignoredFields: `Not applied: ${refused.join(", ")}. Another bot or a routine started this turn, so these are read-only here; only the owner can change them.`,
+            }
+          : settings,
       );
     }
     const { instructions, model, thinkingLevel, readAloud, voice, ...profile } = args;
