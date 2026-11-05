@@ -70,7 +70,8 @@ export const WECHAT_TYPING_REFRESH_MS = 5_000;
 export const WECHAT_TYPING_MAX_MS = 5 * 60_000;
 /** A reply still not out after this long gets a short note first: replies only go out once a run ends. */
 export const WECHAT_ACK_AFTER_MS = 30_000;
-export const WECHAT_ACK_NOTES = ["收到～我去弄一下，稍等哦", "好嘞，在查了，马上回你", "收到！等我一下下～"];
+// Plain on purpose: a cute stock line repeated every few days reads as forced.
+export const WECHAT_ACK_NOTES = ["收到，我看一下", "在弄了，稍等", "有点多，等我一会儿"];
 /** `[收藏表情:...]` keeps the picture the owner sent within this long. */
 const COLLECT_MAX_AGE_MS = 30 * 60_000;
 
