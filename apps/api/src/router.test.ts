@@ -5,7 +5,11 @@ import type { InferRouterInitialContext } from "@orpc/server";
 import { createRouterClient } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import type { ManagedConnectorProvider } from "@rakazo/adapter-kit";
-import { ConnectorAuthUnavailableError, SecretStoreUnavailableError } from "@rakazo/adapter-kit";
+import {
+  ConnectorAuthUnavailableError,
+  routineWakeupJob,
+  SecretStoreUnavailableError,
+} from "@rakazo/adapter-kit";
 import type { McpOAuthSummary } from "@rakazo/adapters";
 import * as adapters from "@rakazo/adapters";
 import {
@@ -87,18 +91,60 @@ describe("account preferences", () => {
       },
     );
     const botFindMany = vi.fn().mockResolvedValue([]);
+    const routines: Record<string, unknown>[] = [];
+    const matches = (row: Record<string, unknown>, where: Record<string, unknown>) =>
+      Object.entries(where).every(([key, value]) =>
+        value && typeof value === "object" && "in" in value
+          ? (value.in as unknown[]).includes(row[key])
+          : row[key] === value,
+      );
     const prisma = {
       user: {
         update,
         updateMany,
+        findUnique: vi.fn(async () => ({ timezone: user.timezone })),
         findUniqueOrThrow: vi.fn().mockResolvedValue(user),
       },
       bot: { findMany: botFindMany },
+      routine: {
+        findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) =>
+          routines.filter((row) => matches(row, where)),
+        ),
+        updateMany: vi.fn(
+          async ({
+            where,
+            data,
+          }: {
+            where: Record<string, unknown>;
+            data: Record<string, unknown>;
+          }) => {
+            let count = 0;
+            for (const [index, row] of routines.entries()) {
+              if (!matches(row, where)) continue;
+              routines[index] = { ...row, ...data };
+              count += 1;
+            }
+            return { count };
+          },
+        ),
+      },
+      $transaction: vi.fn(async (run: (client: unknown) => Promise<unknown>) => run(prisma)),
+      $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const sql = strings.join("?");
+        if (sql.includes("FOR SHARE")) return [{ timezone: user.timezone }];
+        if (sql.includes('"routines"')) {
+          return routines
+            .filter((row) => matches(row, { userId: values[0], timezone: values[1] }))
+            .map((row) => ({ id: row.id }));
+        }
+        return [];
+      }),
       userModelPreference: { findFirst: vi.fn().mockResolvedValue(null) },
       deploymentSettings: { findUnique: vi.fn().mockResolvedValue(null) },
     } as unknown as PrismaClient;
     const deps = {
       prisma,
+      jobs: { enqueue: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined) },
       env: {
         defaultProvider: "fake",
         defaultModel: "fake-model",
@@ -118,6 +164,7 @@ describe("account preferences", () => {
       update,
       updateMany,
       botFindMany,
+      routines,
       deps,
       actor,
       handler: new RPCHandler(createRouter(deps)),
@@ -403,6 +450,64 @@ describe("account preferences", () => {
       where: { id: "user-1" },
       data: { timezone: "Pacific/Auckland" },
     });
+  });
+
+  it("saves the timezone and the language preference in one write", async () => {
+    const setup = preferencesDeps("organic", "Africa/Cairo");
+
+    const response = await updatePreferences(setup, {
+      timezone: "Europe/London",
+      locale: "pt-BR",
+    });
+
+    expect(response.status).toBe(200);
+    expect(setup.update).toHaveBeenCalledTimes(1);
+    expect(setup.update).toHaveBeenCalledWith({
+      where: { id: "user-1" },
+      data: { timezone: "Europe/London", locale: "pt-BR" },
+    });
+  });
+
+  it("moves routines that took the account zone to the new one", async () => {
+    vi.useFakeTimers({ now: new Date("2026-11-04T12:00:00.000Z") });
+    try {
+      const setup = preferencesDeps("organic", "Africa/Cairo");
+      setup.routines.push(
+        {
+          id: "routine-1",
+          userId: "user-1",
+          crons: ["0 9 * * 1"],
+          timezone: "Africa/Cairo",
+          active: true,
+          watch: null,
+          nextRunAt: new Date("2026-11-09T07:00:00.000Z"),
+        },
+        {
+          id: "routine-2",
+          userId: "user-1",
+          crons: ["0 9 * * 1"],
+          timezone: "Asia/Tokyo",
+          active: true,
+          watch: null,
+          nextRunAt: new Date("2026-11-09T00:00:00.000Z"),
+        },
+      );
+
+      const response = await updatePreferences(setup, { timezone: "Europe/London" });
+
+      expect(response.status).toBe(200);
+      // The routine that took the account zone keeps Monday 09:00 in London; the pinned one stays.
+      expect(setup.routines[0]).toMatchObject({
+        timezone: "Europe/London",
+        nextRunAt: new Date("2026-11-09T09:00:00.000Z"),
+      });
+      expect(setup.routines[1]).toMatchObject({ timezone: "Asia/Tokyo" });
+      expect(setup.deps.jobs.enqueue).toHaveBeenCalledWith(
+        routineWakeupJob("routine-1", new Date("2026-11-09T09:00:00.000Z")),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("saves the app language emails are written in", async () => {
@@ -1508,6 +1613,7 @@ describe("MCP pre-registered OAuth client", () => {
         }),
       },
       mcpServerSpace: { findMany: vi.fn(async () => []) },
+      mcpOAuthSession: { deleteMany: vi.fn(async () => ({ count: 0 })) },
       secret: {
         create: vi.fn(async ({ data }: { data: { id: string; ciphertext: string } }) => {
           secretRows.set(data.id, data);
@@ -1624,6 +1730,26 @@ describe("MCP pre-registered OAuth client", () => {
     });
     expect(secrets.put).not.toHaveBeenCalled();
     expect(prisma.mcpServer.create).not.toHaveBeenCalled();
+  });
+
+  it("does not report a stored credential for a lone OAuth generation marker", async () => {
+    const { client, server } = harness(true);
+
+    const created = await client.mcp.servers.create({
+      transport: "streamable_http",
+      slug: "gmail",
+      name: "Gmail",
+      endpoint: "http://localhost:3100/mcp",
+    });
+    expect(created.hasSecret).toBe(false);
+
+    await client.mcp.oauth.disconnect({ serverId: created.id });
+    // The disconnect of a never-connected server still leaves the generation marker row.
+    expect(server()?.secretId).not.toBeNull();
+
+    const checked = await client.mcp.servers.test({ id: created.id });
+    expect(checked.hasSecret).toBe(false);
+    expect(checked.oauthStatus).toBe("none");
   });
 
   describe("stdio server with host-managed OAuth", () => {
@@ -2232,7 +2358,9 @@ describe("MCP server health", () => {
       $queryRaw: vi.fn(async () => []),
       $transaction: vi.fn(async (run: (tx: unknown) => Promise<unknown>) => run(prisma)),
     } as unknown as PrismaClient;
-    const summaryFor = vi.fn(async () => options.oauth ?? { status: "none", clientId: null });
+    const summaryFor = vi.fn(
+      async () => options.oauth ?? { status: "none", clientId: null, credential: true },
+    );
     const deps = {
       prisma,
       secrets: { put: vi.fn(), load: vi.fn() },
@@ -2429,7 +2557,7 @@ describe("MCP server health", () => {
 
     it("says why it did not probe when the server still needs its OAuth account", async () => {
       const { client, probe } = harness({
-        oauth: { status: "none", clientId: "client-1.apps.example.test" },
+        oauth: { status: "none", clientId: "client-1.apps.example.test", credential: true },
       });
 
       const tested = await client.mcp.servers.test({ id: "server-1" });
@@ -2449,7 +2577,7 @@ describe("MCP server health", () => {
       async (material, shouldProbe) => {
         const h = harness({
           row: baseRow({ secretId: "secret-1" }),
-          oauth: { status: "none", clientId: "fake-client" },
+          oauth: { status: "none", clientId: "fake-client", credential: true },
         });
         vi.mocked(h.deps.prisma.secret.findFirst).mockResolvedValue({
           id: "secret-1",
@@ -2518,7 +2646,7 @@ describe("MCP server health", () => {
     it("does not probe a server whose OAuth account is not connected", async () => {
       const { client, probe, row } = harness({
         row: null,
-        oauth: { status: "none", clientId: "client-1.apps.example.test" },
+        oauth: { status: "none", clientId: "client-1.apps.example.test", credential: true },
       });
 
       const created = await client.mcp.servers.create(stdioInput);

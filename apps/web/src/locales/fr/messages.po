@@ -405,6 +405,10 @@ msgstr "{title}, enregistré sous {savedAs}"
 msgid "{toolCount, plural, one {# tool} other {# tools}}"
 msgstr "{toolCount, plural, one {# outil} other {# outils}}"
 
+#: src/components/ModelCredits.tsx
+msgid "{vcpus} vCPU, {memoryGb} GB, {hours} computer hours a month"
+msgstr "{vcpus} vCPU, {memoryGb} Go, {hours} heures d’ordinateur par mois"
+
 #. placeholder {0}: mention.name
 #: src/pages/shell/composer.tsx
 msgid "@{0}"
@@ -1026,6 +1030,10 @@ msgstr "Studio d'avatars"
 msgid "Back"
 msgstr "Retour"
 
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
+msgid "Back or forward"
+msgstr "Précédent ou suivant"
+
 #: src/components/pages/PageNotice.tsx
 msgid "Back to chat"
 msgstr "Retour au chat"
@@ -1214,6 +1222,7 @@ msgstr "Ne peut pas lire les images"
 #: src/pages/model-settings/space-bots-model.tsx
 #: src/pages/ModelSettingsOverlay.tsx
 #: src/pages/Onboarding.tsx
+#: src/pages/OrganizationSettingsPanel.tsx
 #: src/pages/PaymentWalletSettingsPanel.tsx
 #: src/pages/PluginSubmissionsPanel.tsx
 #: src/pages/shell/create-bot-dialog.tsx
@@ -1294,6 +1303,10 @@ msgstr ""
 #: src/pages/model-settings/compatible-model-fields.tsx
 msgid "Chat Completions"
 msgstr ""
+
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
+msgid "Chat details"
+msgstr "Détails de la discussion"
 
 #: src/pages/shell/composer-mentions.tsx
 msgid "Chat Settings"
@@ -1445,6 +1458,7 @@ msgstr "Effacement en cours…"
 #: src/pages/PeerMessagesOverlay.tsx
 #: src/pages/RoutineEditor.tsx
 #: src/pages/shell/avatar-studio-popover.tsx
+#: src/pages/shell/chat-find-bar.tsx
 #: src/pages/WindowChrome.tsx
 msgid "Close"
 msgstr "Fermer"
@@ -1554,6 +1568,7 @@ msgid "Command"
 msgstr "Commande"
 
 #: src/pages/shell/command-palette.tsx
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
 msgid "Command menu"
 msgstr ""
 
@@ -1612,6 +1627,10 @@ msgstr "L'ordinateur est en veille. Ouvrez-le pour le réveiller."
 #: src/pages/shell/computer-view.tsx
 msgid "Computer is stopped"
 msgstr "L'ordinateur est arrêté"
+
+#: src/pages/ModelSettingsOverlay.tsx
+msgid "Computer-use model"
+msgstr "Modèle pour utiliser l’ordinateur"
 
 #: src/components/ComputerDeviceSettings.tsx
 #: src/pages/AccountSettingsOverlay.tsx
@@ -1688,6 +1707,7 @@ msgstr "Connecter la clé API"
 
 #: src/components/SidebarFooter.tsx
 #: src/pages/Shell.tsx
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
 msgid "Connect apps"
 msgstr "Connecter des applications"
 
@@ -2442,6 +2462,7 @@ msgstr ""
 msgid "Country"
 msgstr ""
 
+#: src/components/CreateOrganizationDialog.tsx
 #: src/pages/Board.tsx
 #: src/pages/shell/agent-import.tsx
 #: src/pages/shell/create-bot-dialog.tsx
@@ -2462,6 +2483,11 @@ msgstr "Créer un compte"
 #: src/pages/GroupPanel.tsx
 msgid "Create group"
 msgstr "Créer un groupe"
+
+#: src/components/CreateOrganizationDialog.tsx
+#: src/pages/OrganizationSettingsPanel.tsx
+msgid "Create organization"
+msgstr "Créer une organisation"
 
 #: src/pages/RoutineEditor.tsx
 msgid "Create Routine"
@@ -2608,6 +2634,7 @@ msgstr "Portée par défaut"
 #: src/pages/BotContextMenu.tsx
 #: src/pages/KnowledgeSection.tsx
 #: src/pages/McpServersOverlay.tsx
+#: src/pages/OrganizationSettingsPanel.tsx
 #: src/pages/RoutineEditor.tsx
 #: src/pages/shell/archived-chats.tsx
 #: src/pages/shell/dialogs.tsx
@@ -2634,6 +2661,7 @@ msgstr "Supprimer {0}"
 #. placeholder {0}: deleting.name
 #. placeholder {0}: item.name
 #: src/pages/McpServersOverlay.tsx
+#: src/pages/OrganizationSettingsPanel.tsx
 #: src/pages/shell/dialogs.tsx
 msgid "Delete {0}?"
 msgstr "Supprimer {0} ?"
@@ -2650,6 +2678,10 @@ msgstr "Supprimer le groupe"
 #: src/pages/shell/dialogs.tsx
 msgid "Delete memories too"
 msgstr "Supprimer les mémoires également"
+
+#: src/pages/OrganizationSettingsPanel.tsx
+msgid "Delete organization"
+msgstr "Supprimer l’organisation"
 
 #: src/pages/shell/sidebar-roster.tsx
 msgid "Delete section"
@@ -2670,6 +2702,7 @@ msgstr "supprimé"
 
 #: src/components/PasskeySettings.tsx
 #: src/pages/Artifacts.tsx
+#: src/pages/OrganizationSettingsPanel.tsx
 #: src/pages/shell/dialogs.tsx
 msgid "Deleting…"
 msgstr "Suppression en cours…"
@@ -2720,6 +2753,10 @@ msgstr "Détails"
 #: src/pages/PluginsOverlay.tsx
 msgid "Developer"
 msgstr ""
+
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
+msgid "Dictate"
+msgstr "Dicter"
 
 #: src/lib/dictation.ts
 msgid "Dictation ended unexpectedly."
@@ -3175,6 +3212,11 @@ msgstr ""
 msgid "Find a page"
 msgstr "Trouver une page"
 
+#: src/pages/shell/chat-find-bar.tsx
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
+msgid "Find in chat"
+msgstr "Rechercher dans la discussion"
+
 #: src/pages/model-settings/compatible-model-fields.tsx
 #: src/pages/Onboarding.tsx
 msgid "Find models"
@@ -3205,6 +3247,10 @@ msgstr "Terminé."
 #: src/pages/McpOAuthCallback.tsx
 msgid "Finishing MCP connection…"
 msgstr "Finalisation de la connexion MCP…"
+
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
+msgid "Focus message"
+msgstr "Aller au message"
 
 #: src/pages/Auth.tsx
 msgid "Forgot password?"
@@ -3290,6 +3336,10 @@ msgstr "Offrez {weeks} semaines gratuites à un ami"
 #: src/pages/NotFound.tsx
 msgid "Go home"
 msgstr "Retour à l’accueil"
+
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
+msgid "Go to bot"
+msgstr "Aller à un bot"
 
 #: src/pages/AdminAccessPage.tsx
 msgid "Grant"
@@ -3641,6 +3691,11 @@ msgstr ""
 #: src/pages/RoutineEditor.tsx
 msgid "key"
 msgstr "clé"
+
+#: src/pages/Shell.tsx
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
+msgid "Keyboard shortcuts"
+msgstr "Raccourcis clavier"
 
 #: src/components/vault/kinds.tsx
 msgid "Keys"
@@ -4153,6 +4208,7 @@ msgstr "Micro coupé"
 msgid "My computers"
 msgstr ""
 
+#: src/components/CreateOrganizationDialog.tsx
 #: src/components/teach/SkillDraftCard.tsx
 #: src/components/vault/VaultItemEditor.tsx
 #: src/pages/AccountSettingsOverlay.tsx
@@ -4160,6 +4216,7 @@ msgstr ""
 #: src/pages/GroupPanel.tsx
 #: src/pages/McpServersOverlay.tsx
 #: src/pages/model-settings/providers-section.tsx
+#: src/pages/OrganizationSettingsPanel.tsx
 #: src/pages/PluginsOverlay.tsx
 #: src/pages/RoutineEditor.tsx
 #: src/pages/shell/agent-import.tsx
@@ -4228,6 +4285,7 @@ msgstr "Ne jamais demander"
 
 #: src/components/VaultSettings.tsx
 #: src/pages/shell/chat-context.tsx
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
 msgid "New"
 msgstr ""
 
@@ -4259,6 +4317,7 @@ msgstr "Nouveau groupe"
 
 #: src/pages/Shell.tsx
 #: src/pages/shell/bot-picker.tsx
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
 msgid "New group chat"
 msgstr "Nouvelle discussion de groupe"
 
@@ -4304,6 +4363,14 @@ msgstr ""
 #: src/components/VaultSettings.tsx
 msgid "New variable"
 msgstr ""
+
+#: src/pages/shell/chat-find-bar.tsx
+msgid "Next match"
+msgstr "Résultat suivant"
+
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
+msgid "Next or previous bot"
+msgstr "Bot suivant ou précédent"
 
 #: src/components/markdown-copy.tsx
 msgid "Next page"
@@ -4658,8 +4725,9 @@ msgid "Or paste an API key"
 msgstr "Ou collez une clé API"
 
 #: src/components/ComputerProviderSettings.tsx
+#: src/pages/settings-nav.ts
 msgid "Organization"
-msgstr ""
+msgstr "Organisation"
 
 #: src/pages/memory-providers/SupermemorySettingsForm.tsx
 msgid "Organization API key"
@@ -4872,6 +4940,10 @@ msgstr "Épingler"
 msgid "Pinned"
 msgstr "Épinglés"
 
+#: src/components/ModelCredits.tsx
+msgid "Plan"
+msgstr "Forfait"
+
 #: src/components/ArtifactFileCard.tsx
 msgid "Play {name}"
 msgstr "Lire {name}"
@@ -4922,6 +4994,10 @@ msgstr "Aperçu de {0}"
 #: src/pages/Artifacts.tsx
 msgid "Preview isn't available for this file type — download it to view it."
 msgstr "L'aperçu n'est pas disponible pour ce type de fichier — téléchargez-le pour le consulter."
+
+#: src/pages/shell/chat-find-bar.tsx
+msgid "Previous match"
+msgstr "Résultat précédent"
 
 #: src/components/markdown-copy.tsx
 msgid "Previous page"
@@ -5499,6 +5575,10 @@ msgstr ""
 msgid "Same as {botName}"
 msgstr "Comme {botName}"
 
+#: src/pages/ModelSettingsOverlay.tsx
+msgid "Same as main model"
+msgstr "Identique au modèle principal"
+
 #: src/lib/cron.ts
 msgid "Saturday"
 msgstr "samedi"
@@ -5614,6 +5694,10 @@ msgstr "Rechercher des applications"
 #: src/pages/Artifacts.tsx
 msgid "Search artifacts…"
 msgstr "Rechercher des artefacts…"
+
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
+msgid "Search bots"
+msgstr "Rechercher des bots"
 
 #: src/pages/shell/command-palette.tsx
 msgid "Search bots, actions, and settings"
@@ -5748,6 +5832,7 @@ msgstr "URL du serveur"
 #: src/components/SidebarFooter.tsx
 #: src/pages/MessagingSettingsPanel.tsx
 #: src/pages/SettingsOverlay.tsx
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
 #: src/pages/shell/shell-dialogs.tsx
 msgid "Settings"
 msgstr "Paramètres"
@@ -6190,6 +6275,10 @@ msgid "Switch"
 msgstr "Changer"
 
 #: src/components/ModelCredits.tsx
+msgid "Switch to {tierTargetName}?"
+msgstr "Passer à {tierTargetName} ?"
+
+#: src/components/ModelCredits.tsx
 msgid "Switch to yearly"
 msgstr "Passer à l'annuel"
 
@@ -6322,6 +6411,10 @@ msgstr "Le fournisseur de mémoire sélectionné n'est pas disponible dans cette
 msgid "The shared link stops working"
 msgstr "Le lien partagé cessera de fonctionner"
 
+#: src/components/ModelCredits.tsx
+msgid "The unused difference is credited to your next invoice."
+msgstr "La différence non utilisée est créditée sur votre prochaine facture."
+
 #: src/pages/model-settings/space-bots-model.tsx
 msgid "Their own model is cleared. You can pick one again in each bot."
 msgstr ""
@@ -6390,6 +6483,7 @@ msgstr "Cet appel ne sonne plus."
 msgid "This can't be undone."
 msgstr "Cette action est irréversible."
 
+#: src/pages/OrganizationSettingsPanel.tsx
 #: src/pages/shell/dialogs.tsx
 msgid "This cannot be undone."
 msgstr "Cette action est irréversible."
@@ -6549,6 +6643,10 @@ msgstr "À :"
 msgid "Today"
 msgstr "Aujourd'hui"
 
+#: src/pages/shell/keyboard-shortcuts-dialog.tsx
+msgid "Toggle sidebar"
+msgstr "Afficher ou masquer la barre latérale"
+
 #: src/pages/AccountSettingsOverlay.tsx
 msgid "Tokens"
 msgstr "Jetons"
@@ -6640,6 +6738,10 @@ msgstr "mardi"
 #: src/components/vault/VaultItemEditor.tsx
 msgid "Type"
 msgstr ""
+
+#: src/pages/OrganizationSettingsPanel.tsx
+msgid "Type {name} to confirm"
+msgstr "Saisissez {name} pour confirmer"
 
 #: src/components/teach/TeachRecordingChrome.tsx
 msgid "Type without recording"
@@ -7100,6 +7202,10 @@ msgstr "Votre Anthropic"
 msgid "Your card is charged {annualPrice} today, less the unused part of this month."
 msgstr "Votre carte est débitée de {annualPrice} aujourd'hui, moins la partie inutilisée de ce mois."
 
+#: src/components/ModelCredits.tsx
+msgid "Your card is charged the prorated difference today."
+msgstr "Votre carte est débitée aujourd’hui de la différence au prorata."
+
 #: src/pages/Shell.tsx
 msgid "Your computer's disk is nearly full. Free up space by removing build output and caches you no longer need."
 msgstr "Le disque de votre ordinateur est presque plein. Libérez de l’espace en supprimant les fichiers de build et les caches dont vous n’avez plus besoin."
@@ -7138,6 +7244,10 @@ msgstr "Votre OpenRouter"
 #: src/components/ModelCredits.tsx
 msgid "Your plan becomes {annualPrice} / year when your trial ends."
 msgstr "À la fin de votre essai, votre forfait passe à {annualPrice} / an."
+
+#: src/components/ModelCredits.tsx
+msgid "Your plan becomes {tierTargetLabel} when your trial ends."
+msgstr "Votre forfait passe à {tierTargetLabel} à la fin de votre essai."
 
 #: src/components/integrations/skills-dialog.tsx
 msgid "Your skills"

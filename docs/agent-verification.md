@@ -345,6 +345,31 @@ members' ideas and tasks as their own and could not say which member suggested
 what. The small Anthropic model still sometimes says "you" for a task it took
 on itself.
 
+### Group routing evals
+
+```sh
+pnpm test:evals --suite group-routing --list
+pnpm test:evals --live --suite group-routing --connection <private-connection.json> --pricing <pricing.json> --trials 3 --spend-cap-usd 1 --output test-report/evals/group-routing.json
+```
+
+Each case sends a group message that names nobody, so every member gets it and
+decides alone whether to answer. Every member runs the eval model. One group has
+five bots with distinct roles; another has two peer bots, each holding facts
+only it knows. The cases check that a question reaches the member whose role
+owns it, that a request for one piece of work gets one author, that a question
+nobody owns gets one or two answers, that a roll call gets every member, that a
+greeting or sign-off does not get a reply from everyone, and that a question
+about both peers gets both. Graders count which members posted after the
+message and require the owners to be among them; a handoff or ask card counts
+as a post.
+
+The November 2026 baseline over three trials per case passed every case on the
+default DeepSeek model and on a small Anthropic model, and all but two trials on
+a small OpenAI model, where a greeting and a sign-off each drew one extra
+reply. Sending every unnamed message to the first member instead missed every
+roll call, cost a handoff for any question owned by another member, and on the
+Anthropic model often answered a question about both peers with one of them.
+
 ### Routine silence evals
 
 ```sh
@@ -412,7 +437,16 @@ from `routine.created` events, because `schedule_cancel` deletes the routine.
 The `initiative-meaning-v1` rubric grades the follow-up's chat and push by meaning:
 they must ask about the outstanding item without claiming it arrived or
 inventing details. Calibration anchors cover a paraphrase, another
-language, a false receipt, and a bare alert. No live baseline is claimed yet.
+language, a false receipt, and a bare alert.
+
+The November 2026 baseline, two runs of three trials per case on the default
+small deployment model with a larger one judging, never set a follow-up the user
+declined or one for an item already closed. The open-loop and closed-early cases
+passed half the time. On the misses the bot set no follow-up, or answered the
+promise with a clarifying question, which these cases count as a failure. The
+runner wakes the follow-up right away rather than at the promised time, so a bot
+that notices the lease is not due yet may schedule another check; that shows up
+as a second follow-up.
 
 ### Bot memory evals
 
