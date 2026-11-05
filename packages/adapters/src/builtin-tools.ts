@@ -1492,7 +1492,7 @@ export const builtinAgentTools: ConnectorTool[] = [
   {
     name: "update_bot",
     description:
-      "Read or change your own settings. Call with no fields to read them and the models and thinking levels you can pick. Long instructions come in pages; follow instructionsNextOffset before replacing them. If a read comes back with contextTruncated, it was shortened: say so, do not rewrite. Pass fields to change them, only when the user asks; setting your name, description and first instructions when you have none is fine. Never claim a change without calling this.",
+      "Read or change your own settings. Call with no fields to read them and the models and thinking levels you can pick; any field you pass is a change. Long instructions come in pages; follow instructionsNextOffset before replacing them. If a read comes back with contextTruncated, it was shortened: say so, do not rewrite. Pass fields to change them, only when the user asks; setting your name, description and first instructions when you have none is fine. Never claim a change without calling this.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1564,7 +1564,7 @@ export const builtinAgentTools: ConnectorTool[] = [
   {
     name: "list_fleet",
     description:
-      "List the bots and groups in this space with their ids, sections and pinned state. You can manage every bot listed; createdByMe only says which ones you created. Pass bot_id of a bot in this space to read only its full instructions and instructionsVersion, which set_child_instructions needs as expected_version. Call this before changing the bots you manage.",
+      "List the bots and groups in this space with their ids, sections, pinned state and models. You can manage every bot listed; createdByMe only says which ones you created. Pass bot_id of a bot in this space to read only its full instructions and instructionsVersion, which set_child_instructions needs as expected_version. Call this before changing the bots you manage.",
     inputSchema: {
       type: "object",
       properties: {

@@ -2046,6 +2046,25 @@ describe("own settings through update_bot", () => {
     expect(f.results[0]).toMatchObject({ error: expect.stringContaining("outside content") });
     expect(f.prisma.bot.update).not.toHaveBeenCalled();
   });
+  it("only reads its own settings in a turn another bot started", async () => {
+    const f = fixture({ name: "update_bot", builtin: true, trigger: "bot_message" });
+    f.setCalls([{ args: { notifyOnFinish: false, dailyCheckIns: false }, executionId: "call-1" }]);
+    await f.run();
+    expect(f.results[0]).toMatchObject({
+      name: "Assistant",
+      ignoredFields: expect.stringContaining("only the owner can change them"),
+    });
+    expect(f.prisma.bot.update).not.toHaveBeenCalled();
+  });
+  it("refuses owner-only settings mixed into another change in a turn another bot started", async () => {
+    const f = fixture({ name: "update_bot", builtin: true, trigger: "bot_message" });
+    f.setCalls([
+      { args: { description: "Finds leads", notifyOnFinish: false }, executionId: "call-1" },
+    ]);
+    await f.run();
+    expect(f.results[0]).toMatchObject({ error: expect.stringContaining("notifyOnFinish=false") });
+    expect(f.prisma.bot.update).not.toHaveBeenCalled();
+  });
   it("reads its settings when called with no fields", async () => {
     const f = fixture({ name: "update_bot", builtin: true });
     f.setCalls([{ args: { name: null, model: "" }, executionId: "call-1" }]);
