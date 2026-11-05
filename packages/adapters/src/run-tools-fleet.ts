@@ -300,7 +300,9 @@ export const fleetTools: ToolHandlers = {
     if (argumentGiven(instructionsOffsetArg)) {
       const parsedOffset = Number(instructionsOffsetArg);
       if (!read) {
-        const extra = Object.keys(writeArgs).filter((key) => argumentGiven(writeArgs[key]));
+        const extra = Object.entries(writeArgs)
+          .filter(([, value]) => argumentGiven(value))
+          .map(([key]) => key);
         return call.finish({
           error: `instructions_offset only works on a read: call update_bot with no other fields (you also passed ${extra.join(", ")}).`,
         });

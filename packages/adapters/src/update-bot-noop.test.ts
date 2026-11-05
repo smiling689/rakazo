@@ -36,6 +36,16 @@ describe("dropUnchangedOwnBotArgs", () => {
     ).toEqual({ instructions_offset: 0 });
   });
 
+  it("treats the model and thinking this run uses as the bot's own when it is on the defaults", () => {
+    expect(
+      dropUnchangedOwnBotArgs(
+        { model: "openai-compatible/gpt-fixture", thinkingLevel: "medium" },
+        { ...current, thinkingLevel: null },
+        { modelId: "gpt-fixture", thinkingLevel: "medium" },
+      ),
+    ).toEqual({});
+  });
+
   it("keeps real changes", () => {
     expect(
       dropUnchangedOwnBotArgs(

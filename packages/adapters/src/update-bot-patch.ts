@@ -78,7 +78,10 @@ export type OwnBotCurrentValues = {
 export function dropUnchangedOwnBotArgs(
   args: Record<string, unknown>,
   current: OwnBotCurrentValues,
+  /** The model and thinking this run is using, which a bot on the defaults reports as its own. */
+  running: { modelId?: string | null; thinkingLevel?: string | null } = {},
 ): Record<string, unknown> {
+  const modelId = current.modelId ?? running.modelId ?? undefined;
   const same: Record<string, unknown> = {
     name: current.name,
     description: current.description ?? "",
@@ -87,8 +90,8 @@ export function dropUnchangedOwnBotArgs(
     notifyOnFinish: current.notifyOnFinish,
     notify_on_finish: current.notifyOnFinish,
     dailyCheckIns: current.dailyCheckIns,
-    model: current.modelId ?? undefined,
-    thinkingLevel: current.thinkingLevel ?? undefined,
+    model: modelId,
+    thinkingLevel: current.thinkingLevel ?? running.thinkingLevel ?? undefined,
     readAloud: current.autoSpeak,
     voice: current.voiceId ?? "default",
     use_attached_image: false,
@@ -99,7 +102,9 @@ export function dropUnchangedOwnBotArgs(
       key in same &&
       same[key] !== undefined &&
       (typeof value === "string" && typeof same[key] === "string"
-        ? value.trim() === (same[key] as string).trim()
+        ? value.trim() === (same[key] as string).trim() ||
+          // A model may be named with its provider, e.g. "openai-compatible/gpt-fixture".
+          (key === "model" && value.trim().endsWith(`/${same[key] as string}`))
         : value === same[key]);
     if (!repeated) kept[key] = value;
   }
