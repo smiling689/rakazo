@@ -84,14 +84,14 @@ function fakeServer(options: { cdnStatus?: number } = {}) {
 
 function adapterFor(
   server: ReturnType<typeof fakeServer>,
-  options: { stickers?: Pick<StickerLibrary, "pick" | "collect">; poll?: boolean } = {},
+  options: { stickers?: Pick<StickerLibrary, "pick" | "collect" | "remove">; poll?: boolean } = {},
 ) {
   const adapter = new WechatAdapter({
     token: "bot-token",
     dataDir,
     pollInboundMessages: options.poll ?? false,
     fetch: server.fetch,
-    stickers: options.stickers ?? { pick: async () => undefined, collect: async () => true },
+    stickers: options.stickers ?? { pick: async () => undefined, collect: async () => true, remove: async () => {} },
     random: () => 0,
   });
   adapters.push(adapter);
@@ -181,12 +181,17 @@ describe("WeChat pictures and files", () => {
 });
 
 describe("WeChat stickers", () => {
-  const sticker: Sticker = { name: "cat.gif", mimeType: "image/gif", data: GIF };
+  const sticker: Sticker = {
+    name: "cat.gif",
+    mimeType: "image/gif",
+    data: GIF,
+    ref: { file: "pets/cat.gif", collected: false },
+  };
 
   it("strips the tag from the text and sends one matching sticker after it", async () => {
     const server = fakeServer();
     const pick = vi.fn(async () => sticker);
-    await adapterFor(server, { stickers: { pick, collect: async () => true } }).postMessage(
+    await adapterFor(server, { stickers: { pick, collect: async () => true, remove: async () => {} } }).postMessage(
       encodeWechatThreadId(user),
       "这也太离谱了 [表情:无语] [表情：开心]",
     );
@@ -199,14 +204,18 @@ describe("WeChat stickers", () => {
 
   it("sends a sticker on its own and drops one it cannot find without failing", async () => {
     const server = fakeServer();
-    await adapterFor(server, { stickers: { pick: async () => sticker, collect: async () => true } }).postMessage(
+    await adapterFor(server, { stickers: { pick: async () => sticker, collect: async () => true, remove: async () => {} } }).postMessage(
       encodeWechatThreadId(user),
       "[表情:晚安]",
     );
     expect(server.sent).toEqual([expect.objectContaining({ type: 2 })]);
 
     const quiet = fakeServer();
-    const failing = { pick: vi.fn(async () => Promise.reject(new Error("gone"))), collect: async () => true };
+    const failing = {
+      pick: vi.fn(async () => Promise.reject(new Error("gone"))),
+      collect: async () => true,
+      remove: async () => {},
+    };
     await expect(
       adapterFor(quiet, { stickers: failing }).postMessage(encodeWechatThreadId(user), "好的 [表情:好的]"),
     ).resolves.toMatchObject({ threadId: encodeWechatThreadId(user) });
@@ -218,16 +227,25 @@ describe("WeChat stickers", () => {
       text: "先这样\n[链接](x)",
       queries: ["摸鱼"],
       collect: [],
+      remove: false,
     });
     expect(extractStickerTags("收好啦 [收藏表情:猫猫 开心]")).toEqual({
       text: "收好啦",
       queries: [],
       collect: ["猫猫 开心"],
+      remove: false,
     });
     expect(extractStickerTags("[注意] 没有表情")).toEqual({
       text: "[注意] 没有表情",
       queries: [],
       collect: [],
+      remove: false,
+    });
+    expect(extractStickerTags("好，这张不发了【删除表情】")).toEqual({
+      text: "好，这张不发了",
+      queries: [],
+      collect: [],
+      remove: true,
     });
   });
 
@@ -286,6 +304,48 @@ describe("WeChat stickers", () => {
     expect(index).toEqual([expect.objectContaining({ label: "我的 生日 快乐", family: COLLECTED_FAMILY })]);
   });
 
+  it("takes a removed sticker out of use: library ones are skipped, collected ones deleted", async () => {
+    await writeLibrary("stickers", [
+      { file: "a/one.gif", label: "开心", text: "", family: "鲸鱼娘", data: GIF },
+      { file: "a/two.gif", label: "开心", text: "", family: "鲸鱼娘", data: GIF },
+    ]);
+    const library = new StickerLibrary({ dataDir, random: () => 0 });
+    const first = await library.pick("开心");
+    expect(first?.ref).toEqual({ file: "a/one.gif", collected: false });
+    await library.remove(first!.ref);
+    expect((await library.pick("开心"))?.ref.file).toBe("a/two.gif");
+    await library.remove({ file: "a/two.gif", collected: false });
+    expect(await library.pick("开心")).toBeUndefined();
+    expect(
+      JSON.parse(await readFile(join(dataDir, "messaging", "stickers-blocked.json"), "utf8")),
+    ).toEqual(["a/one.gif", "a/two.gif"]);
+
+    await library.collect(PNG, "生日");
+    const mine = await library.pick("生日");
+    expect(mine?.ref.collected).toBe(true);
+    await library.remove(mine!.ref);
+    expect(await library.pick("生日")).toBeUndefined();
+    await expect(readFile(join(dataDir, "messaging", "stickers-collected", mine!.ref.file))).rejects.toThrow();
+  });
+
+  it("removes the sticker it sent last when a later reply carries [删除表情]", async () => {
+    const server = fakeServer();
+    const remove = vi.fn(async () => {});
+    const adapter = adapterFor(server, { stickers: { pick: async () => sticker, collect: async () => true, remove } });
+    await adapter.postMessage(encodeWechatThreadId(user), "哈哈 [表情:开心]");
+    await adapter.postMessage(encodeWechatThreadId(user), "好，那张不发了 [删除表情]");
+    expect(remove).toHaveBeenCalledWith({ file: "pets/cat.gif", collected: false });
+    expect(server.sent.at(-1)).toEqual({ type: 1, text_item: { text: "好，那张不发了" } });
+
+    const fresh = fakeServer();
+    const untouched = vi.fn(async () => {});
+    await adapterFor(fresh, {
+      stickers: { pick: async () => undefined, collect: async () => true, remove: untouched },
+    }).postMessage(encodeWechatThreadId("other@im.wechat"), "[删除表情]");
+    expect(untouched).not.toHaveBeenCalled();
+    expect(fresh.sent).toEqual([]);
+  });
+
   it("recognises the picture types WeChat shows", () => {
     expect(sniffImageExtension(GIF)).toBe("gif");
     expect(sniffImageExtension(PNG)).toBe("png");
@@ -304,7 +364,7 @@ describe("WeChat stickers", () => {
       aeskey: key.toString("hex"),
     });
     const collect = vi.fn(async () => true);
-    await adapterFor(server, { stickers: { pick: async () => undefined, collect } }).postMessage(
+    await adapterFor(server, { stickers: { pick: async () => undefined, collect, remove: async () => {} } }).postMessage(
       encodeWechatThreadId(user),
       "收好啦～ [收藏表情:猫猫 害羞]",
     );

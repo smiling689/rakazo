@@ -42,7 +42,7 @@ export interface WechatAdapterConfig {
   /** Test seam: replace the HTTP boundary. */
   fetch?: typeof fetch;
   /** Test seam: replace the sticker library. */
-  stickers?: Pick<StickerLibrary, "pick" | "collect">;
+  stickers?: Pick<StickerLibrary, "pick" | "collect" | "remove">;
   /** Test seam: pick the "on it" note. */
   random?: () => number;
 }
@@ -74,6 +74,8 @@ export const WECHAT_ACK_AFTER_MS = 30_000;
 export const WECHAT_ACK_NOTES = ["收到，我看一下", "在弄了，稍等", "有点多，等我一会儿"];
 /** `[收藏表情:...]` keeps the picture the owner sent within this long. */
 const COLLECT_MAX_AGE_MS = 30 * 60_000;
+/** `[删除表情]` removes the sticker sent within this long. */
+const REMOVE_MAX_AGE_MS = 24 * 60 * 60_000;
 
 export function encodeWechatThreadId(userId: string): string {
   return `${THREAD_PREFIX}${Buffer.from(userId).toString("base64url")}`;
@@ -102,7 +104,7 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
   private polling: AbortController | undefined;
   private readonly retries = new Set<ReturnType<typeof setTimeout>>();
   private readonly typingTickets = new Map<string, { ticket: string; expires: number }>();
-  private readonly stickers: Pick<StickerLibrary, "pick" | "collect">;
+  private readonly stickers: Pick<StickerLibrary, "pick" | "collect" | "remove">;
   private readonly activity: WechatActivity;
   private readonly watchers = new Map<string, () => void>();
 
@@ -352,19 +354,20 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
 
   /**
    * Text, then each file (a picture when WeChat can show it), then at most one sticker for a
-   * `[表情:...]` tag. One bubble per item; a sticker that cannot be found or sent is dropped
+   * `[表情:...]` tag (after `[删除表情]` took the last one out of use). One bubble per item; a sticker that cannot be found or sent is dropped
    * quietly so a retry never repeats the text.
    */
   async postMessage(threadId: string, message: AdapterPostableMessage) {
     const userId = decodeWechatThreadId(threadId);
     const context = await this.store.context(userId);
-    const { text: body, queries, collect } = extractStickerTags(outboundText(message).trim());
+    const { text: body, queries, collect, remove } = extractStickerTags(outboundText(message).trim());
     const files = typeof message === "object" && "files" in message ? (message.files ?? []) : [];
-    if (!body && files.length === 0 && queries.length === 0 && collect.length === 0) {
+    if (!body && files.length === 0 && queries.length === 0 && collect.length === 0 && !remove) {
       throw new Error("WeChat message content is empty or unsupported");
     }
     const label = collect[0];
     if (label) await this.collectLastImage(userId, label);
+    if (remove) await this.removeLastSticker(userId);
     let id = "";
     if (body) id = await this.client.sendText(userId, body, context);
     for (const file of files) id = await this.sendUpload(userId, file, context);
@@ -378,6 +381,7 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
             { data: Buffer.from(sticker.data), filename: sticker.name, mimeType: sticker.mimeType },
             context,
           );
+          await this.activity.rememberSticker(userId, sticker.ref);
         }
       } catch (error) {
         getLogger().warn("wechat sticker failed", { error: String(error) });
@@ -398,6 +402,16 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
       }
     } catch (error) {
       getLogger().warn("wechat sticker collect failed", { error: String(error) });
+    }
+  }
+
+  /** Takes the sticker sent to `userId` last (within a day) out of use. */
+  private async removeLastSticker(userId: string) {
+    try {
+      const sticker = await this.activity.lastSticker(userId, REMOVE_MAX_AGE_MS);
+      if (sticker) await this.stickers.remove(sticker);
+    } catch (error) {
+      getLogger().warn("wechat sticker remove failed", { error: String(error) });
     }
   }
 
