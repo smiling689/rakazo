@@ -2,6 +2,11 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+/** Names this login's files; a new login (new token) starts clean. */
+export function loginKey(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 16);
+}
+
 interface StoredState {
   cursor?: string;
   /** Latest reply context per contact; iLink wants it on every message to that contact. */
@@ -20,8 +25,7 @@ export class WechatStateStore {
   private writing: Promise<void> = Promise.resolve();
 
   constructor(dataDir: string, token: string) {
-    const key = createHash("sha256").update(token).digest("hex").slice(0, 16);
-    this.path = join(dataDir, "messaging", `wechat-${key}.json`);
+    this.path = join(dataDir, "messaging", `wechat-${loginKey(token)}.json`);
   }
 
   async cursor(): Promise<string> {

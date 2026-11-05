@@ -27,6 +27,7 @@ import {
   IlinkClient,
   IlinkError,
 } from "./ilink-client.js";
+import { WechatActivity } from "./activity.js";
 import { WechatStateStore } from "./state.js";
 import { extractStickerTags, StickerLibrary } from "./stickers.js";
 
@@ -41,7 +42,9 @@ export interface WechatAdapterConfig {
   /** Test seam: replace the HTTP boundary. */
   fetch?: typeof fetch;
   /** Test seam: replace the sticker library. */
-  stickers?: Pick<StickerLibrary, "pick">;
+  stickers?: Pick<StickerLibrary, "pick" | "collect">;
+  /** Test seam: pick the "on it" note. */
+  random?: () => number;
 }
 
 /** WeChat shows these as pictures; anything else goes out as a file. */
@@ -61,6 +64,15 @@ export const WECHAT_POLL_BACKOFF_MS = 30_000;
 /** An expired login stays expired until someone scans a new QR code; check back rarely. */
 export const WECHAT_EXPIRED_PAUSE_MS = 10 * 60_000;
 const TYPING_TICKET_TTL_MS = 10 * 60_000;
+/** WeChat's typing indicator fades after a few seconds; the reference client re-sends it every 5. */
+export const WECHAT_TYPING_REFRESH_MS = 5_000;
+/** Stop showing "typing" when no reply came for this long (the bot may have chosen not to answer). */
+export const WECHAT_TYPING_MAX_MS = 5 * 60_000;
+/** A reply still not out after this long gets a short note first: replies only go out once a run ends. */
+export const WECHAT_ACK_AFTER_MS = 30_000;
+export const WECHAT_ACK_NOTES = ["收到～我去弄一下，稍等哦", "好嘞，在查了，马上回你", "收到！等我一下下～"];
+/** `[收藏表情:...]` keeps the picture the owner sent within this long. */
+const COLLECT_MAX_AGE_MS = 30 * 60_000;
 
 export function encodeWechatThreadId(userId: string): string {
   return `${THREAD_PREFIX}${Buffer.from(userId).toString("base64url")}`;
@@ -89,7 +101,9 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
   private polling: AbortController | undefined;
   private readonly retries = new Set<ReturnType<typeof setTimeout>>();
   private readonly typingTickets = new Map<string, { ticket: string; expires: number }>();
-  private readonly stickers: Pick<StickerLibrary, "pick">;
+  private readonly stickers: Pick<StickerLibrary, "pick" | "collect">;
+  private readonly activity: WechatActivity;
+  private readonly watchers = new Map<string, () => void>();
 
   constructor(readonly config: WechatAdapterConfig) {
     this.client = new IlinkClient({
@@ -98,9 +112,8 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
       ...(config.fetch ? { fetch: config.fetch } : {}),
     });
     this.store = new WechatStateStore(config.dataDir, config.token);
-    this.stickers =
-      config.stickers ??
-      new StickerLibrary({ dataDir: config.dataDir, ...(config.fetch ? { fetch: config.fetch } : {}) });
+    this.stickers = config.stickers ?? new StickerLibrary({ dataDir: config.dataDir });
+    this.activity = new WechatActivity(config.dataDir, config.token);
   }
 
   async initialize(chat: ChatInstance) {
@@ -117,6 +130,7 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     this.polling = undefined;
     for (const timer of this.retries) clearTimeout(timer);
     this.retries.clear();
+    for (const stop of [...this.watchers.values()]) stop();
   }
 
   async disconnect() {
@@ -179,6 +193,20 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
       void this.replyUnsupported(raw.from_user_id);
       return;
     }
+    if (attempt === 0) {
+      const image = [...(raw.item_list ?? [])]
+        .reverse()
+        .find((item) => item.type === ILINK_ITEM.image && item.image_item?.media)?.image_item;
+      if (image?.media) {
+        void this.activity
+          .rememberImage(raw.from_user_id, {
+            media: image.media,
+            ...(image.aeskey ? { aeskey: image.aeskey } : {}),
+          })
+          .catch(() => undefined);
+      }
+      this.watchReply(raw.from_user_id);
+    }
     const options: WebhookOptions = { waitUntil: (task) => void task.catch(() => undefined) };
     chat
       .processMessage(
@@ -202,6 +230,47 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
         timer.unref?.();
         this.retries.add(timer);
       });
+  }
+
+  /**
+   * Until a reply to `userId` goes out (from any process): keep "typing" showing, and after
+   * WECHAT_ACK_AFTER_MS send one short note, since a run's replies only go out when it ends.
+   */
+  private watchReply(userId: string) {
+    this.watchers.get(userId)?.();
+    const since = Date.now();
+    let acked = false;
+    let busy = false;
+    const timer = setInterval(() => {
+      if (busy) return;
+      busy = true;
+      (async () => {
+        const elapsed = Date.now() - since;
+        if (elapsed >= WECHAT_TYPING_MAX_MS || (await this.activity.repliedSince(userId, since))) {
+          stop();
+          return;
+        }
+        if (!acked && elapsed >= WECHAT_ACK_AFTER_MS) {
+          acked = true;
+          const notes = WECHAT_ACK_NOTES;
+          const note = notes[Math.floor((this.config.random ?? Math.random)() * notes.length)]!;
+          await this.client
+            .sendText(userId, note, await this.store.context(userId))
+            .catch((error: unknown) => getLogger().warn("wechat ack failed", { error: String(error) }));
+        }
+        await this.startTyping(encodeWechatThreadId(userId));
+      })()
+        .catch(() => undefined)
+        .finally(() => {
+          busy = false;
+        });
+    }, WECHAT_TYPING_REFRESH_MS);
+    timer.unref?.();
+    const stop = () => {
+      clearInterval(timer);
+      if (this.watchers.get(userId) === stop) this.watchers.delete(userId);
+    };
+    this.watchers.set(userId, stop);
   }
 
   private async replyUnsupported(userId: string) {
@@ -288,11 +357,13 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
   async postMessage(threadId: string, message: AdapterPostableMessage) {
     const userId = decodeWechatThreadId(threadId);
     const context = await this.store.context(userId);
-    const { text: body, queries } = extractStickerTags(outboundText(message).trim());
+    const { text: body, queries, collect } = extractStickerTags(outboundText(message).trim());
     const files = typeof message === "object" && "files" in message ? (message.files ?? []) : [];
-    if (!body && files.length === 0 && queries.length === 0) {
+    if (!body && files.length === 0 && queries.length === 0 && collect.length === 0) {
       throw new Error("WeChat message content is empty or unsupported");
     }
+    const label = collect[0];
+    if (label) await this.collectLastImage(userId, label);
     let id = "";
     if (body) id = await this.client.sendText(userId, body, context);
     for (const file of files) id = await this.sendUpload(userId, file, context);
@@ -311,7 +382,22 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
         getLogger().warn("wechat sticker failed", { error: String(error) });
       }
     }
+    if (id) await this.activity.markReplied(userId).catch(() => undefined);
     return { id, threadId, raw: { client_id: id } as IlinkMessage };
+  }
+
+  /** Adds the picture `userId` sent last (within half an hour) to the sticker collection. */
+  private async collectLastImage(userId: string, label: string) {
+    try {
+      const image = await this.activity.lastImage(userId, COLLECT_MAX_AGE_MS);
+      if (!image) return;
+      const data = await this.client.downloadMedia(image.media, image.aeskey);
+      if (!(await this.stickers.collect(data, label))) {
+        getLogger().warn("wechat sticker collect skipped: not a picture WeChat shows", {});
+      }
+    } catch (error) {
+      getLogger().warn("wechat sticker collect failed", { error: String(error) });
+    }
   }
 
   private async sendUpload(userId: string, file: FileUpload, context: string | undefined) {
