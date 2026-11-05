@@ -65,6 +65,12 @@ export async function applyTool(
   _route?: unknown,
   observer?: AgentToolExecutionObserver,
 ) {
+  // A bot naming itself in bot_id means its own settings, not a managed bot's profile (which
+  // would skip model and thinking and count its result as outside content).
+  if (name === "update_bot" && args.bot_id === ctx.run.botId) {
+    const { bot_id: _self, ...own } = args;
+    args = own;
+  }
   try {
     return await dispatchTool(ctx, name, args, executionId, observer);
   } finally {

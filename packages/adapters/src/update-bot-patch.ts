@@ -95,6 +95,9 @@ export function dropUnchangedOwnBotArgs(
     readAloud: current.autoSpeak,
     voice: current.voiceId ?? "default",
     use_attached_image: false,
+    // Reading from the start is the default, not a request to page.
+    instructions_offset: 0,
+    instructionsOffset: 0,
   };
   const kept: Record<string, unknown> = {};
   for (const [key, raw] of Object.entries(args)) {

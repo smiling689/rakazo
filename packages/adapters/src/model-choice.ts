@@ -36,9 +36,15 @@ export async function connectedModelChoices(
   });
 }
 
-/** Words and version numbers: "Gemini 3.8 Flash" is gemini, 3.8, flash. */
+/**
+ * Words and version numbers: "Gemini 3.8 Flash" is gemini, 3.8, flash. An id writes versions
+ * with hyphens ("claude-sonnet-5-5"), so short number pairs there read as 5.5 as well.
+ */
 export function words(text: string): string[] {
-  return text.toLowerCase().match(/\p{L}+|\d+(?:\.\d+)*/gu) ?? [];
+  const dotted = text.replace(/(?<=^|[-_\s])(\d{1,2})[-_](\d{1,2})(?=$|[-_\s])/g, "$1.$2");
+  const split = (value: string) => value.toLowerCase().match(/\p{L}+|\d+(?:\.\d+)*/gu) ?? [];
+  // The dotted reading comes first: the first version word is the one compared for newest.
+  return dotted === text ? split(text) : [...new Set([...split(dotted), ...split(text)])];
 }
 
 const isVersion = (word: string) => /^\d/.test(word);
