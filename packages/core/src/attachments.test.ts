@@ -230,7 +230,7 @@ describe("peer message history", () => {
       blocksToAgentHistoryText([
         { kind: "bot_message_sent", toBotId: "b_2", toBotName: "Analyst", text: "chart it" },
       ]),
-    ).toBe("[to Analyst] chart it");
+    ).toBe("(sent to Analyst with message_bot) chart it");
   });
 });
 

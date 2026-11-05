@@ -8,6 +8,7 @@ import {
 import { messageBot } from "./bot-messages.js";
 import { endCallFromTool, requestUserCall } from "./call-request.js";
 import { handoffToGroupBot } from "./group-handoff.js";
+import { postToGroup } from "./group-posts.js";
 import { publishMessage } from "./run-messages.js";
 import {
   canPostLongTaskHeadsUp,
@@ -180,6 +181,18 @@ export const messagingTools: ToolHandlers = {
     );
     if (!result.ok) return call.finish({ error: result.error });
     return call.finish(result);
+  },
+  async post_to_group(ctx, call) {
+    const { deps, run, thread } = ctx;
+    const { args, effectKey } = call;
+    const groupId = args.group_id ? String(args.group_id).trim() : thread.groupId;
+    if (!groupId) return call.finish({ error: "group_id is required outside a group chat" });
+    return call.finish(
+      await postToGroup(deps, { ...run, sourceMessageId: run.sourceMessageId }, groupId, {
+        message: redactSecrets(String(args.message ?? ""), ctx.secrets),
+        deliveryKey: effectKey,
+      }),
+    );
   },
   async handoff_to_bot(ctx, call) {
     const { deps, run, thread } = ctx;

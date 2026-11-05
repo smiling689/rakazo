@@ -13,6 +13,8 @@ export const REACTION_SILENT_REPLY_GUIDANCE = `The user reacted with an emoji to
 
 export const GROUP_UNADDRESSED_REPLY_GUIDANCE = `This message went to every member of the group and names nobody. Members decide at about the same time, so do not count on seeing the others' replies. Before using any tools, decide whether it is for you. Answer when it falls within your own description, or when it asks each member to reply. Stay silent when it fits another member's description better, or when no member's description fits it and you are not the first member listed. To stay silent, the entire final assistant reply must be exactly ${NO_RESPONSE}, with no tool calls, never a dot, a placeholder or an empty message.`;
 
+export const GROUP_BOT_POST_REPLY_GUIDANCE = `Another member posted this message in the group and named you. Reply here in the group when you have something for it, briefly and with the real details; your reply reaches that member without naming it. When you have nothing to add, stay silent: the entire final assistant reply must be exactly ${NO_RESPONSE}, with no tool calls, never a dot, a placeholder or an empty message.`;
+
 export function runAllowsSilentEmpty(trigger: string): boolean {
   return trigger === "reaction" || trigger === "routine" || isBackgroundRunTrigger(trigger);
 }

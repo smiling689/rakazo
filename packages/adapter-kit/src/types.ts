@@ -773,6 +773,8 @@ export interface BackgroundJobPayloads {
   /** The bot's call rang out: mark it missed if nobody answered. */
   "call.expire": { threadId: string; callId: string };
   "history.compact": { threadId: string };
+  /** Hand a bot the group replies to its post once the members it named finish. */
+  "group.collect": { messageId: string; askerRunId: string };
   "messaging.deliver": { runId?: string; progress?: boolean };
   "messaging.credential-cleanup": { installationId: string; ref: string };
   /** Reconcile durable remote-agent intent; scope is loaded from the database. */

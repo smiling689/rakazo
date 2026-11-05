@@ -66,6 +66,8 @@ export interface CreateThreadMessageInput {
   replyQuote?: string;
   runId?: string;
   clientNonce?: string;
+  /** Bot-to-bot hop of a bot's group post. */
+  hop?: number;
   markUnread?: boolean;
   /** Terminal echo after the run is already cancelled. Every other write stays rejected. */
   allowCancelledRun?: boolean;
@@ -108,6 +110,7 @@ export async function createThreadMessageInTransaction(
       replyQuote: input.replyQuote,
       runId: input.runId,
       clientNonce: input.clientNonce,
+      hop: input.hop,
     },
   });
 }

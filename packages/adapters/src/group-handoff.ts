@@ -19,6 +19,7 @@ import {
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import type { ExecutorDeps } from "./executor-deps.js";
+import { sourceChainHop } from "./group-posts.js";
 import { runLeaseFor } from "./run-messages.js";
 
 export async function handoffToGroupBot(
@@ -74,7 +75,7 @@ export async function handoffToGroupBot(
       select: {
         id: true,
         thread: { select: { groupId: true } },
-        sourceMessage: { select: { blocks: true } },
+        sourceMessage: { select: { id: true, blocks: true, role: true } },
       },
     });
     if (!activeSource) return { error: "source run is no longer active" } as const;
@@ -150,7 +151,13 @@ export async function handoffToGroupBot(
           "do not hand this stage back to its sender; post the result in the shared thread instead",
       } as const;
     }
-    const hop = nextBotMessageHop(sourceHandoff?.hop ?? botMessageContext(sourceBlocks)?.hop);
+    const carriedHop = sourceHandoff?.hop ?? botMessageContext(sourceBlocks)?.hop;
+    // A bot's group post or reply woke this run: its hop comes from that message's chain.
+    const hop = nextBotMessageHop(
+      carriedHop === undefined && activeSource.sourceMessage?.role === "bot"
+        ? await sourceChainHop(tx, activeSource.sourceMessage.id)
+        : carriedHop,
+    );
     if (botMessageHopExhausted(hop)) {
       return {
         error:

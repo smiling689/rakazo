@@ -42,6 +42,9 @@ type GroupTargetInput = {
   explicitMentions?: string[];
 };
 
+/** Names that reach every member: bots writing in Chinese use @所有人 and @all as often as @everyone. */
+const EVERYONE = ["everyone", "all", "所有人"];
+
 /** Members a message names (chip, @Name or @everyone). Empty when it names nobody. */
 export function mentionedGroupBotIds(input: GroupTargetInput): string[] {
   const membersById = new Map(input.members.map((member) => [member.id, member]));
@@ -52,19 +55,23 @@ export function mentionedGroupBotIds(input: GroupTargetInput): string[] {
     if (membersById.has(mentionId)) targetIds.add(mentionId);
   }
 
-  const names = ["everyone", ...input.members.map((member) => member.name.trim())]
+  const names = [...EVERYONE, ...input.members.map((member) => member.name.trim())]
     .filter(Boolean)
     .sort((a, b) => b.length - a.length);
   // Consume each mention once so a full name cannot also wake its prefix.
   const alternatives = names.map(escapeRegExp).join("|");
-  const pattern = new RegExp(`(?<![\\p{L}\\p{N}_-])@(${alternatives})(?![\\p{L}\\p{N}_-])`, "giu");
+  // A name may run straight into Chinese text ("@Campus你看下"); other letters still extend it.
+  const pattern = new RegExp(
+    `(?<![\\p{L}\\p{N}_-])@(${alternatives})(?!(?!\\p{Script=Han})[\\p{L}\\p{N}_-])`,
+    "giu",
+  );
   const mentions = [...input.text.matchAll(pattern)].map((match) => match[1]!);
   const isMentioned = (name: string) => {
     const exactName = new RegExp(`^${escapeRegExp(name.trim())}$`, "iu");
     return mentions.some((mention) => exactName.test(mention));
   };
 
-  if (isMentioned("everyone")) {
+  if (EVERYONE.some(isMentioned)) {
     for (const member of input.members) targetIds.add(member.id);
   } else {
     for (const member of input.members) {

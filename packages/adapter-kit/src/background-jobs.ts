@@ -23,6 +23,7 @@ const payloadSchemas = {
   "skill.teaching-expire": z.object({ skillId: z.string().min(1) }),
   "call.expire": z.object({ threadId: z.string().min(1), callId: z.string().min(1) }),
   "history.compact": z.object({ threadId: z.string().min(1) }),
+  "group.collect": z.object({ messageId: z.string().min(1), askerRunId: z.string().min(1) }),
   "messaging.deliver": z.object({
     runId: z.string().min(1).optional(),
     /** Send what the run has posted so far; the run is still going and is not marked mirrored. */
@@ -179,6 +180,20 @@ export function messagingDeliverJob(runId?: string, availableAt?: Date): Backgro
     payload: runId ? { runId } : {},
     replaceKey: `messaging.deliver:${runId ?? "drain"}`,
     ...(availableAt ? { availableAt } : {}),
+  };
+}
+
+/** Checks whether the members a bot's group post named have finished; repeats until they have. */
+export function groupCollectJob(
+  messageId: string,
+  askerRunId: string,
+  availableAt: Date,
+): BackgroundJob {
+  return {
+    name: "group.collect",
+    payload: { messageId, askerRunId },
+    availableAt,
+    replaceKey: `group.collect:${messageId}`,
   };
 }
 

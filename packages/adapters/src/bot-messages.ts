@@ -17,6 +17,7 @@ import {
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import type { ExecutorDeps } from "./executor-deps.js";
+import { sourceChainHop } from "./group-posts.js";
 import { runLeaseFor } from "./run-messages.js";
 
 /**
@@ -94,7 +95,10 @@ export async function messageBot(
 
   const sourceContext = await loadBotMessageContext(deps.prisma, run.sourceMessageId);
   const intent = input.intent ?? "request";
-  const hop = nextBotMessageHop(sourceContext?.hop);
+  // A run a group post woke has no peer message; its hop comes from the post's chain.
+  const hop = nextBotMessageHop(
+    sourceContext?.hop ?? (await sourceChainHop(deps.prisma, run.sourceMessageId)),
+  );
 
   const candidates = await deps.prisma.bot.findMany({
     where: { spaceId: run.spaceId, userId: run.userId, archivedAt: null },

@@ -181,6 +181,7 @@ import {
 import { createReplyState } from "./run-progress.js";
 import {
   DELEGATED_EMPTY_NOTICE,
+  GROUP_BOT_POST_REPLY_GUIDANCE,
   GROUP_UNADDRESSED_REPLY_GUIDANCE,
   runAllowsSilentEmpty,
   runReplyGuidance,
@@ -839,8 +840,11 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
         const currentRunRequiresImageInput = confirmedRunImages.length > 0;
         // The send decided whether the message named this member; one it named nobody for
         // reached every member, and each may end its turn without a reply.
+        // A bot's group post names the members it wakes, and each may still have nothing to add.
         const groupReplyOptional =
-          Boolean(thread.groupId) && run.trigger === "user" && run.groupReplyOptional;
+          Boolean(thread.groupId) &&
+          (run.trigger === "user" || run.trigger === "follow_up") &&
+          run.groupReplyOptional;
         const allowSilentPeerMessage = botMessageAllowsSilence(
           peerMessage?.intent,
           peerMessage?.repliesToRequest,
@@ -1831,7 +1835,14 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
               instructions: userTurnInstructions({
                 botInstructions: runIdentityInstruction(bot, run.trigger),
                 groupContext: groupReplyOptional
-                  ? [groupContext, GROUP_UNADDRESSED_REPLY_GUIDANCE].filter(Boolean).join("\n")
+                  ? [
+                      groupContext,
+                      sourceMessage?.role === "bot"
+                        ? GROUP_BOT_POST_REPLY_GUIDANCE
+                        : GROUP_UNADDRESSED_REPLY_GUIDANCE,
+                    ]
+                      .filter(Boolean)
+                      .join("\n")
                   : groupContext,
                 messagingContext,
                 redactedMemoryContext: memoryContext

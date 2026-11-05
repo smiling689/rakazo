@@ -180,7 +180,10 @@ export function blocksToAgentHistoryText(blocks: MessageBlock[]): string {
       // Keep attribution on peer messages: without it a later turn cannot tell
       // which lines came from another bot rather than the user.
       if (block.kind === "bot_message_received") return `[from ${block.fromBotName}] ${block.text}`;
-      if (block.kind === "bot_message_sent") return `[to ${block.toBotName}] ${block.text}`;
+      // Not "[to Name] ...": a bot copying that shape into its reply thinks it sent something.
+      if (block.kind === "bot_message_sent") {
+        return `(sent to ${block.toBotName} with message_bot) ${block.text}`;
+      }
       if (block.kind === "handoff") {
         return `[handoff ${block.fromBotId} -> ${block.toBotId}] ${block.text}`;
       }

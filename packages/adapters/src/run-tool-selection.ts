@@ -127,6 +127,7 @@ export function selectBuiltinToolsForRun(options: {
         ![
           "message_user",
           "message_bot",
+          "post_to_group",
           "handoff_to_bot",
           "message_agent",
           "generate_image",
