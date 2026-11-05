@@ -10,6 +10,7 @@ import {
   TransientModelError,
 } from "@rakazo/adapter-kit";
 import {
+  clampBotMessage,
   containsSecret,
   displayName,
   humanizeToolName,
@@ -25,10 +26,11 @@ import { RunHistoryWriteError, recordUsage } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import { sanitizedError } from "@rakazo/logging/monitoring";
 import { isToolPauseResult } from "./approval-effect.js";
-import { returnBotMessageOutcome } from "./bot-messages.js";
+import { messageBot, returnBotMessageOutcome } from "./bot-messages.js";
 import { scheduleComputerSleep } from "./computer-idle.js";
 import { holdComputerExecutionLeaseForTakeover } from "./computer-lifecycle.js";
 import { resolveBotWorkspacePath } from "./computer-support.js";
+import { wakeMembersNamedInReply } from "./group-posts.js";
 import {
   COMPACTION_BATCH_SIZE,
   HISTORY_WINDOW_SIZE,
@@ -732,6 +734,37 @@ async function groupSilenceStillAllowed(ctx: RunContext) {
   return !earlier;
 }
 
+const ADDRESSED_REPLY = /^\[to ([^\]\n]{1,80})\]\s*([\s\S]+)$/;
+
+/**
+ * A reply that opens with "[to Name]" was meant for that bot, but writing it sends nothing.
+ * Send it, unless it answers the bot's own request, which already goes back on its own.
+ */
+async function deliverAddressedReply(ctx: RunContext, text: string) {
+  const match = ADDRESSED_REPLY.exec(text.trim());
+  if (!match) return;
+  const [, name = "", body = ""] = match;
+  const peer = ctx.source.peerMessage;
+  if (
+    peer?.fromBotName === name.trim() &&
+    (peer.intent === undefined || peer.intent === "request" || peer.intent === "question")
+  ) {
+    return;
+  }
+  await messageBot(
+    ctx.deps,
+    { ...ctx.run, sourceMessageId: ctx.run.sourceMessageId },
+    { id: ctx.bot.id, name: ctx.bot.name },
+    {
+      confirm_name: name.trim(),
+      message: clampBotMessage(body.trim()),
+      intent: "result",
+      deliveryKey: `addressed-reply:${ctx.runId}`,
+    },
+    { allowTerminalSource: true },
+  );
+}
+
 /** The turn ended: apply a scripted runtime's files and memory, then finalize the reply. */
 export async function completeRun(ctx: RunContext) {
   const { deps, run, runId, bot, thread, context } = ctx;
@@ -920,6 +953,17 @@ export async function completeRun(ctx: RunContext) {
       botMessageOutcome.intent,
     ).catch((error) => getLogger().error("bot message result return", error));
   }
+  if (thread.groupId && text && !groupSilentEnd) {
+    await wakeMembersNamedInReply(
+      deps,
+      { ...run, sourceMessageId: run.sourceMessageId },
+      thread.groupId,
+      text,
+    ).catch((error) => getLogger().error("group reply mentions", error));
+  }
+  await deliverAddressedReply(ctx, text).catch((error) =>
+    getLogger().error("addressed reply delivery", error),
+  );
   const notifyBody = completionNotificationPreview(text);
   if (runSendsFinishNotification(run.trigger) && notifyBody && !completed.continuationRunId) {
     await notifyRun(deps, run, {

@@ -110,6 +110,7 @@ export const DELEGATION_TOOL_NAMES = new Set<string>([
   "archive_bot",
   "handoff_to_bot",
   "message_bot",
+  "post_to_group",
   ...FLEET_TOOL_NAMES,
 ]);
 
@@ -1699,6 +1700,25 @@ export const builtinAgentTools: ConnectorTool[] = [
           type: "string",
           enum: ["request", "result", "question", "status", "fyi"],
           description: "What the recipient should do with this message. Defaults to request.",
+        },
+      },
+      required: ["message"],
+    },
+  },
+  {
+    name: "post_to_group",
+    description:
+      "Post a message in one of your groups, to ask several members at once. Members you name with @Name (followed by a space) or @所有人 wake and may reply in the group; naming nobody wakes nobody. From another chat, their replies come back to you together once they finish, so end your turn after posting instead of waiting. Inside the group, simply write @Name in your reply instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        group_id: {
+          type: "string",
+          description: "Group from your groups list; omitted inside a group.",
+        },
+        message: {
+          type: "string",
+          description: "What to post, naming the members who should answer.",
         },
       },
       required: ["message"],

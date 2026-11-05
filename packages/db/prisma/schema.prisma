@@ -913,6 +913,8 @@ model Message {
   replies          Message[] @relation("MessageReplies")
   runId            String?
   clientNonce      String?
+  /// Bot-to-bot hop of a bot's post in a group, so members it wakes stay inside the chain limit.
+  hop              Int?
   /// Blind-index search tokens for the encrypted blocks; NULL until the row is encrypted.
   searchTokens     Int[]
   sourceRuns            Run[]             @relation("RunSourceMessage")

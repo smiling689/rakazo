@@ -29,6 +29,22 @@ describe("hasMentionToken", () => {
   });
 });
 
+describe("mentionedGroupBotIds", () => {
+  it("reads @所有人 and @all as everyone", () => {
+    expect(mentionedGroupBotIds({ text: "@所有人 明天有提醒吗", members })).toEqual([
+      "a",
+      "b",
+      "c",
+    ]);
+    expect(mentionedGroupBotIds({ text: "@all any reminders?", members })).toEqual(["a", "b", "c"]);
+  });
+
+  it("lets a name run into Chinese text but not into other letters", () => {
+    expect(mentionedGroupBotIds({ text: "@Writer你看下", members })).toEqual(["c"]);
+    expect(mentionedGroupBotIds({ text: "@Writers look", members })).toEqual([]);
+  });
+});
+
 describe("resolveGroupTargetBotIds", () => {
   it("returns mentioned bots from text", () => {
     expect(

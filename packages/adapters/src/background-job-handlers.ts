@@ -28,6 +28,7 @@ import { rateLimitEnds, scheduleComputerSleep, sleepComputerIfIdle } from "./com
 import { performComputerUpdate } from "./computer-update.js";
 import type { createRunExecutor } from "./executor.js";
 import type { ExpoPushProvider } from "./expo-push.js";
+import { collectGroupReplies } from "./group-posts.js";
 import { compactHistory } from "./history-compaction.js";
 import type { MemoryProviderResolver } from "./memory-provider-factory.js";
 import {
@@ -234,6 +235,12 @@ export function createBackgroundJobHandlers(deps: {
     "push.receipt": async (payload) => {
       await runAsSystem("check a push receipt", () => deps.notifications?.checkReceipt(payload));
     },
+    "group.collect": asOwner(
+      ({ askerRunId }: { askerRunId: string }) => run({ runId: askerRunId }),
+      async (payload) => {
+        await collectGroupReplies(relayDeps, payload);
+      },
+    ),
     "history.compact": asOwner(thread, async (payload) => {
       // Retrieval policies use stored context without paid message-count compaction.
       // Skip legacy backlog work after a policy change.
