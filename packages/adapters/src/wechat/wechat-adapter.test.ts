@@ -303,6 +303,42 @@ describe("WechatAdapter", () => {
     expect(events[0]).toMatchObject({ type: "message", provider: "wechat", pulled: true });
   });
 
+  it("stores a contact's messages in order while a picture downloads; others do not wait", async () => {
+    const server = fakeIlink();
+    const other = "o9cq80other@im.wechat";
+    const photo = { type: 2, image_item: { media: { encrypt_query_param: "img" } } };
+    server.batches.push({
+      ret: 0,
+      get_updates_buf: "c",
+      msgs: [
+        inbound({ message_id: 1, item_list: [photo] }),
+        inbound({ message_id: 2, item_list: [{ type: 1, text_item: { text: "what is this?" } }] }),
+        inbound({ message_id: 3, from_user_id: other, context_token: "ctx-2" }),
+      ],
+    });
+    const chat = new Chat({
+      userName: "rakazo",
+      adapters: { wechat: adapterFor(server, true) },
+      state: createMemoryState(),
+      concurrency: "concurrent",
+    });
+    let downloaded!: () => void;
+    const download = new Promise<void>((resolve) => {
+      downloaded = resolve;
+    });
+    const stored: string[] = [];
+    chat.onDirectMessage(async (_thread, message) => {
+      // Storing a picture downloads it first, which can take a while.
+      if (message.attachments.length) await download;
+      stored.push(message.id);
+    });
+    await chat.initialize();
+
+    await vi.waitFor(() => expect(stored).toEqual(["3"]));
+    downloaded();
+    await vi.waitFor(() => expect(stored).toEqual(["3", "1", "2"]));
+  });
+
   it("decrypts inbound images on demand", async () => {
     const server = fakeIlink();
     const key = Buffer.from("00112233445566778899aabbccddeeff", "hex");
