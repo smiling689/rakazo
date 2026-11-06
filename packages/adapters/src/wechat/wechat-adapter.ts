@@ -19,6 +19,7 @@ import {
   toPlainText,
 } from "chat";
 import { currentOutboundSendKey } from "../chat-sdk-surface.js";
+import { WechatActivity } from "./activity.js";
 import type { IlinkMessage, IlinkMessageItem } from "./ilink-client.js";
 import {
   ILINK_ITEM,
@@ -29,7 +30,6 @@ import {
   IlinkError,
   ilinkClientId,
 } from "./ilink-client.js";
-import { WechatActivity } from "./activity.js";
 import { WechatStateStore } from "./state.js";
 import { extractStickerTags, StickerLibrary } from "./stickers.js";
 
@@ -48,7 +48,13 @@ export interface WechatAdapterConfig {
 }
 
 /** WeChat shows these as pictures; anything else goes out as a file. */
-const WECHAT_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"]);
+const WECHAT_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+  "image/bmp",
+]);
 
 const THREAD_PREFIX = "wechat:";
 
@@ -105,6 +111,8 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
   private readonly watchers = new Map<string, () => void>();
   /** Context tokens iLink called stale, per contact; a newer one arrives with their next message. */
   private readonly staleContexts = new Map<string, string>();
+  /** The last inbound message each contact has in processing; their next one waits for it. */
+  private readonly inbound = new Map<string, Promise<void>>();
 
   constructor(readonly config: WechatAdapterConfig) {
     this.client = new IlinkClient({
@@ -208,15 +216,22 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
       }
       this.watchReply(raw.from_user_id);
     }
+    const userId = raw.from_user_id;
     const options: WebhookOptions = { waitUntil: (task) => void task.catch(() => undefined) };
-    chat
-      .processMessage(
+    // One contact's messages are stored in the order they were sent: a picture downloads before
+    // it is stored, and the "what is this?" after it must not start a run without it. Other
+    // contacts never wait. A retry joins the back of the line, so one failing message does not
+    // hold the contact's later ones for minutes.
+    const handle = () =>
+      chat.processMessage(
         this,
-        encodeWechatThreadId(raw.from_user_id),
+        encodeWechatThreadId(userId),
         message,
         // The first attempt already marked the message seen.
         attempt ? { ...options, deduplicate: false } : options,
-      )
+      );
+    const done = (this.inbound.get(userId) ?? Promise.resolve())
+      .then(handle)
       .catch((error: unknown) => {
         const delay = WECHAT_RETRY_DELAYS_MS[attempt];
         getLogger().warn("wechat inbound processing failed", {
@@ -231,6 +246,10 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
         timer.unref?.();
         this.retries.add(timer);
       });
+    this.inbound.set(userId, done);
+    void done.finally(() => {
+      if (this.inbound.get(userId) === done) this.inbound.delete(userId);
+    });
   }
 
   /**
@@ -346,7 +365,12 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
    */
   async postMessage(threadId: string, message: AdapterPostableMessage) {
     const userId = decodeWechatThreadId(threadId);
-    const { text: body, queries, collect, remove } = extractStickerTags(outboundText(message).trim());
+    const {
+      text: body,
+      queries,
+      collect,
+      remove,
+    } = extractStickerTags(outboundText(message).trim());
     const files = typeof message === "object" && "files" in message ? (message.files ?? []) : [];
     if (!body && files.length === 0 && queries.length === 0 && collect.length === 0 && !remove) {
       throw new Error("WeChat message content is empty or unsupported");
