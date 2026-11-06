@@ -529,6 +529,24 @@ describe("bot management tool parameters", () => {
     },
   );
 
+  it("applies only the update_bot fields named in change", () => {
+    // A model asked "which model are you" sent every field, switches off.
+    const filled = {
+      thinkingLevel: "off",
+      notifyOnFinish: false,
+      dailyCheckIns: false,
+      readAloud: false,
+      model: "gpt-fixture",
+    };
+    expect(prepareFleetArguments("update_bot", filled)).toEqual({});
+    expect(prepareFleetArguments("update_bot", { ...filled, change: ["model"] })).toEqual({
+      model: "gpt-fixture",
+    });
+    expect(
+      prepareFleetArguments("update_bot", { bot_id: "b1", instructions_offset: 800, ...filled }),
+    ).toEqual({ bot_id: "b1", instructions_offset: 800 });
+  });
+
   it("keeps the instruction text exactly as sent", () => {
     const args = { bot_id: "b1", instructions: "  Keep\n spacing ", expected_version: "v1" };
     expect(prepareFleetArguments("set_child_instructions", args)).toEqual(args);

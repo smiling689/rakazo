@@ -25,6 +25,7 @@ import {
 import { z } from "zod";
 import { allowPrivateHttpSecretOrigins } from "./bot-secrets.js";
 import { BROWSER_ACT_KINDS } from "./browser-tools.js";
+import { UPDATE_BOT_SETTING_FIELDS } from "./update-bot-patch.js";
 import { messageUserMaxLength } from "./user-progress.js";
 import { MAX_WEB_FETCH_OFFSET } from "./web-limits.js";
 
@@ -1492,7 +1493,7 @@ export const builtinAgentTools: ConnectorTool[] = [
   {
     name: "update_bot",
     description:
-      "Read or change your own settings. Call with no fields to read them and the models and thinking levels you can pick. Long instructions come in pages; follow instructionsNextOffset before replacing them. If a read comes back with contextTruncated, it was shortened: say so, do not rewrite. Pass fields to change them, only when the user asks; setting your name, description and first instructions when you have none is fine. Never claim a change without calling this.",
+      "Read or change your own settings. Call without change to read them and the models and thinking levels you can pick. Long instructions come in pages; follow instructionsNextOffset before replacing them. If a read comes back with contextTruncated, it was shortened: say so, do not rewrite. To change, pass new values and list those fields in change, only when the user asks; setting your name, description and first instructions when you have none is fine. Never claim a change without calling this.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1557,6 +1558,11 @@ export const builtinAgentTools: ConnectorTool[] = [
         bot_id: {
           type: "string",
           description: "A bot in this space, to update its profile instead of yours.",
+        },
+        change: {
+          type: "array",
+          items: { type: "string", enum: [...UPDATE_BOT_SETTING_FIELDS] },
+          description: "Fields to change; others are ignored. Omit to read.",
         },
       },
     },

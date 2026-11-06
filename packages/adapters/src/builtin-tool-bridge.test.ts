@@ -56,7 +56,8 @@ describe("built-in tool bridge", () => {
     // +1 byte over upstream: feat/memory-size makes remember say "Holds 16 KB" instead of "Holds 4 KB".
     // +15 bytes: the deferred catalog names post_to_group. +23: the catalog names update_default_models.
     // Fork (lean tools): schedule_create/schedule_list and update_preferences are deferred, 31,949 -> 18,601.
-    expect(definitionBytes(listed)).toBeLessThanOrEqual(18_569);
+    // +317: update_bot names the fields a call changes, so a read cannot switch settings off.
+    expect(definitionBytes(listed)).toBeLessThanOrEqual(18_886);
     expect(deferred.map((tool) => tool.name)).toEqual(
       expect.arrayContaining(["render_plot", "create_space", "generate_secret", "scratchpad_add"]),
     );
