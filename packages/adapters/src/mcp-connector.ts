@@ -190,6 +190,19 @@ function isRejectedTokenError(error: unknown): boolean {
   return error instanceof McpError && REJECTED_TOKEN_CODES.has(error.code);
 }
 
+/** Whether a failed call left its session usable: the connection is still up and the
+ * failure came from the protocol (a timeout, the server's JSON-RPC error) or the run's
+ * cancellation, not from the transport or a token the server stopped accepting. */
+function keepsMcpSession(
+  session: McpSession | undefined,
+  error: unknown,
+  signal: AbortSignal,
+): boolean {
+  if (!session?.open) return false;
+  if (signal.aborted) return true;
+  return error instanceof McpError && !isRejectedTokenError(error);
+}
+
 /** A redacted connect failure that keeps whether it was expected, which its message loses. */
 class McpConnectFailure extends Error {
   constructor(
@@ -689,9 +702,11 @@ export class McpConnector implements ConnectorProvider {
     let material: OAuthMaterial | undefined;
     let launchSecrets: string[] = [];
     const sessionKey = this.sessionKey(assignment.server, context);
+    let used: McpSession | undefined;
     try {
       const toolName = call.route.toolName;
       const result = await this.withSession(assignment.server, context, (session) => {
+        used = session;
         material = this.sessions.get(sessionKey)?.material;
         launchSecrets = this.sessions.get(sessionKey)?.launchSecrets ?? [];
         return session.callTool(toolName, call.args, { signal: context.signal });
@@ -699,9 +714,11 @@ export class McpConnector implements ConnectorProvider {
       const secrets = [...(material ? oauthMaterialSecrets(material) : []), ...launchSecrets];
       yield { type: "result", data: redactConnectorPayload(result, secrets) };
     } catch (error) {
-      // A thrown call means the transport or auth broke; drop the session so the next call reconnects.
       const secrets = [...(material ? oauthMaterialSecrets(material) : []), ...launchSecrets];
-      await this.evict(sessionKey);
+      // Drop only a broken connection or rejected auth, so the next call reconnects. A
+      // timeout, a cancelled run or the server's own error leaves a stdio process and the
+      // server's session state in place.
+      if (!keepsMcpSession(used, error, context.signal)) await this.evict(sessionKey);
       yield { type: "error", message: sanitizeConnectorError(error, secrets) };
     }
   }
