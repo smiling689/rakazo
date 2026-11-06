@@ -2995,3 +2995,142 @@ describe("Pi runtime reasoning efforts an endpoint refuses", () => {
     },
   );
 });
+
+describe("Pi runtime empty replies", () => {
+  const providers = (): string[] =>
+    providerState.stream.mock.calls.map(
+      ([target]) => (target as Model<"openai-completions">).provider,
+    );
+  const thinkingOnly: AssistantMessage["content"] = [
+    { type: "thinking", thinking: "Considering the answer." },
+  ];
+
+  it("repeats an empty and a thinking-only reply on the same model with backoff", async () => {
+    providerState.stream
+      .mockImplementationOnce(() => stream(primary, message(primary, [], "stop")))
+      .mockImplementationOnce(() => stream(primary, message(primary, thinkingOnly, "stop")))
+      .mockImplementation(() =>
+        stream(primary, message(primary, [{ type: "text", text: "Recovered." }], "stop")),
+      );
+    const appendMessage = vi.fn(async (_entry: AgentMessage) => undefined);
+    vi.spyOn(PiJsonlSessionRecorder.prototype, "start").mockResolvedValue({ appendMessage });
+
+    const events = await run(
+      request(),
+      [],
+      new PiAgentRuntime({ sessionRoot: "fixture-sessions" }),
+    );
+
+    expect(providers()).toEqual([primary.provider, primary.provider, primary.provider]);
+    expect(providerState.delay.mock.calls.map(([delay]) => delay)).toEqual([2_000, 8_000]);
+    expect(events.filter((event) => event.type === "text")).toEqual([
+      { type: "text", text: "Recovered." },
+    ]);
+    expect(events.at(-1)).toEqual({ type: "done", text: "Recovered." });
+    // The empty attempts and their thinking never reach the transcript.
+    expect(appendMessage.mock.calls.filter(([entry]) => entry.role === "assistant")).toEqual([
+      [expect.objectContaining({ content: [{ type: "text", text: "Recovered." }] })],
+    ]);
+  });
+
+  it("moves to the backup once the same-model repeats are empty too", async () => {
+    providerState.stream.mockImplementation((target: Model<"openai-completions">) =>
+      target.provider === primary.provider
+        ? stream(target, message(target, thinkingOnly, "stop"))
+        : stream(target, message(target, [{ type: "text", text: "from backup" }], "stop")),
+    );
+
+    const events = await run(
+      request([{ provider: backupA.provider, id: backupA.id, apiKey: "fake-backup-a" }]),
+    );
+
+    expect(providers()).toEqual([
+      primary.provider,
+      primary.provider,
+      primary.provider,
+      backupA.provider,
+    ]);
+    expect(events.at(-1)).toEqual({ type: "done", text: "from backup" });
+  });
+
+  it("shows the empty-response text only after every attempt is empty", async () => {
+    providerState.stream.mockImplementation((target: Model<"openai-completions">) =>
+      stream(target, message(target, [], "stop")),
+    );
+
+    const events = await run(
+      request([{ provider: backupA.provider, id: backupA.id, apiKey: "fake-backup-a" }]),
+    );
+
+    expect(providers()).toEqual([
+      primary.provider,
+      primary.provider,
+      primary.provider,
+      backupA.provider,
+      backupA.provider,
+      backupA.provider,
+    ]);
+    expect(events.at(-1)).toEqual({ type: "done", text: "No response. Try again." });
+  });
+
+  it("does not repeat an empty reply in a run allowed to stay silent", async () => {
+    providerState.stream.mockImplementation(() => stream(primary, message(primary, [], "stop")));
+    const input = { ...request(), allowSilentEmpty: true };
+
+    const events = await run(input);
+
+    expect(providerState.stream).toHaveBeenCalledOnce();
+    expect(events.at(-1)).toEqual({ type: "done" });
+  });
+
+  it("leaves an empty reply after tool work to the runtime's own follow-up", async () => {
+    let calls = 0;
+    providerState.stream.mockImplementation(() => {
+      calls += 1;
+      if (calls === 1)
+        return stream(
+          primary,
+          message(
+            primary,
+            [{ type: "toolCall", id: "call", name: "write_effect", arguments: { value: "one" } }],
+            "toolUse",
+          ),
+        );
+      return stream(
+        primary,
+        message(primary, calls === 2 ? [] : [{ type: "text", text: "Done." }], "stop"),
+      );
+    });
+
+    const events = await run(request());
+
+    // The empty reply after the tool result is followed up with a prompt, not repeated as is.
+    expect(providerState.stream).toHaveBeenCalledTimes(3);
+    expect(providerState.delay).not.toHaveBeenCalled();
+    expect(events.at(-1)).toEqual({ type: "done", text: "Done." });
+  });
+
+  it("stops repeating when the run is cancelled during the backoff", async () => {
+    const controller = new AbortController();
+    providerState.delay.mockImplementation(async () => controller.abort());
+    providerState.stream.mockImplementation(() => stream(primary, message(primary, [], "stop")));
+    const events: AgentRuntimeEvent[] = [];
+    const consume = async () => {
+      for await (const event of new PiAgentRuntime().run(request(), {
+        operationId: "operation",
+        traceId: "trace",
+        spaceId: "space",
+        userId: "user",
+        signal: controller.signal,
+      })) {
+        events.push(event);
+      }
+    };
+
+    await consume().catch(() => undefined);
+
+    expect(providerState.stream).toHaveBeenCalledOnce();
+    expect(providerState.delay).toHaveBeenCalledOnce();
+    expect(events).not.toContainEqual({ type: "text", text: "No response. Try again." });
+  });
+});
