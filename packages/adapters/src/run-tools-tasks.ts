@@ -43,7 +43,9 @@ export const taskTools: ToolHandlers = {
       spaceId: run.spaceId,
       botId: bot.id,
       userId: run.userId,
-      ...(thread.groupId ? { threadId: thread.id } : {}),
+      // A group run sees the bot's routines from its own chat too (fork: an empty list
+      // there read as "never created").
+      ...(thread.groupId ? { currentThreadId: thread.id } : {}),
       tools: ctx.tools.offered,
     });
   },
@@ -209,7 +211,6 @@ export const taskTools: ToolHandlers = {
         botId: bot.id,
         userId: run.userId,
         threadId: thread.id,
-        ...(thread.groupId ? { scopeThreadId: thread.id } : {}),
         routineId: String(args.routineId ?? ""),
         name: isScheduleValueProvided(args.name) ? String(args.name) : undefined,
         prompt: isScheduleValueProvided(args.prompt) ? String(args.prompt) : undefined,
@@ -233,17 +234,16 @@ export const taskTools: ToolHandlers = {
       spaceId: run.spaceId,
       botId: bot.id,
       userId: run.userId,
-      ...(thread.groupId ? { threadId: thread.id } : {}),
+      ...(thread.groupId ? { currentThreadId: thread.id } : {}),
     });
   },
   async schedule_cancel(ctx, call) {
-    const { deps, run, bot, thread } = ctx;
+    const { deps, run, bot } = ctx;
     const { args } = call;
     const cancelled = await cancelScheduleFromTool(deps, {
       spaceId: run.spaceId,
       botId: bot.id,
       userId: run.userId,
-      ...(thread.groupId ? { threadId: thread.id } : {}),
       routineId: args.routineId ? String(args.routineId) : undefined,
       name: args.name ? String(args.name) : undefined,
     });
