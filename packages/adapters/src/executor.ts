@@ -1358,45 +1358,69 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
             userComputerScreen = device.platform === "darwin" || device.platform === "win32";
           } else userComputer = "offline";
         }
-        const builtins = [
-          ...selectBuiltinToolsForRun({
-            ticketBoardEnabled: deps.ticketBoardEnabled,
-            phoneCallsEnabled: deps.phoneCallsEnabled,
-            historyRetrievalEnabled: contextStrategy !== "current",
-            graphicalToolsAllowed,
-            pageBrowserAllowed,
-            groupId: thread.groupId,
-            trigger: run.trigger,
-            semanticMemoryEnabled,
-            semanticMemoryForgets: Boolean(semanticMemory?.forget),
-            mediaImagesEnabled: Boolean(deps.artifacts && mediaGeneration?.capabilities.images),
-            mediaVideoEnabled: Boolean(deps.artifacts && mediaGeneration?.capabilities.video),
-            cloudAgentEnabled: cloudAgentsEnabled(cloudAgent, run.spaceId),
-            paymentWalletEnabled,
-            messagingChannelRun: nonOwnerChatRun,
-            voiceCall,
-            // Every member already got a message that names nobody, so a handoff only repeats it.
-            disabledBuiltinTools: groupReplyOptional
-              ? [...(bot.disabledBuiltinTools ?? []), "handoff_to_bot"]
-              : bot.disabledBuiltinTools,
-            fleetManagement: bot.fleetManagement,
-            followUpFromUser: sourceMessage?.role === "user",
-            ownerDirectMessage: ownerDirectMessage && sourceMessage?.role === "user",
-            userComputer: userComputer === "connected",
-            userComputerScreen,
-          }),
-          // Cross-owner agent connections only exist for chat-linked bots.
-          ...(hasMessagingIdentity &&
+        const builtinSelection: Parameters<typeof selectBuiltinToolsForRun>[0] = {
+          ticketBoardEnabled: deps.ticketBoardEnabled,
+          phoneCallsEnabled: deps.phoneCallsEnabled,
+          historyRetrievalEnabled: contextStrategy !== "current",
+          graphicalToolsAllowed,
+          pageBrowserAllowed,
+          groupId: thread.groupId,
+          trigger: run.trigger,
+          semanticMemoryEnabled,
+          semanticMemoryForgets: Boolean(semanticMemory?.forget),
+          mediaImagesEnabled: Boolean(deps.artifacts && mediaGeneration?.capabilities.images),
+          mediaVideoEnabled: Boolean(deps.artifacts && mediaGeneration?.capabilities.video),
+          cloudAgentEnabled: cloudAgentsEnabled(cloudAgent, run.spaceId),
+          paymentWalletEnabled,
+          messagingChannelRun: nonOwnerChatRun,
+          voiceCall,
+          // Every member already got a message that names nobody, so a handoff only repeats it.
+          disabledBuiltinTools: groupReplyOptional
+            ? [...(bot.disabledBuiltinTools ?? []), "handoff_to_bot"]
+            : bot.disabledBuiltinTools,
+          fleetManagement: bot.fleetManagement,
+          followUpFromUser: sourceMessage?.role === "user",
+          ownerDirectMessage: ownerDirectMessage && sourceMessage?.role === "user",
+          userComputer: userComputer === "connected",
+          userComputerScreen,
+        };
+        // Cross-owner agent connections only exist for chat-linked bots.
+        const agentConnectionBuiltins =
+          hasMessagingIdentity &&
           bot.crossSpaceCommunication === true &&
           !isBackgroundRunTrigger(run.trigger) &&
           run.trigger !== "created"
             ? agentConnectionTools.filter((tool) => !disabledBuiltinTools.has(tool.name))
-            : []),
+            : [];
+        const builtins = [
+          ...selectBuiltinToolsForRun(builtinSelection),
+          ...agentConnectionBuiltins,
         ];
         const strategicBuiltins = filterStrategicInitiativeTools(builtins, {
           trigger: run.trigger,
           clientNonce: run.clientNonce,
         });
+        // Fork (stable prefix): a turn another bot started shares its thread with the owner's
+        // turns. The two used to get different instructions and tool indexes, so each switch
+        // between them sent the whole conversation uncached. Such a turn now describes the owner's
+        // tool set; the tools it may not use stay out of the run and its prompt names them.
+        const ownerShapedPrompt =
+          !ownerStartedRun &&
+          !nonOwnerChatRun &&
+          (run.trigger === "bot_message" || run.trigger === "follow_up");
+        const promptBuiltins = ownerShapedPrompt
+          ? filterStrategicInitiativeTools(
+              [
+                ...selectBuiltinToolsForRun({
+                  ...builtinSelection,
+                  trigger: "user",
+                  followUpFromUser: true,
+                }),
+                ...agentConnectionBuiltins,
+              ],
+              { trigger: run.trigger, clientNonce: run.clientNonce },
+            )
+          : strategicBuiltins;
         const exposedConnectorTools = discovered.filter(
           (tool) => !builtinAgentTools.some((builtin) => builtin.name === tool.name),
         );
@@ -1428,13 +1452,19 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           run.trigger === "created"
             ? strategicBuiltins
             : [...strategicBuiltins, ...strategicConnectorTools];
+        const promptTools = ownerShapedPrompt
+          ? [...promptBuiltins, ...strategicConnectorTools]
+          : tools;
+        const unavailableToolNames = promptBuiltins
+          .map((tool) => tool.name)
+          .filter((name) => !tools.some((tool) => tool.name === name));
         // Fork (lean tools): a deferred tool's usage notes come back with find_tool, so the
         // instructions treat it like a tool that is off; only listed tools get prompt guidance.
-        const deferredToolNames = partitionTools(tools).deferred.map((tool) => tool.name);
+        const deferredToolNames = partitionTools(promptTools).deferred.map((tool) => tool.name);
         const guidanceDisabled = deferredToolNames.length
           ? new Set([...disabledBuiltinTools, ...deferredToolNames])
           : disabledBuiltinTools;
-        const taskCatalogInstruction = tools.some(
+        const taskCatalogInstruction = promptTools.some(
           (tool) => tool.name === "task_catalog" && !guidanceDisabled.has(tool.name),
         )
           ? TASK_CATALOG_GUIDANCE
@@ -1692,6 +1722,11 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
             // Lateness is optional context; a lookup failure must not prevent a run.
           }
         }
+        const groupReplyGuidance = groupReplyOptional
+          ? sourceMessage?.role === "bot"
+            ? GROUP_BOT_POST_REPLY_GUIDANCE
+            : GROUP_UNADDRESSED_REPLY_GUIDANCE
+          : undefined;
         const prompt = [
           replyContext,
           run.trigger === "reaction" && replyContext ? undefined : basePrompt,
@@ -1702,6 +1737,15 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           // Per-turn, not in the system prompt: the timestamp changes every call and would break the cacheable prefix.
           formatCurrentTimeInstruction(new Date(), userTimeZone),
           lateRoutineNote,
+          // Fork (stable prefix): what differs between turns of one thread comes after the
+          // conversation, so the instructions and history before it stay a cached prefix.
+          groupReplyGuidance,
+          ownerShapedPrompt
+            ? `Another bot started this turn, not the owner: do not set your own follow-ups${unavailableToolNames.length ? `, and ${unavailableToolNames.join(", ")} cannot be used` : ""} in this turn.`
+            : undefined,
+          memoryContext ? redactSecrets(memoryContext, runSecrets) : undefined,
+          scratchpadContext ? redactSecrets(scratchpadContext, runSecrets) : undefined,
+          ticketContext ? redactSecrets(ticketContext, runSecrets) : undefined,
         ]
           .filter(Boolean)
           .join("\n\n");
@@ -1855,26 +1899,12 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
               contextStrategy: deps.contextStrategy,
               instructions: userTurnInstructions({
                 botInstructions: runIdentityInstruction(bot, run.trigger),
-                groupContext: groupReplyOptional
-                  ? [
-                      groupContext,
-                      sourceMessage?.role === "bot"
-                        ? GROUP_BOT_POST_REPLY_GUIDANCE
-                        : GROUP_UNADDRESSED_REPLY_GUIDANCE,
-                    ]
-                      .filter(Boolean)
-                      .join("\n")
-                  : groupContext,
+                groupContext,
                 messagingContext,
-                redactedMemoryContext: memoryContext
-                  ? redactSecrets(memoryContext, runSecrets)
-                  : undefined,
-                redactedScratchpadContext: scratchpadContext
-                  ? redactSecrets(scratchpadContext, runSecrets)
-                  : undefined,
-                redactedTicketContext: ticketContext
-                  ? redactSecrets(ticketContext, runSecrets)
-                  : undefined,
+                // Fork (stable prefix): memory, scratchpad and tickets go in the prompt instead.
+                redactedMemoryContext: undefined,
+                redactedScratchpadContext: undefined,
+                redactedTicketContext: undefined,
                 hasHistoricalContext: historicalContext.length > 0,
                 historyRetrievalEnabled: contextStrategy !== "current",
                 computerInstruction,
@@ -1895,8 +1925,11 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
                           .filter((name) => !strategicBuiltins.some((tool) => tool.name === name)),
                       )
                     : guidanceDisabled,
-                offeredFleetTools: offeredFleetTools(strategicBuiltins),
-                followUpsOffered: followUpsOffered(strategicBuiltins, ownerStartedRun),
+                offeredFleetTools: offeredFleetTools(promptBuiltins),
+                followUpsOffered: followUpsOffered(
+                  promptBuiltins,
+                  ownerStartedRun || ownerShapedPrompt,
+                ),
                 userComputer,
               })
                 .filter((instruction): instruction is string => Boolean(instruction))
@@ -1912,6 +1945,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
                   ),
               ),
               tools,
+              ...(ownerShapedPrompt ? { advertisedToolNames: unavailableToolNames } : {}),
               model: mainRunModel,
               computerModel,
               fallbackModels: fallbackModels.map(({ provider, modelId, credentialId }) => ({

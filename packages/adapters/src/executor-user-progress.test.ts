@@ -10,6 +10,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import { PARTIAL_REPLY_NOTE } from "./automated-messages.js";
 import { loadBotMessageContext, returnBotMessageOutcome } from "./bot-messages.js";
+import { partitionTools } from "./builtin-tool-bridge.js";
 import type * as ComputerLifecycleModule from "./computer-lifecycle.js";
 import { createRunExecutor } from "./executor.js";
 import { createJobReconciler } from "./job-reconciler.js";
@@ -1762,6 +1763,31 @@ it("terminal cancellation wins over a runtime's open thinking marker", async () 
   );
 });
 
+// Fork (stable prefix): turns the owner and other bots start in one chat share its cached prefix.
+describe("a turn another bot started", () => {
+  const request = (result: Awaited<ReturnType<typeof runTurn>>) =>
+    result.runtimeRun.mock.calls[0]![0];
+  const toolList = (run: AgentRunRequest) =>
+    partitionTools(run.tools, run.advertisedToolNames).listed.map((tool) => JSON.stringify(tool));
+
+  it("gets the owner's instructions and tool list, and is told what it cannot use", async () => {
+    const events: AgentRuntimeEvent[] = [{ type: "done", text: "ok" }];
+    const owner = request(
+      await runTurn("", false, undefined, [], "fyi", { trigger: "user", runtimeEvents: events }),
+    );
+    const peer = request(
+      await runTurn("", true, undefined, [], "request", {
+        trigger: "bot_message",
+        runtimeEvents: events,
+      }),
+    );
+    expect(peer.instructions).toBe(owner.instructions);
+    expect(toolList(peer)).toEqual(toolList(owner));
+    expect(peer.prompt).toContain("Another bot started this turn, not the owner");
+    expect(owner.prompt).not.toContain("Another bot started this turn");
+  });
+});
+
 describe("a group member the message named nobody for", () => {
   const text = (value: string): AgentRuntimeEvent => ({ type: "text", text: value });
   const tool: AgentRuntimeEvent = {
@@ -1780,8 +1806,9 @@ describe("a group member the message named nobody for", () => {
     });
   }
 
+  // Fork (stable prefix): the reply rule changes per message, so it comes with the turn's prompt.
   function guidance(result: Awaited<ReturnType<typeof runTurn>>) {
-    return result.runtimeRun.mock.calls[0]![0].instructions;
+    return result.runtimeRun.mock.calls[0]![0].prompt;
   }
 
   it("is told to decide before using tools, and ends silently on NO_RESPONSE", async () => {

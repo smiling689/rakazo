@@ -121,6 +121,18 @@ describe("built-in tool bridge", () => {
     );
   });
 
+  // Fork (stable prefix).
+  it("indexes advertised names it cannot run, so a peer turn's tool list matches the owner's", () => {
+    const peerChat = ownerChat.filter((tool) => tool.name !== "list_fleet");
+    const peer = partitionTools(peerChat, ["list_fleet", "shell", "not_a_tool"]);
+    expect(peer.listed).toEqual(partitionTools(ownerChat).listed);
+    expect(peer.deferred.some((tool) => tool.name === "list_fleet")).toBe(false);
+    expect(findTools(peer.deferred, { names: ["list_fleet"] })).toMatchObject({
+      tools: [],
+      unknown: ["list_fleet"],
+    });
+  });
+
   it("shows the real tool as activity", () => {
     expect(
       describeToolActivity(USE_TOOL, { name: "create_space", arguments: { name: "Finance" } }),
