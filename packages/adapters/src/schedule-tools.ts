@@ -649,10 +649,20 @@ async function createWatchFromTool(
   };
 }
 
-/** List bot routines, optionally restricted to the current group thread. */
+/**
+ * List bot routines, optionally restricted to one thread. With `currentThreadId` every
+ * routine says whether it posts in that chat, so a group run sees the bot's routines from
+ * its own chat too and can tell them apart.
+ */
 export async function listSchedulesFromTool(
   deps: Pick<ScheduleToolDeps, "prisma">,
-  input: { spaceId: string; botId: string; userId: string; threadId?: string },
+  input: {
+    spaceId: string;
+    botId: string;
+    userId: string;
+    threadId?: string;
+    currentThreadId?: string;
+  },
 ) {
   const rows = await deps.prisma.routine.findMany({
     where: {
@@ -674,6 +684,7 @@ export async function listSchedulesFromTool(
       oneShot: isOneShotRoutineCrons(row.crons),
       ...describeRoutineTiming(row),
       ...(row.watch ? { watch: row.watch, lastCheck: row.watchState ?? null } : {}),
+      ...(input.currentThreadId ? { inThisChat: row.threadId === input.currentThreadId } : {}),
     })),
   };
 }

@@ -96,9 +96,56 @@ describe("task catalog", () => {
       ]),
     );
     expect(result.tools).toEqual([
-      { name: "task_catalog", description: "Catalog", readOnly: true },
-      { name: "GITHUB_LIST_RELEASES", description: "List releases", readOnly: true },
+      { name: "task_catalog", readOnly: true },
+      { name: "GITHUB_LIST_RELEASES", readOnly: true },
     ]);
     expect(result.guidance).toBe(TASK_CATALOG_GUIDANCE);
+  });
+
+  it("lists a group run's routines from every chat and marks the ones posting here", async () => {
+    const findMany = vi.fn(async (_args: Record<string, unknown>) => [
+      {
+        id: "r-own",
+        name: "Daily check",
+        prompt: "p",
+        crons: ["0 8 * * *"],
+        active: true,
+        threadId: "own-thread",
+        nextRunAt: null,
+      },
+      {
+        id: "r-group",
+        name: "Group digest",
+        prompt: "p",
+        crons: ["0 9 * * *"],
+        active: true,
+        threadId: "group-thread",
+        nextRunAt: null,
+      },
+    ]);
+    const prisma = {
+      scratchpadItem: { findMany: vi.fn(async () => []) },
+      routine: { findMany },
+      taughtSkill: { findMany: vi.fn(async () => []) },
+      agentSkill: { findMany: vi.fn(async () => []) },
+    };
+    const result = await taskCatalogFromTool(
+      { prisma: prisma as never },
+      {
+        spaceId: "space-1",
+        botId: "bot-1",
+        userId: "user-1",
+        currentThreadId: "group-thread",
+        tools: [],
+      },
+    );
+    expect(findMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { spaceId: "space-1", botId: "bot-1", userId: "user-1" },
+    });
+    expect(findMany.mock.calls[0]?.[0]?.where).not.toHaveProperty("threadId");
+    expect(result.routines).toEqual([
+      expect.objectContaining({ routineId: "r-own", inThisChat: false }),
+      expect.objectContaining({ routineId: "r-group", inThisChat: true }),
+    ]);
   });
 });
