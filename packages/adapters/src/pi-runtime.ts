@@ -298,6 +298,7 @@ export class PiAgentRuntime implements AgentRuntime {
           pausePending: false,
           pendingShells: [],
           modelResponses: 0,
+          recentCalls: [],
         };
         resumeHost = host;
         const allTools = toAgentTools(toolDefs, host, request.advertisedToolNames);

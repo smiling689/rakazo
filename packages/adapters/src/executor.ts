@@ -243,7 +243,6 @@ import {
 } from "./thread-artifacts.js";
 import { loadAgentTicketContext } from "./ticket-context.js";
 import { appendToolCompletionAudit } from "./tool-completion-audit.js";
-import { toolResultFingerprint } from "./tool-loop.js";
 import { restoreTurnCheckpoint } from "./turn-checkpoint.js";
 import {
   loadPinnedContextState,
@@ -1551,9 +1550,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
             storedTurnCheckpoint,
           },
           screen: { lastFrameId: undefined, unchangedVisualStreak: { count: 0 } },
-          toolCallStreak: { key: undefined, count: 0 },
           overLimitActionCalls: 0,
-          toolResults: new Map(),
           tainted: initiallyTainted,
           ownerSettingsRefused: false,
           // A resumed turn replaces this with the baseline its saved prompt was built from.
@@ -2095,7 +2092,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
                   effects.restoredPending = undefined;
                 if (!completion.paused)
                   effects.pendingTurnCheckpoints.delete(completion.executionId);
-                const audited = appendToolCompletionAudit(
+                return appendToolCompletionAudit(
                   deps,
                   {
                     spaceId: run.spaceId,
@@ -2106,11 +2103,6 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
                   completion,
                   runSecrets,
                 );
-                state.toolResults.set(
-                  completion.executionId,
-                  toolResultFingerprint(completion.result, completion.error),
-                );
-                return audited;
               },
               claimSteering: (seenIds) =>
                 claimRunSteering(

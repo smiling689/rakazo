@@ -1,193 +1,218 @@
 import { describe, expect, it } from "vitest";
 import { observationToolResult } from "./computer-tools.js";
+import type { ToolCallRecord, ToolLoopVerdict } from "./tool-loop.js";
 import {
+  admitToolCall,
   advanceOverLimitActionCalls,
-  advanceToolCallLoopGuard,
   isLoopGuardStopText,
   loopGuardStopText,
   MAX_CONSECUTIVE_OVER_LIMIT_ACTION_CALLS,
   overLimitStopText,
-  toolCallStreakLength,
   toolResultFingerprint,
 } from "./tool-loop.js";
 
 const answer = (text: string) => toolResultFingerprint({ content: [{ type: "text", text }] });
 const failure = (text = "missing script") => toolResultFingerprint(undefined, new Error(text));
 
-/** The call that stops one command repeated with `seen(call)` as each call's answer, if any. */
-function identicalStopsAt(seen: (call: number) => string | undefined) {
-  let streak = { key: undefined as string | undefined, count: 0 };
-  let previous: string | undefined;
-  for (let call = 1; call <= 60; call += 1) {
-    const result = advanceToolCallLoopGuard(streak, "shell", { command: "cat job.log" }, previous);
-    streak = result.streak;
-    if (result.stuck) return call;
-    previous = seen(call);
+type Call = { name: string; args: unknown; response?: number };
+
+/**
+ * Plays `call(n)` for n = 1..limit through one history, one model response each unless the call
+ * names one. A call that runs gets `seen(n)` as its answer; a refused one gets none.
+ */
+function play(
+  call: (n: number) => Call,
+  seen: (n: number) => string | undefined,
+  limit = 60,
+): ToolLoopVerdict[] {
+  const history: ToolCallRecord[] = [];
+  const verdicts: ToolLoopVerdict[] = [];
+  for (let n = 1; n <= limit; n += 1) {
+    const { name, args, response = n } = call(n);
+    const { verdict, record } = admitToolCall(history, name, args, response);
+    verdicts.push(verdict);
+    if (verdict.action === "stop") break;
+    if (record && verdict.action === "run") record.result = seen(n);
   }
-  return undefined;
+  return verdicts;
 }
 
-describe("advanceToolCallLoopGuard", () => {
-  it("allows a parallel Open Connector batch with distinct action inputs", () => {
-    let streak = { key: undefined as string | undefined, count: 0 };
+const actions = (verdicts: ToolLoopVerdict[]) => verdicts.map((verdict) => verdict.action);
+const stopsAt = (verdicts: ToolLoopVerdict[]) =>
+  verdicts.at(-1)?.action === "stop" ? verdicts.length : undefined;
+const catLog = () => ({ name: "shell", args: { command: "cat job.log" } });
 
-    for (let index = 0; index < 20; index += 1) {
-      const result = advanceToolCallLoopGuard(streak, "mcp__open-connector__execute_action", {
-        actionId: "records.get",
-        input: { recordId: index + 1 },
-      });
-      streak = result.streak;
-      expect(result.stuck).toBe(false);
-    }
+describe("admitToolCall", () => {
+  it("refuses a call that keeps failing the same way at its third time and stops at its fifth", () => {
+    const verdicts = play(catLog, () => failure());
+
+    expect(actions(verdicts)).toEqual(["run", "run", "warn", "warn", "stop"]);
+    expect(verdicts[2]).toMatchObject({
+      action: "warn",
+      text: expect.stringMatching(
+        /^Not run: you have called shell with the same input 3 times and it failed the same way/,
+      ),
+    });
+    expect(verdicts[4]).toEqual({ action: "stop", tools: ["shell"], repeats: 5 });
   });
 
-  it("stops six consecutive identical calls that return the same tool error", () => {
-    let streak = { key: undefined as string | undefined, count: 0 };
-    let stuck = false;
+  it("gives a call that keeps answering the same way room to wait before warning", () => {
+    const verdicts = play(catLog, () => answer("Still loading"));
 
-    for (let index = 0; index < 6; index += 1) {
-      const result = advanceToolCallLoopGuard(streak, "shell", { command: "npm test" }, failure());
-      streak = result.streak;
-      stuck = result.stuck;
-    }
-
-    expect(stuck).toBe(true);
-    expect(streak.count).toBe(6);
+    expect(actions(verdicts)).toEqual([...Array(9).fill("run"), "warn", "warn", "stop"]);
+    expect(verdicts[9]).toMatchObject({
+      text: expect.stringContaining("If you are waiting for something, wait longer"),
+    });
   });
 
-  it("stops calls that differ only by a number in a text argument", () => {
-    let streak = { key: undefined as string | undefined, count: 0 };
-    let calls = 0;
-    let stuck = false;
-
-    while (!stuck && calls < 50) {
-      calls += 1;
-      const result = advanceToolCallLoopGuard(streak, "shell", { command: `echo noop-${calls}` });
-      streak = result.streak;
-      stuck = result.stuck;
-    }
-
-    expect(calls).toBe(25);
-    expect(toolCallStreakLength(streak)).toBe(25);
-  });
-
-  it("reports the run that stopped it, identical or near-identical, in the stop text", () => {
-    const stopText = (command: (call: number) => string) => {
-      let streak = { key: undefined as string | undefined, count: 0 };
-      for (let call = 1; call < 50; call += 1) {
-        const result = advanceToolCallLoopGuard(
-          streak,
-          "shell",
-          { command: command(call) },
-          failure(),
-        );
-        streak = result.streak;
-        if (result.stuck) return loopGuardStopText("shell", streak);
-      }
-      throw new Error("never stopped");
-    };
-
-    expect(stopText(() => "npm test")).toContain(" with the same input 6 times in a row");
-    expect(stopText((call) => `echo noop-${call}`)).toContain(
-      " with nearly the same input 25 times",
+  it("catches calls that alternate without a new answer", () => {
+    const verdicts = play(
+      (n) =>
+        n % 2
+          ? { name: "read_file", args: { path: "notes/plan.md" } }
+          : { name: "list_files", args: { path: "notes" } },
+      () => failure(),
     );
-    expect(isLoopGuardStopText(stopText(() => "npm test"))).toBe(true);
-    expect(isLoopGuardStopText("An ordinary reply")).toBe(false);
-    expect(isLoopGuardStopText(stopText((call) => `echo noop-${call}`))).toBe(true);
+
+    // Each call's third time is warned, its fifth ends the turn.
+    expect(actions(verdicts)).toEqual([...Array(4).fill("run"), ...Array(4).fill("warn"), "stop"]);
+    expect(verdicts[4]).toMatchObject({
+      text: expect.stringContaining("repeated the same 2 calls (list_files, read_file) 3 times"),
+    });
+    expect(verdicts.at(-1)).toEqual({
+      action: "stop",
+      tools: ["list_files", "read_file"],
+      repeats: 5,
+    });
   });
 
-  it("keeps the identical stop count when a longer similar streak precedes it", () => {
-    let streak = { key: undefined as string | undefined, count: 0 };
-    for (let call = 1; call <= 10; call += 1) {
-      streak = advanceToolCallLoopGuard(streak, "shell", { command: `echo noop-${call}` }).streak;
-    }
-    for (let call = 0; call < 6; call += 1) {
-      streak = advanceToolCallLoopGuard(
-        streak,
-        "shell",
-        { command: "echo noop-11" },
-        failure(),
-      ).streak;
-    }
-    expect(loopGuardStopText("shell", streak)).toContain(" with the same input 6 times in a row");
+  it("catches a cycle of three calls with unchanged answers", () => {
+    const tools = ["browser_snapshot", "browser_act", "web_fetch"];
+    const verdicts = play(
+      (n) => ({ name: tools[n % 3]!, args: { ref: "e1" } }),
+      (n) => answer(`same ${n % 3}`),
+    );
+    // The twelfth lap's first call ends it.
+    expect(stopsAt(verdicts)).toBe(3 * 11 + 1);
+  });
+
+  it("lets a status poll go on while its answer changes", () => {
+    const poll = () => ({ name: "cloud_agent_status", args: { id: "job-1" } });
+    expect(stopsAt(play(poll, (n) => answer(`Downloaded ${n}%`)))).toBeUndefined();
+    expect(actions(play(poll, (n) => answer(`Downloaded ${n}%`))).every((a) => a === "run")).toBe(
+      true,
+    );
+    // Waiting on a download: unchanged for a while, then it lands.
+    expect(
+      actions(play(poll, (n) => answer(n <= 8 ? "[]" : "[report.csv]"), 9)).every(
+        (a) => a === "run",
+      ),
+    ).toBe(true);
+  });
+
+  it("lets a sleep-then-check wait loop go on while the check changes", () => {
+    const verdicts = play(
+      (n) =>
+        n % 2
+          ? { name: "shell", args: { command: "sleep 30" } }
+          : { name: "list_files", args: { path: "downloads" } },
+      (n) => answer(n % 2 ? "" : `${n} bytes`),
+    );
+    expect(actions(verdicts).every((a) => a === "run")).toBe(true);
+  });
+
+  it("treats a changing cursor as a different call", () => {
+    const verdicts = play(
+      (n) => ({ name: "mcp__open-connector__execute_action", args: { cursor: `page-${n}` } }),
+      () => answer("[]"),
+    );
+    expect(actions(verdicts).every((a) => a === "run")).toBe(true);
+  });
+
+  it("ignores key order in the arguments", () => {
+    const verdicts = play(
+      (n) => ({
+        name: "web_fetch",
+        args: n % 2 ? { url: "u", mode: "text" } : { mode: "text", url: "u" },
+      }),
+      () => failure(),
+    );
+    expect(stopsAt(verdicts)).toBe(5);
+  });
+
+  it("counts the same call in one model response once", () => {
+    expect(
+      stopsAt(
+        play(
+          () => ({ ...catLog(), response: 1 }),
+          () => failure(),
+          12,
+        ),
+      ),
+    ).toBe(undefined);
+    const pairs = play(
+      (n) => ({ ...catLog(), response: Math.ceil(n / 2) }),
+      () => failure(),
+    );
+    expect(stopsAt(pairs)).toBe(9);
   });
 
   it.each([
-    ["shell", (n: number) => ({ command: `sed -n '${n * 100},${n * 100 + 99}p' big.log` })],
-    ["browser_act", (n: number) => ({ actions: [{ kind: "click", ref: `e${n + 2}` }] })],
-    ["browser_navigate", (n: number) => ({ url: `https://fixture.test/list?page=${n}` })],
-  ])("lets a 12-step %s sequence that differs only by numbers finish", (name, input) => {
-    let streak = { key: undefined as string | undefined, count: 0 };
-    for (let step = 1; step <= 12; step += 1) {
-      const result = advanceToolCallLoopGuard(streak, name, input(step));
-      streak = result.streak;
-      expect(result.stuck).toBe(false);
-    }
-  });
-
-  it("lets a similar run broken by another call start over", () => {
-    let streak = { key: undefined as string | undefined, count: 0 };
-    for (let index = 0; index < 20; index += 1) {
-      const command = index % 5 === 4 ? "pwd" : `echo noop-${index}`;
-      const result = advanceToolCallLoopGuard(streak, "shell", { command });
-      streak = result.streak;
-      expect(result.stuck).toBe(false);
-    }
-  });
-
-  it.each([
-    ["the same failure", () => failure(), 6],
-    ["the same answer", () => answer("Still loading"), 25],
-    ["an unknown answer", () => undefined, 25],
-    ["a new answer each time", (call: number) => answer(`Downloaded ${call * 10}%`), undefined],
-    // Only the first switch is new; after that both are known.
-    ["alternating failures", (call: number) => failure(call % 2 ? "a" : "b"), 7],
-    ["alternating answers", (call: number) => answer(call % 2 ? "a" : "b"), 26],
-    // The first failure, from call 5, starts the run the sixth failing call stops.
-    ["a failure after four answers", (call: number) => (call <= 4 ? answer("ok") : failure()), 10],
-    // Call 20's new answer starts the run over from it, so its 25th repeat stops.
-    ["an answer that changes at call 20", (call: number) => answer(call < 20 ? "a" : "b"), 44],
-    // A wait with transient errors: the first error starts the run over from call 4.
-    ["one error in a wait", (call: number) => (call === 4 ? failure() : answer("pending")), 28],
-    [
-      "an error every third answer in a wait",
-      (call: number) => (call % 3 === 1 && call > 1 ? failure() : answer("pending")),
-      28,
-    ],
+    ["the same failure", () => failure(), 5],
+    ["the same answer", () => answer("Still loading"), 12],
+    ["an unknown answer", () => undefined, 12],
+    ["a new answer each time", (n: number) => answer(`Downloaded ${n * 10}%`), undefined],
+    // The first switch is new and starts the count over; after that both answers are known.
+    ["alternating failures", (n: number) => failure(n % 2 ? "a" : "b"), 6],
+    ["alternating answers", (n: number) => answer(n % 2 ? "a" : "b"), 13],
+    // The first failure, from call 5, starts the run its fifth failing call stops.
+    ["a failure after four answers", (n: number) => (n <= 4 ? answer("ok") : failure()), 9],
+    ["an answer that changes at call 8", (n: number) => answer(n < 8 ? "a" : "b"), 19],
+    // A wait with a transient error: the error starts the count over from call 4.
+    ["one error in a wait", (n: number) => (n === 4 ? failure() : answer("pending")), 15],
     // A failing exit code can be a wait too (`sleep 30; test -f done`).
     [
       "a failing shell exit code",
       () => toolResultFingerprint({ stdout: "", stderr: "1 test failed", code: 1 }),
-      25,
+      12,
     ],
-  ])("stops an identical repeat that got %s at the expected call", (_, seen, stopsAt) => {
-    expect(identicalStopsAt(seen)).toBe(stopsAt);
+  ])("stops an identical repeat that got %s at the expected call", (_, seen, stop) => {
+    expect(stopsAt(play(catLog, seen))).toBe(stop);
   });
 
-  it.each([
-    ["identical", () => "npm test", 6],
-    ["digits-only", (call: number) => `cat page-${call}.txt`, 25],
-  ])("counts %s calls once per model response", (_, command, limit) => {
-    const stopsAt = (response: (call: number) => number) => {
-      let streak = { key: undefined as string | undefined, count: 0 };
-      for (let call = 1; call <= limit; call += 1) {
-        const result = advanceToolCallLoopGuard(
-          streak,
-          "shell",
-          { command: command(call) },
-          failure(),
-          response(call),
-        );
-        streak = result.streak;
-        if (result.stuck) return call;
-      }
-      return undefined;
-    };
-
-    expect(stopsAt(() => 1)).toBeUndefined();
-    expect(stopsAt((call) => call)).toBe(limit);
+  it("allows a parallel batch with distinct action inputs", () => {
+    const verdicts = play(
+      (n) => ({
+        name: "mcp__open-connector__execute_action",
+        args: { actionId: "records.get", input: { recordId: n } },
+        response: 1,
+      }),
+      () => answer("ok"),
+      20,
+    );
+    expect(actions(verdicts).every((a) => a === "run")).toBe(true);
   });
+});
 
+describe("loopGuardStopText", () => {
+  it("names the repeated calls and is recognised as a loop-guard stop", () => {
+    expect(loopGuardStopText(["List files"], 5)).toMatch(
+      /^I got stuck calling List files with the same input 5 times in a row/,
+    );
+    const cycle = loopGuardStopText(["List files", "Read file", "Shell"], 5);
+    expect(cycle).toContain("calling List files, Read file and Shell with the same input");
+    expect(isLoopGuardStopText(cycle)).toBe(true);
+    expect(isLoopGuardStopText("An ordinary reply")).toBe(false);
+    // Stops written before the rewrite still count.
+    expect(
+      isLoopGuardStopText(
+        "I got stuck calling Shell with nearly the same input 25 times in a row without making progress, so I stopped early. Try rephrasing this, or ask me to try a different approach.",
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("toolResultFingerprint", () => {
   it("fingerprints what the model saw, not timing details", () => {
     expect(toolResultFingerprint({ content: [{ type: "text", text: "ok" }], details: 1 })).toBe(
       toolResultFingerprint({ content: [{ type: "text", text: "ok" }], details: 2 }),

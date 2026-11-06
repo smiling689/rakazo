@@ -339,7 +339,7 @@ async function runLoop(
   const finalText = finalBlocks
     .map((block) => (block as { kind: string; text?: string }).text ?? "")
     .join("");
-  return { requests, act, finalizeRun, finalText };
+  return { requests, act, listFiles, finalizeRun, finalText };
 }
 
 /** Every answer is a computer_act call. `sizes` gives the batch size per request; the last repeats. */
@@ -399,19 +399,29 @@ describe("over-limit computer_act batches through the run loop", () => {
     expect(isLoopGuardStopText(finalText)).toBe(true);
   }, 30_000);
 
-  it("ends an identical refused batch at the fourth, before the same-input guard", async () => {
+  it("leaves an identical refused batch to the repeat guard, which refuses it sooner", async () => {
     const { requests, act, finalText } = await runWithBatches([30], false);
 
-    expect(requests).toHaveLength(MAX_CONSECUTIVE_OVER_LIMIT_ACTION_CALLS);
+    // Refused by the action limit twice, then by the repeat guard twice, then stopped.
+    expect(requests.length).toBeGreaterThanOrEqual(5);
+    expect(requests.length).toBeLessThanOrEqual(6);
     expect(act).not.toHaveBeenCalled();
-    expect(finalText).toContain("with too many actions 4 times in a row");
-    expect(finalText).not.toContain("the same input");
+    expect(toolResultTexts(requests[2]!.messages).at(-1)).toContain(REFUSAL);
+    expect(toolResultTexts(requests[3]!.messages).at(-1)).toContain("Not run: you have");
+    expect(finalText).toMatch(/^I got stuck calling Computer act with the same input 5 times/);
   }, 30_000);
 });
 
 describe("repeated identical tool calls through the run loop", () => {
-  it("ends the run at the sixth call that fails the same way", async () => {
-    expectStoppedAt(6, await runLoop(() => ({ calls: [LISTING] }), { listing: unreadable }));
+  it("refuses the third and fourth identical failing calls, then ends the run at the fifth", async () => {
+    const run = await runLoop(() => ({ calls: [LISTING] }), { listing: unreadable });
+
+    expectStoppedAt(5, run);
+    // Only the first two ran; the next two came back as warnings the model could act on.
+    expect(run.listFiles).toHaveBeenCalledTimes(2);
+    for (const request of run.requests.slice(3, 5)) {
+      expect(toolResultTexts(request.messages).at(-1)).toContain("Not run: you have");
+    }
   }, 30_000);
 
   it("lets the bot wait on an unchanged answer until it changes", async () => {
@@ -424,8 +434,11 @@ describe("repeated identical tool calls through the run loop", () => {
     expect(finalText).toBe("The report is ready.");
   }, 30_000);
 
-  it("ends an unchanged answer at the 25th call, not the sixth", async () => {
-    expectStoppedAt(25, await runLoop(() => ({ calls: [LISTING] })));
+  it("warns about an unchanged answer at the tenth call and ends the run at the twelfth", async () => {
+    const run = await runLoop(() => ({ calls: [LISTING] }));
+
+    expectStoppedAt(12, run);
+    expect(run.listFiles).toHaveBeenCalledTimes(9);
   }, 30_000);
 
   it("keeps polling while the result changes", async () => {
@@ -437,14 +450,13 @@ describe("repeated identical tool calls through the run loop", () => {
     expect(isLoopGuardStopText(finalText)).toBe(false);
   }, 30_000);
 
-  it("keeps going when the model writes before each repeat", async () => {
-    const { requests, finalText } = await runLoop(
-      () => ({ text: "Checking the download again.", calls: [LISTING] }),
-      { listing: unreadable },
+  it("ends a failing repeat even when the model writes before each one", async () => {
+    expectStoppedAt(
+      5,
+      await runLoop(() => ({ text: "Checking the download again.", calls: [LISTING] }), {
+        listing: unreadable,
+      }),
     );
-
-    expect(requests).toHaveLength(REQUEST_CAP + 1);
-    expect(isLoopGuardStopText(finalText)).toBe(false);
   }, 30_000);
 
   it("counts identical calls in one answer once", async () => {
@@ -455,8 +467,21 @@ describe("repeated identical tool calls through the run loop", () => {
     expect(batch.finalText).toBe("Done.");
 
     expectStoppedAt(
-      6,
+      5,
       await runLoop(() => ({ calls: [LISTING, LISTING] }), { listing: unreadable }),
     );
+  }, 30_000);
+
+  it("ends two calls that alternate without a new answer", async () => {
+    const other = { name: "list_files", args: { path: "inbox/downloads" } };
+    const run = await runLoop((n) => ({ calls: [n % 2 ? LISTING : other] }), {
+      listing: unreadable,
+    });
+
+    // Each call's third and fourth time are refused; the first one's fifth ends the run.
+    expect(run.listFiles).toHaveBeenCalledTimes(4);
+    expect(run.requests.length).toBeGreaterThanOrEqual(9);
+    expect(run.requests.length).toBeLessThanOrEqual(10);
+    expect(run.finalText).toMatch(/^I got stuck calling List files with the same input 5 times/);
   }, 30_000);
 });

@@ -28,6 +28,7 @@ import {
   terminatingToolResult,
 } from "./approval-effect.js";
 import { PiAgentRuntime } from "./pi-runtime.js";
+import { releaseToolCallBudget } from "./pi-runtime-tools.js";
 
 const primary = model("provider-a", "primary", 32_768);
 
@@ -222,6 +223,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // A paused run keeps its tool-call count for its continuation; these tests reuse one run id.
+  releaseToolCallBudget("run", false);
   if (previousMaxToolCalls === undefined) delete process.env.MAX_TOOL_CALLS_PER_TURN;
   else process.env.MAX_TOOL_CALLS_PER_TURN = previousMaxToolCalls;
 });

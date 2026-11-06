@@ -40,7 +40,6 @@ import { subagentMarksUnread } from "./run-notifications.js";
 import { secretPausedToolResult } from "./run-secret.js";
 import type { createRunTrustLoaders } from "./run-trust.js";
 import type { inferScript } from "./scripted-runtime.js";
-import type { LoopGuardStreak } from "./tool-loop.js";
 import { restoreTurnCheckpoint, unresolvedTurnCheckpointCalls } from "./turn-checkpoint.js";
 
 export type RunningHelper = Omit<Extract<MessageBlock, { kind: "subagent" }>, "kind">;
@@ -166,9 +165,6 @@ export interface RunState {
   approval: ApprovalState;
   effects: EffectState;
   screen: ScreenState;
-  toolCallStreak: LoopGuardStreak;
-  /** Result fingerprints of finished calls, read when the next call is tracked. */
-  toolResults: Map<string, string>;
   /** Consecutive `computer_act`/`browser_act` batches over the action limit, this one included. */
   overLimitActionCalls: number;
   /**

@@ -143,7 +143,9 @@ export async function executeSubagent(
     depth: 1,
     agentNamespace: agentId,
     pendingShells: [],
-    modelResponses: undefined,
+    modelResponses: 0,
+    // Interleaved with its siblings' calls, a helper's repeats would not line up.
+    recentCalls: [],
     // A paused child or a spent shared budget stops the parent turn; a result that
     // ends only the child's turn stops the child, and the parent reads it as the
     // tool result, exactly as it reads a lone turn-ending result.
@@ -287,6 +289,7 @@ export async function executeSubagent(
       terminatedReply = terminatingReplyText(event.result) ?? terminatedReply;
     }
     if (event.type === "message_start" && event.message.role === "assistant") {
+      nestedHost.modelResponses = (nestedHost.modelResponses ?? 0) + 1;
       // A later assistant turn supersedes the carried reply, except the empty aborted
       // message of a turn the terminating result itself ended.
       if (event.message.stopReason !== "aborted") terminatedReply = undefined;

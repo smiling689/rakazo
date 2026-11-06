@@ -691,8 +691,11 @@ export type AgentRuntimeEvent =
       executionId: string;
       /** The model reached this deferred built-in through use_tool. */
       viaUseTool?: boolean;
-      /** Which model response made the call; calls from one response share it. */
-      response?: number;
+      /**
+       * The runtime refused this call because the agent kept repeating it (or a short cycle of
+       * calls ending with it) without a new answer; the turn should end. `tools` names the calls.
+       */
+      stuck?: { tools: string[]; repeats: number };
     }
   | {
       type: "ask";

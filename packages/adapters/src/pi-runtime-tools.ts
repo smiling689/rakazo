@@ -36,6 +36,8 @@ import { recordPiTelemetryContent, withPiTelemetrySpan } from "./pi-telemetry.js
 import { VERBATIM_TOOL_RESULTS } from "./runtime-context.js";
 import { SCHEDULE_TOOL_NAMES } from "./schedule-tools.js";
 import type { FinishedShellCommand } from "./shell-command-stream.js";
+import type { ToolCallRecord } from "./tool-loop.js";
+import { admitToolCall, toolResultFingerprint } from "./tool-loop.js";
 import { textContentArg } from "./tool-text.js";
 import { isVerbatimMcpResult } from "./verbatim-mcp-result.js";
 
@@ -45,8 +47,11 @@ export interface ToolCallBudget {
   limit: number;
   inFlight: number;
 }
-// Optional fuse is process-local. continueRun on another worker starts at zero.
+// The fuse is process-local. continueRun on another worker starts at zero.
 const toolCallBudgetsByRun = new Map<string, ToolCallBudget>();
+// Paused and stopped runs keep their count for a continuation that may never come here, so the
+// oldest are dropped past this many; a dropped run that does continue starts at zero.
+const MAX_KEPT_TOOL_CALL_BUDGETS = 1_000;
 
 // Pi forwards these names to OpenAI Responses, whose function-name contract is
 // ^[a-zA-Z0-9_-]+$ with a maximum length of 64 characters.
@@ -54,13 +59,19 @@ const AGENT_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const MAX_AGENT_TOOL_NAME_LENGTH = 64;
 const FALLBACK_AGENT_TOOL_NAME = "connector_tool";
 
-/** Optional self-host fuse. Unset, empty, or 0 means unlimited (default). */
+/**
+ * Ends a runaway turn that keeps making different calls, which the repeat guard cannot see. The
+ * count includes helpers' calls; 300 leaves a long task room while a turn that would otherwise
+ * run for hours stops. Self-hosts can change it; 0 means unlimited.
+ */
+export const DEFAULT_MAX_TOOL_CALLS_PER_TURN = 300;
+
 export function maxToolCallsPerTurn(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.MAX_TOOL_CALLS_PER_TURN?.trim();
-  if (!raw) return 0;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
-  return Math.floor(parsed);
+  const parsed = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0
+    ? Math.floor(parsed)
+    : DEFAULT_MAX_TOOL_CALLS_PER_TURN;
 }
 
 export function toAgentTools(
@@ -105,7 +116,6 @@ function useToolAgentTool(
           name: USE_TOOL,
           args: params as Record<string, unknown>,
           executionId: JSON.stringify(["pi-tool", host.agentNamespace ?? "main", toolCallId]),
-          response: host.modelResponses,
         });
         throw new Error(`${name} is not available. Use a name find_tool lists.`);
       }
@@ -447,6 +457,30 @@ function toAgentTool(
           // This makes the saved sequential tail safe to resolve on resume.
           if (host.pausePending)
             return { content: [], details: { skipped: true }, terminate: true };
+          // Decided before any await, so parallel calls are judged in the order the model made them.
+          const { verdict, record } = admitToolCall(
+            host.recentCalls,
+            tool.name,
+            args,
+            host.modelResponses,
+          );
+          if (verdict.action === "warn") {
+            return { content: [{ type: "text", text: verdict.text }], details: { skipped: true } };
+          }
+          if (verdict.action === "stop") {
+            host.queue.push({
+              type: "tool",
+              name: tool.name,
+              args,
+              executionId,
+              stuck: { tools: verdict.tools, repeats: verdict.repeats },
+              ...(viaUseTool ? { viaUseTool } : {}),
+            });
+            return {
+              content: [{ type: "text", text: "Not run: the turn is ending." }],
+              details: { skipped: true },
+            };
+          }
           if (host.depth === 0) await host.captureCheckpoint?.(rawCallId, executionId);
           if (host.pausePending)
             return { content: [], details: { skipped: true }, terminate: true };
@@ -461,7 +495,6 @@ function toAgentTool(
             name: tool.name,
             args,
             executionId,
-            response: host.modelResponses,
             ...(viaUseTool ? { viaUseTool } : {}),
           });
           const startedAt = Date.now();
@@ -621,6 +654,7 @@ function toAgentTool(
             recordPiTelemetryContent(span, "pi.agent.tool.result", result);
             if (failed) span?.setStatus({ status: "error" });
             endToolCall(host);
+            if (record) record.result = toolResultFingerprint(result, failure);
             const completion: AgentToolCompletion = {
               name: tool.name,
               executionId,
@@ -748,8 +782,10 @@ export interface ToolHost {
   captureCheckpoint?: (toolCallId: string, executionId: string) => Promise<void>;
   /** Shell commands that returned output and are still running. */
   pendingShells: Array<Promise<FinishedShellCommand>>;
-  /** Model responses started by the main agent. Helpers reset it, so each of their calls counts. */
+  /** Model responses this agent has started; calls from one response share the number. */
   modelResponses?: number;
+  /** This agent's recent calls for the repeat guard. Each helper keeps its own. */
+  recentCalls: ToolCallRecord[];
 }
 
 export function toolCallBudgetExceededMessage(limit: number) {
@@ -770,6 +806,9 @@ export function toolCallBudgetFor(runId: string): ToolCallBudget {
     inFlight: 0,
   };
   if (budget.limit > 0) toolCallBudgetsByRun.set(runId, budget);
+  if (toolCallBudgetsByRun.size > MAX_KEPT_TOOL_CALL_BUDGETS) {
+    toolCallBudgetsByRun.delete(toolCallBudgetsByRun.keys().next().value!);
+  }
   return budget;
 }
 
