@@ -951,6 +951,11 @@ export interface MessagingInboundMessage {
   mediaUrl: string | null;
   /** Files the platform only serves to the bot's credentials (Slack url_private, …). */
   attachments?: MessagingInboundAttachment[];
+  /**
+   * The deployment fetched this message itself (a long poll or a stream), so no provider
+   * webhook waits on its processing and its files can take longer to download.
+   */
+  pulled?: boolean;
   /** The platform reports that this group message @-mentions the bot. */
   mentionsBot?: boolean;
   /** Team-room workspace/team id when the platform reports one (Slack team_id, …). */

@@ -129,9 +129,18 @@ async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<vo
       await mirrorChannelRun(deps, run, channelBlock);
       return;
     }
+  } else if (run.trigger === "routine") {
+    // A scheduled routine speaks first, so its reply goes where the owner reads the bot: the
+    // linked chat. Only routines on the bot's own thread (the one the chat mirrors), never a
+    // group's; a silent run leaves no text, so nothing is queued.
+    if (!run.routineId) return;
+    const ownThread = await deps.prisma.thread.findFirst({
+      where: { id: run.threadId, botId: run.botId },
+      select: { id: true },
+    });
+    if (!ownThread) return;
   } else if (run.trigger !== "bot_message") {
-    // Mirror inbound messaging runs and delegated bot_message replies only.
-    // Do not push in-app user/routine runs out to the linked chat.
+    // In-app user runs and follow-ups were written in the app, so their replies stay there.
     return;
   }
 
@@ -519,7 +528,7 @@ async function deliverRow(
         return true;
       }
       const sent = await deps.messaging.sendToThread(
-        { threadId: row.threadId, body: row.body },
+        { threadId: row.threadId, body: row.body, idempotencyKey: row.idempotencyKey },
         context,
       );
       accepted = true;
@@ -596,7 +605,12 @@ async function deliverRow(
       attachment = { name: artifact.name, mimeType: artifact.mimeType, data };
     }
     const sent = await deps.messaging.sendToThread(
-      { threadId, body: row.body, ...(attachment ? { attachment } : {}) },
+      {
+        threadId,
+        body: row.body,
+        idempotencyKey: row.idempotencyKey,
+        ...(attachment ? { attachment } : {}),
+      },
       context,
     );
     accepted = true;

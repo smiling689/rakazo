@@ -1,4 +1,4 @@
-import type { AdapterContext, MessagingSurface } from "@rakazo/adapter-kit";
+import type { AdapterContext, MessagingSendRequest, MessagingSurface } from "@rakazo/adapter-kit";
 import type { PrismaClient } from "@rakazo/db";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatSdkMessagingSurface, MessagingSendError } from "./chat-sdk-surface.js";
@@ -70,8 +70,12 @@ function findOutboundRow(rows: Array<Record<string, unknown>>, where: OutboundRo
 }
 
 function createFakeSurface(sendError?: Error) {
-  const sendToThread = vi.fn(async () => ({ handle: "handle-out-1" }));
+  const sendToThread = vi.fn(async (_request: MessagingSendRequest, _context: AdapterContext) => ({
+    handle: "handle-out-1",
+  }));
   if (sendError) sendToThread.mockRejectedValue(sendError);
+  // Outbox keys go here, so assertions on sendToThread stay about the message itself.
+  const sendKeys: Array<string | undefined> = [];
   const openDirectThread = vi.fn(
     async (_provider: string, address: string) => `sendblue:opened:${address}`,
   );
@@ -91,11 +95,14 @@ function createFakeSurface(sendError?: Error) {
     ],
     handleWebhook: () => null,
     onInbound: () => undefined,
-    sendToThread,
+    sendToThread: ({ idempotencyKey, ...request }, sendContext) => {
+      sendKeys.push(idempotencyKey);
+      return sendToThread(request, sendContext);
+    },
     openDirectThread,
     acknowledge: vi.fn(async () => undefined),
   };
-  return { messaging, sendToThread, openDirectThread };
+  return { messaging, sendToThread, openDirectThread, sendKeys };
 }
 
 function createDeps(overrides: {
@@ -108,9 +115,12 @@ function createDeps(overrides: {
   connectionStatus?: string | null;
   blockedBot?: string;
   artifacts?: Array<Record<string, unknown>>;
+  botThreadId?: string;
 }) {
   const rows = [...(overrides.outboundRows ?? [])] as Array<Record<string, unknown>>;
-  const { messaging, sendToThread, openDirectThread } = createFakeSurface(overrides.sendError);
+  const { messaging, sendToThread, openDirectThread, sendKeys } = createFakeSurface(
+    overrides.sendError,
+  );
   // Stateful identity row so a cached dmThreadId is visible to later reads.
   const identityRow =
     overrides.identity === null ? null : { ...identity, ...(overrides.identity ?? {}) };
@@ -118,6 +128,13 @@ function createDeps(overrides: {
     run: {
       findUnique: vi.fn(async () => overrides.run ?? messagingRun),
       updateMany: vi.fn(async () => ({ count: 1 })),
+    },
+    thread: {
+      findFirst: vi.fn(async ({ where }: { where: { id: string; botId: string } }) =>
+        where.id === (overrides.botThreadId ?? "thread-1") && where.botId === "bot-1"
+          ? { id: where.id }
+          : null,
+      ),
     },
     message: {
       findMany: vi.fn(
@@ -243,6 +260,7 @@ function createDeps(overrides: {
     jobs: { enqueue: vi.fn(async () => undefined) },
     artifacts: { get: vi.fn(async (storageKey: string) => new TextEncoder().encode(storageKey)) },
     sendToThread,
+    sendKeys,
     openDirectThread,
     rows,
   };
@@ -463,6 +481,52 @@ describe("deliverMessagingOutbound", () => {
       { threadId: "sendblue:dm-1", body: "Hello from your bot" },
       context,
     );
+  });
+
+  it("sends a routine's reply on the bot's own thread to the linked chat", async () => {
+    const routineRun = {
+      ...messagingRun,
+      trigger: "routine",
+      routineId: "routine-1",
+      threadId: "thread-1",
+      sourceMessage: null,
+    };
+    const deps = createDeps({ run: routineRun });
+    await deliverMessagingOutbound(deps, { runId: "run-1" }, context);
+    expect(deps.sendToThread).toHaveBeenCalledWith(
+      { threadId: "sendblue:dm-1", body: "Hello from your bot" },
+      context,
+    );
+
+    // A routine that posts to a group thread, or a routine-trigger run that is not a routine
+    // (a memory flush, an initiative), stays off the chat.
+    const group = createDeps({ run: { ...routineRun, threadId: "group-thread" } });
+    await deliverMessagingOutbound(group, { runId: "run-1" }, context);
+    expect(group.sendToThread).not.toHaveBeenCalled();
+    const internal = createDeps({ run: { ...routineRun, routineId: null } });
+    await deliverMessagingOutbound(internal, { runId: "run-1" }, context);
+    expect(internal.sendToThread).not.toHaveBeenCalled();
+
+    // Without a linked chat there is nowhere to send.
+    const noIdentity = createDeps({ run: routineRun, identity: null });
+    await deliverMessagingOutbound(noIdentity, { runId: "run-1" }, context);
+    expect(noIdentity.sendToThread).not.toHaveBeenCalled();
+  });
+
+  it("keeps a silent routine run silent", async () => {
+    const run = {
+      ...messagingRun,
+      trigger: "routine",
+      routineId: "routine-1",
+      threadId: "thread-1",
+    };
+    // A silent ending leaves no bot message, or only tool steps with no text.
+    for (const messages of [[], [{ id: "m-1", blocks: [{ kind: "tool", name: "search" }] }]]) {
+      const deps = createDeps({ run, messages });
+      await deliverMessagingOutbound(deps, { runId: "run-1" }, context);
+      expect(deps.rows).toEqual([]);
+      expect(deps.sendToThread).not.toHaveBeenCalled();
+    }
   });
 
   it("holds sendblue DM sends at the consecutive-outbound cap", async () => {
@@ -1249,6 +1313,8 @@ describe("deliverMessagingOutbound conversation order", () => {
       })),
     );
     expect(deps.rows.map((row) => row.status)).toEqual(["sent", "sent", "sent"]);
+    // Each send carries its row's key, so a platform that dedupes sees the retry as the same message.
+    expect(deps.sendKeys).toEqual(["msg:m-1", "msg:m-1:2", "msg:m-1:2", "msg:m-1:3"]);
   });
 
   it.each([

@@ -18,6 +18,7 @@ import {
   text,
   toPlainText,
 } from "chat";
+import { currentOutboundSendKey } from "../chat-sdk-surface.js";
 import type { IlinkMessage, IlinkMessageItem } from "./ilink-client.js";
 import {
   ILINK_ITEM,
@@ -26,6 +27,7 @@ import {
   ILINK_UPLOAD,
   IlinkClient,
   IlinkError,
+  ilinkClientId,
 } from "./ilink-client.js";
 import { WechatActivity } from "./activity.js";
 import { WechatStateStore } from "./state.js";
@@ -101,6 +103,8 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
   private readonly stickers: Pick<StickerLibrary, "pick" | "collect" | "remove">;
   private readonly activity: WechatActivity;
   private readonly watchers = new Map<string, () => void>();
+  /** Context tokens iLink called stale, per contact; a newer one arrives with their next message. */
+  private readonly staleContexts = new Map<string, string>();
 
   constructor(readonly config: WechatAdapterConfig) {
     this.client = new IlinkClient({
@@ -263,10 +267,8 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
 
   private async replyUnsupported(userId: string) {
     try {
-      await this.client.sendText(
-        userId,
-        WECHAT_UNSUPPORTED_REPLY,
-        await this.store.context(userId),
+      await this.sendWithContext(userId, (context) =>
+        this.client.sendText(userId, WECHAT_UNSUPPORTED_REPLY, context),
       );
     } catch (error) {
       getLogger().warn("wechat unsupported-message reply failed", { error: String(error) });
@@ -344,7 +346,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
    */
   async postMessage(threadId: string, message: AdapterPostableMessage) {
     const userId = decodeWechatThreadId(threadId);
-    const context = await this.store.context(userId);
     const { text: body, queries, collect, remove } = extractStickerTags(outboundText(message).trim());
     const files = typeof message === "object" && "files" in message ? (message.files ?? []) : [];
     if (!body && files.length === 0 && queries.length === 0 && collect.length === 0 && !remove) {
@@ -353,9 +354,18 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     const label = collect[0];
     if (label) await this.collectLastImage(userId, label);
     if (remove) await this.removeLastSticker(userId);
+    // A retry of an outbox row sends each bubble under the client id of its first try.
+    const sendKey = currentOutboundSendKey();
+    let bubble = 0;
+    const nextClientId = () => (sendKey ? ilinkClientId(`${sendKey}:${bubble++}`) : undefined);
     let id = "";
-    if (body) id = await this.client.sendText(userId, body, context);
-    for (const file of files) id = await this.sendUpload(userId, file, context);
+    if (body) {
+      const clientId = nextClientId();
+      id = await this.sendWithContext(userId, (context) =>
+        this.client.sendText(userId, body, context, clientId),
+      );
+    }
+    for (const file of files) id = await this.sendUpload(userId, file, nextClientId());
     const query = queries[0];
     if (query) {
       try {
@@ -364,7 +374,7 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
           id = await this.sendUpload(
             userId,
             { data: Buffer.from(sticker.data), filename: sticker.name, mimeType: sticker.mimeType },
-            context,
+            nextClientId(),
           );
           await this.activity.rememberSticker(userId, sticker.ref);
         }
@@ -400,7 +410,7 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     }
   }
 
-  private async sendUpload(userId: string, file: FileUpload, context: string | undefined) {
+  private async sendUpload(userId: string, file: FileUpload, clientId: string | undefined) {
     const data = await uploadBytes(file.data);
     const image = WECHAT_IMAGE_TYPES.has(file.mimeType ?? "");
     const uploaded = await this.client.uploadMedia(
@@ -408,9 +418,35 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
       data,
       image ? ILINK_UPLOAD.image : ILINK_UPLOAD.file,
     );
-    return image
-      ? this.client.sendImage(userId, uploaded, context)
-      : this.client.sendFile(userId, file.filename, uploaded, context);
+    return this.sendWithContext(userId, (context) =>
+      image
+        ? this.client.sendImage(userId, uploaded, context, clientId)
+        : this.client.sendFile(userId, file.filename, uploaded, context, clientId),
+    );
+  }
+
+  /**
+   * Sends under the contact's latest context token. When iLink calls the session behind it
+   * stale (the owner has not written for hours), sends once more without it, as Hermes
+   * Agent's adapter does to keep scheduled pushes working, and skips that token from then on.
+   * A stale session that survives this is left to the outbox, which gives up on it.
+   */
+  private async sendWithContext(
+    userId: string,
+    send: (context: string | undefined) => Promise<string>,
+  ): Promise<string> {
+    const stored = await this.store.context(userId);
+    const context = stored === this.staleContexts.get(userId) ? undefined : stored;
+    try {
+      return await send(context);
+    } catch (error) {
+      if (!context || !(error instanceof IlinkError) || error.failure !== "stale_session") {
+        throw error;
+      }
+      this.staleContexts.set(userId, context);
+      getLogger().warn("wechat context token is stale; sending without it", {});
+      return send(undefined);
+    }
   }
 
   async startTyping(threadId: string) {

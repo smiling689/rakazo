@@ -922,6 +922,37 @@ describe("createMessagingInboundHandler DM routing", () => {
     );
   });
 
+  it("gives the files of a pulled message their own longer download time", async () => {
+    const storeAttachment = vi.fn<NonNullable<MessagingInboundDeps["storeAttachment"]>>(
+      async ({ attachment }) => ({
+        id: attachment.name,
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+        size: 1,
+      }),
+    );
+    const deps = createDeps({ storeAttachment });
+    const before = Date.now();
+    const file = (name: string, mimeType: string) => ({
+      name,
+      mimeType,
+      fetch: async () => new Uint8Array([1]),
+    });
+    await createMessagingInboundHandler(deps)({
+      ...dmEvent,
+      pulled: true,
+      attachments: [
+        file("image.jpg", "image/jpeg"),
+        file("video.mp4", "video/mp4"),
+        file("notes.pdf", "application/pdf"),
+      ],
+    });
+    const budgets = storeAttachment.mock.calls.map(
+      ([input]) => Math.round((input.downloadDeadline! - before) / 1_000) * 1_000,
+    );
+    expect(budgets).toEqual([30_000, 120_000, 60_000]);
+  });
+
   it("sanitizes unavailable file labels and keeps routine failure metadata fenced", async () => {
     const deps = createDeps({ routines: [{ id: "routine-1", name: "Triage", prompt: "Review" }] });
     await createMessagingInboundHandler(deps)({

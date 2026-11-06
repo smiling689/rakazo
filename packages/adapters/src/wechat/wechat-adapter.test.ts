@@ -6,8 +6,10 @@ import { createMemoryState } from "@chat-adapter/state-memory";
 import type { Message, Thread } from "chat";
 import { Chat } from "chat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ChatSdkMessagingSurface, MessagingSendError } from "../chat-sdk-surface.js";
 import { messagingPlatformsFromEnv, splitOutboundBody } from "../messaging-platforms.js";
-import type { IlinkMessage } from "./ilink-client.js";
+import type { IlinkError, IlinkMessage } from "./ilink-client.js";
+import { ILINK_RATE_LIMIT_RETRY_SECONDS } from "./ilink-client.js";
 import {
   decodeWechatThreadId,
   encodeWechatThreadId,
@@ -21,6 +23,8 @@ function fakeIlink() {
   const batches: Record<string, unknown>[] = [];
   const requests: { path: string; body: Record<string, unknown>; headers: Headers }[] = [];
   const media = new Map<string, Uint8Array>();
+  /** Answers for the next sendmessage calls, in order; then success. */
+  const sendReplies: Record<string, unknown>[] = [];
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input));
     if (url.pathname.endsWith("/download")) {
@@ -38,9 +42,16 @@ function fakeIlink() {
       });
     }
     if (path === "ilink/bot/getconfig") return Response.json({ ret: 0, typing_ticket: "ticket-1" });
+    if (path === "ilink/bot/sendmessage") return Response.json(sendReplies.shift() ?? { ret: 0 });
     return Response.json({ ret: 0 });
   });
-  return { fetch: fetch as unknown as typeof globalThis.fetch, batches, requests, media };
+  return {
+    fetch: fetch as unknown as typeof globalThis.fetch,
+    batches,
+    requests,
+    media,
+    sendReplies,
+  };
 }
 
 const user = "o9cq80abc@im.wechat";
@@ -191,6 +202,107 @@ describe("WechatAdapter", () => {
     expect(restarted.requests[0]!.body.get_updates_buf).toBe("cursor-9");
   });
 
+  it("sends once more without a stale context token, then stops using it", async () => {
+    const server = fakeIlink();
+    server.batches.push({ ret: 0, get_updates_buf: "c", msgs: [inbound({})] });
+    const received = await chatWith(adapterFor(server, true));
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    const sender = adapterFor(server, false);
+    server.sendReplies.push({ ret: -14, errmsg: "session timeout" });
+
+    await sender.postMessage(encodeWechatThreadId(user), "Reminder: call back.");
+    await sender.postMessage(encodeWechatThreadId(user), "And one more thing.");
+    const sends = server.requests
+      .filter((request) => request.path === "ilink/bot/sendmessage")
+      .map((request) => request.body.msg as Record<string, unknown>);
+    expect(sends.map((msg) => msg.context_token)).toEqual(["ctx-1", undefined, undefined]);
+  });
+
+  it("classifies send failures for the outbox", async () => {
+    const [platform] = messagingPlatformsFromEnv({ wechatBotToken: "t", dataDir });
+    const server = fakeIlink();
+    const sender = adapterFor(server, false);
+    const failure = async (reply: Record<string, unknown>) => {
+      server.sendReplies.push(reply);
+      return sender.postMessage(encodeWechatThreadId(user), "hi").then(
+        () => {
+          throw new Error("expected the send to fail");
+        },
+        (error: unknown) => error as IlinkError,
+      );
+    };
+
+    // The frequency limit waits minutes, through the outbox's retry-after.
+    const limited = await failure({ ret: -2, errmsg: "freq limit" });
+    expect(limited.failure).toBe("rate_limited");
+    expect(limited.retryAfter).toBe(ILINK_RATE_LIMIT_RETRY_SECONDS);
+    expect(platform!.isPermanentSendError!(limited)).toBe(false);
+
+    // With no context token to drop, a stale session cannot recover until the owner writes.
+    const stale = await failure({ ret: -2, errmsg: "prepare failed" });
+    expect(stale.failure).toBe("stale_session");
+    expect(stale.retryAfter).toBeUndefined();
+    expect(platform!.isPermanentSendError!(stale)).toBe(true);
+
+    // Unknown codes stay retryable.
+    const other = await failure({ ret: -1, errmsg: "system error" });
+    expect(other.failure).toBeUndefined();
+    expect(platform!.isPermanentSendError!(other)).toBe(false);
+  });
+
+  it("sends a retried outbox row under the client ids of its first try", async () => {
+    const server = fakeIlink();
+    const adapter = adapterFor(server, false);
+    const [platform] = messagingPlatformsFromEnv({ wechatBotToken: "t", dataDir });
+    const surface = new ChatSdkMessagingSurface([{ ...platform!, adapter }]);
+    const context = {
+      operationId: "op",
+      traceId: "trace",
+      spaceId: "space",
+      userId: "owner",
+      signal: new AbortController().signal,
+    };
+    const send = (idempotencyKey: string) =>
+      surface.sendToThread(
+        { threadId: encodeWechatThreadId(user), body: "Your 3pm reminder.", idempotencyKey },
+        context,
+      );
+    server.sendReplies.push({ ret: -2, errmsg: "freq limit" });
+    const limited = await send("msg:m-1").catch((error: unknown) => error);
+    expect(limited).toBeInstanceOf(MessagingSendError);
+    expect((limited as MessagingSendError).permanent).toBe(false);
+    expect((limited as MessagingSendError).retryAfterMs).toBe(
+      ILINK_RATE_LIMIT_RETRY_SECONDS * 1000,
+    );
+    await send("msg:m-1");
+    await send("msg:m-2");
+
+    const ids = server.requests
+      .filter((request) => request.path === "ilink/bot/sendmessage")
+      .map((request) => (request.body.msg as Record<string, unknown>).client_id as string);
+    expect(ids[1]).toBe(ids[0]);
+    expect(ids[2]).not.toBe(ids[0]);
+    for (const id of ids)
+      expect(id).toMatch(
+        /^rakazo-[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+  });
+
+  it("marks polled messages as pulled, so their files get the longer download time", async () => {
+    const server = fakeIlink();
+    server.batches.push({ ret: 0, get_updates_buf: "c", msgs: [inbound({})] });
+    const adapter = adapterFor(server, true);
+    const [platform] = messagingPlatformsFromEnv({ wechatBotToken: "t", dataDir });
+    const surface = new ChatSdkMessagingSurface([{ ...platform!, adapter }]);
+    const events: unknown[] = [];
+    surface.onInbound(async (event) => {
+      events.push(event);
+    });
+    await surface.initialize();
+    await vi.waitFor(() => expect(events).toHaveLength(1));
+    expect(events[0]).toMatchObject({ type: "message", provider: "wechat", pulled: true });
+  });
+
   it("decrypts inbound images on demand", async () => {
     const server = fakeIlink();
     const key = Buffer.from("00112233445566778899aabbccddeeff", "hex");
@@ -257,7 +369,12 @@ describe("WeChat platform wiring", () => {
     expect(messagingPlatformsFromEnv({}).map((platform) => platform.provider)).toEqual([]);
     const [platform] = messagingPlatformsFromEnv({ wechatBotToken: "t", dataDir: "/tmp/x" });
     expect(platform!.provider).toBe("wechat");
-    expect(platform!.capabilities).toEqual({ direct: true, groups: false, receipt: "typing", files: true });
+    expect(platform!.capabilities).toEqual({
+      direct: true,
+      groups: false,
+      receipt: "typing",
+      files: true,
+    });
   });
 
   it("splits long replies at line breaks under the part limit", () => {

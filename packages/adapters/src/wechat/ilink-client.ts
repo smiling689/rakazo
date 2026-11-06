@@ -14,8 +14,19 @@ export const ILINK_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 const PROTOCOL_VERSION = "2.4.10";
 const APP_ID = "bot";
 const BOT_AGENT = "Rakazo";
-/** Business code for an expired login: the operator has to scan a new QR code. */
+/**
+ * Business codes, as Hermes Agent's WeChat adapter handles them
+ * (github.com/NousResearch/hermes-agent, plugins/platforms/weixin/adapter.py):
+ * -14 is an expired session. On getupdates that is the login (scan a new QR
+ * code); on sendmessage it can be just the peer's context token. -2 is the
+ * frequency limit, except that with errmsg "unknown error" or "prepare failed"
+ * it is a stale session too: the peer has not written for a long time.
+ */
 export const ILINK_SESSION_EXPIRED = -14;
+export const ILINK_RATE_LIMITED = -2;
+const ILINK_STALE_SESSION_MESSAGES = new Set(["unknown error", "prepare failed"]);
+/** iLink gives no retry-after; its limit holds for minutes once a few messages went out quickly. */
+export const ILINK_RATE_LIMIT_RETRY_SECONDS = 180;
 
 export const ILINK_LONG_POLL_TIMEOUT_MS = 35_000;
 const ILINK_REQUEST_TIMEOUT_MS = 15_000;
@@ -67,13 +78,24 @@ export interface IlinkMessage {
 
 export const ILINK_ITEM = { text: 1, image: 2, voice: 3, file: 4, video: 5 } as const;
 
+/**
+ * What a failed request means for a retry: wait out a rate limit, send again without the
+ * peer's context token after a stale session, or give up on a refusal that will not change.
+ */
+export type IlinkFailure = "rate_limited" | "stale_session" | "permanent";
+
 export class IlinkError extends Error {
+  /** Seconds to wait before retrying; the messaging outbox reads it like a platform's retry-after. */
+  readonly retryAfter: number | undefined;
+
   constructor(
     message: string,
     readonly code?: number,
+    readonly failure?: IlinkFailure,
   ) {
     super(message);
     this.name = "IlinkError";
+    this.retryAfter = failure === "rate_limited" ? ILINK_RATE_LIMIT_RETRY_SECONDS : undefined;
   }
 }
 
@@ -117,17 +139,39 @@ export class IlinkClient {
     };
   }
 
-  /** Sends one text message; returns the client id the message was sent under. */
-  async sendText(toUserId: string, text: string, contextToken?: string): Promise<string> {
-    return this.sendItem(toUserId, { type: ILINK_ITEM.text, text_item: { text } }, contextToken);
+  /**
+   * Sends one text message; returns the client id the message was sent under. Pass a
+   * `clientId` from ilinkClientId to send a retry under the id of its first try.
+   */
+  async sendText(
+    toUserId: string,
+    text: string,
+    contextToken?: string,
+    clientId?: string,
+  ): Promise<string> {
+    return this.sendItem(
+      toUserId,
+      { type: ILINK_ITEM.text, text_item: { text } },
+      contextToken,
+      clientId,
+    );
   }
 
   /** Sends an uploaded image (a photo, a chart, a sticker). */
-  async sendImage(toUserId: string, uploaded: IlinkUploaded, contextToken?: string): Promise<string> {
+  async sendImage(
+    toUserId: string,
+    uploaded: IlinkUploaded,
+    contextToken?: string,
+    clientId?: string,
+  ): Promise<string> {
     return this.sendItem(
       toUserId,
-      { type: ILINK_ITEM.image, image_item: { media: uploaded.media, mid_size: uploaded.cipherSize } },
+      {
+        type: ILINK_ITEM.image,
+        image_item: { media: uploaded.media, mid_size: uploaded.cipherSize },
+      },
       contextToken,
+      clientId,
     );
   }
 
@@ -137,6 +181,7 @@ export class IlinkClient {
     fileName: string,
     uploaded: IlinkUploaded,
     contextToken?: string,
+    clientId?: string,
   ): Promise<string> {
     return this.sendItem(
       toUserId,
@@ -145,6 +190,7 @@ export class IlinkClient {
         file_item: { media: uploaded.media, file_name: fileName, len: String(uploaded.size) },
       },
       contextToken,
+      clientId,
     );
   }
 
@@ -153,8 +199,8 @@ export class IlinkClient {
     toUserId: string,
     item: IlinkMessageItem,
     contextToken?: string,
+    clientId = `rakazo-${randomUUID()}`,
   ): Promise<string> {
-    const clientId = `rakazo-${randomUUID()}`;
     const body = await this.post(
       "ilink/bot/sendmessage",
       {
@@ -170,10 +216,8 @@ export class IlinkClient {
       },
       ILINK_REQUEST_TIMEOUT_MS,
     );
-    const code = failureCode(body);
-    if (code !== undefined) {
-      throw new IlinkError(`sendmessage failed: ${code} ${stringOf(body.errmsg)}`.trim(), code);
-    }
+    const failure = requestFailure("sendmessage", body);
+    if (failure) throw failure;
     return clientId;
   }
 
@@ -186,7 +230,9 @@ export class IlinkClient {
     data: Uint8Array,
     mediaType: (typeof ILINK_UPLOAD)[keyof typeof ILINK_UPLOAD],
   ): Promise<IlinkUploaded> {
-    if (data.byteLength > ILINK_MEDIA_MAX_BYTES) throw new IlinkError("media is too large");
+    if (data.byteLength > ILINK_MEDIA_MAX_BYTES) {
+      throw new IlinkError("media is too large", undefined, "permanent");
+    }
     const plain = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
     const key = randomBytes(16);
     const cipher = createCipheriv("aes-128-ecb", key, null);
@@ -206,10 +252,8 @@ export class IlinkClient {
       },
       ILINK_REQUEST_TIMEOUT_MS,
     );
-    const code = failureCode(body);
-    if (code !== undefined) {
-      throw new IlinkError(`getuploadurl failed: ${code} ${stringOf(body.errmsg)}`.trim(), code);
-    }
+    const failure = requestFailure("getuploadurl", body);
+    if (failure) throw failure;
     const full = stringOf(body.upload_full_url).trim();
     const param = stringOf(body.upload_param);
     if (!full && !param) throw new IlinkError("getuploadurl returned no upload URL");
@@ -227,7 +271,11 @@ export class IlinkClient {
         });
         if (response.status >= 400 && response.status < 500) {
           // A client error will not get better on retry.
-          throw new IlinkError(`media upload refused: HTTP ${response.status}`, response.status);
+          throw new IlinkError(
+            `media upload refused: HTTP ${response.status}`,
+            response.status,
+            "permanent",
+          );
         }
         const download = response.headers.get("x-encrypted-param");
         if (response.status !== 200 || !download) {
@@ -277,7 +325,8 @@ export class IlinkClient {
         ? `${ILINK_CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(media.encrypt_query_param)}`
         : undefined);
     if (!url) throw new IlinkError("media has no download location");
-    const response = await this.fetchImpl(url, { signal: AbortSignal.timeout(60_000) });
+    // Long enough for a video; the caller's own budget per kind of file is usually shorter.
+    const response = await this.fetchImpl(url, { signal: AbortSignal.timeout(120_000) });
     if (!response.ok) throw new IlinkError(`media download failed: HTTP ${response.status}`);
     const declared = Number(response.headers.get("content-length"));
     if (declared > ILINK_MEDIA_MAX_BYTES) throw new IlinkError("media is too large");
@@ -338,8 +387,36 @@ function failureCode(body: Record<string, unknown>): number | undefined {
   return undefined;
 }
 
+/** A send or upload request's business failure, classified for retries; undefined on success. */
+function requestFailure(path: string, body: Record<string, unknown>): IlinkError | undefined {
+  const code = failureCode(body);
+  if (code === undefined) return undefined;
+  const message = stringOf(body.errmsg) || stringOf(body.msg);
+  const failure: IlinkFailure | undefined =
+    code === ILINK_SESSION_EXPIRED ||
+    (code === ILINK_RATE_LIMITED && ILINK_STALE_SESSION_MESSAGES.has(message.trim().toLowerCase()))
+      ? "stale_session"
+      : code === ILINK_RATE_LIMITED
+        ? "rate_limited"
+        : undefined;
+  return new IlinkError(`${path} failed: ${code} ${message}`.trim(), code, failure);
+}
+
 function stringOf(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/**
+ * The client id for a send identified by a stable key, so every retry of it goes out under
+ * the same id. Shaped like the random ones (a UUID behind the prefix).
+ */
+export function ilinkClientId(key: string): string {
+  const hash = createHash("sha256").update(key).digest();
+  // Version 5 and RFC 4122 variant bits, as a name-based UUID has them.
+  hash[6] = (hash[6]! & 0x0f) | 0x50;
+  hash[8] = (hash[8]! & 0x3f) | 0x80;
+  const hex = hash.subarray(0, 16).toString("hex");
+  return `rakazo-${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 /** Media keys arrive as 32 hex characters, or base64 of either 16 raw bytes or that hex string. */

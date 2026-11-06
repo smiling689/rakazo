@@ -260,6 +260,22 @@ async function handleDirectEvent(
 /** Time for all voice note transcripts of one inbound message; files are delivered without them after it. */
 const VOICE_TRANSCRIBE_BUDGET_MS = 20_000;
 
+/**
+ * Time for all files of one message when a provider webhook waits on them: the webhook has to
+ * be answered before the provider gives up and retries.
+ */
+const WEBHOOK_DOWNLOAD_BUDGET_MS = 2_000;
+
+/**
+ * Time for one file of a message the deployment pulled, which nothing waits on. CDN media is
+ * slow to start and large, so these follow what Hermes Agent gives WeChat media.
+ */
+function pulledDownloadMs(mimeType: string): number {
+  if (mimeType.startsWith("image/")) return 30_000;
+  if (mimeType.startsWith("video/")) return 120_000;
+  return 60_000;
+}
+
 /** Download provider-held files into thread artifacts, mirroring the team-chat path. */
 async function storeInboundMedia(
   deps: MessagingInboundDeps,
@@ -268,7 +284,7 @@ async function storeInboundMedia(
 ) {
   const stored: Array<{ artifact: StoredAttachment; bytes: Uint8Array | undefined }> = [];
   const unavailable: string[] = [];
-  const downloadDeadline = Date.now() + 2_000;
+  const webhookDeadline = Date.now() + WEBHOOK_DOWNLOAD_BUDGET_MS;
   for (const [index, attachment] of (event.attachments ?? []).entries()) {
     if (!deps.storeAttachment || index >= ATTACHMENT_MAX_COUNT) {
       unavailable.push(`[file: ${sanitizeMessagingLabel(attachment.name)} (unavailable)]`);
@@ -281,7 +297,9 @@ async function storeInboundMedia(
         botId: ids.botId,
         attachment,
         clientNonce: `messaging-attachment:${event.provider}:${event.handle}:${index}`,
-        downloadDeadline,
+        downloadDeadline: event.pulled
+          ? Date.now() + pulledDownloadMs(attachment.mimeType)
+          : webhookDeadline,
       });
       // Only audio is transcribed; other files' bytes are not kept past their download.
       stored.push({

@@ -54,6 +54,9 @@ export type StoredInboundAttachment = ReturnType<typeof createdArtifact> & {
   bytes?: Uint8Array;
 };
 
+/** Download time for an inbound file when the caller sets no deadline. */
+const INBOUND_DOWNLOAD_DEFAULT_MS = 2_000;
+
 export async function storeInboundAttachment(
   deps: {
     prisma: PrismaClient;
@@ -79,7 +82,8 @@ export async function storeInboundAttachment(
     `Attachment exceeds the ${attachmentSizeLabel(maxBytes)} limit`,
   );
   if ((attachment.size ?? 0) > maxBytes) throw tooLarge;
-  const timeoutMs = Math.min(2_000, (input.downloadDeadline ?? Infinity) - Date.now());
+  const timeoutMs =
+    (input.downloadDeadline ?? Date.now() + INBOUND_DOWNLOAD_DEFAULT_MS) - Date.now();
   if (timeoutMs <= 0) throw new AttachmentValidationError("Attachment download timed out");
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
