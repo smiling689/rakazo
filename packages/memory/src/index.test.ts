@@ -12,11 +12,12 @@ const context: AdapterContext = {
 
 describe("memory store contract shape", () => {
   it("reads the most recently updated documents first", async () => {
+    const createdAt = new Date("2026-08-01T10:00:00.000Z");
     const updatedAt = new Date("2026-08-16T10:00:00.000Z");
     const findMany = vi
       .fn()
       .mockResolvedValue([
-        { id: "memory-1", path: "facts.md", content: "A fact", revision: 3, updatedAt },
+        { id: "memory-1", path: "facts.md", content: "A fact", revision: 3, createdAt, updatedAt },
       ]);
     const store = new MarkdownMemoryStore({ memoryDocument: { findMany } } as never);
 
@@ -27,6 +28,7 @@ describe("memory store contract shape", () => {
           path: "facts.md",
           content: "A fact",
           revision: 3,
+          createdAt: createdAt.toISOString(),
           updatedAt: updatedAt.toISOString(),
         },
       ],

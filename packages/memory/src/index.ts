@@ -44,6 +44,7 @@ export class MarkdownMemoryStore implements MemoryStore {
         path: doc.path,
         content: doc.content,
         revision: doc.revision,
+        createdAt: doc.createdAt.toISOString(),
         updatedAt: doc.updatedAt.toISOString(),
       })),
     };

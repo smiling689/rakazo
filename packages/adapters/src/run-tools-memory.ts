@@ -9,6 +9,7 @@ import type { z } from "zod";
 import { MAX_SHARED_MEMORY_CHARS, sharedMemorySaveError } from "./builtin-tools.js";
 import { redactConnectorPayload } from "./connector-safety.js";
 import { MAX_RECALLED_MEMORIES } from "./history-compaction.js";
+import { readMemoryDocument } from "./memory-context.js";
 import type { MemoryEdit, MemoryLimit } from "./memory-tools.js";
 import { BOT_MEMORY_LIMIT, editMemory } from "./memory-tools.js";
 import type { RunContext } from "./run-context.js";
@@ -152,6 +153,16 @@ export const memoryTools: ToolHandlers = {
       unit: "characters",
     });
     return call.finish("error" in result ? result : { ok: true, ...result });
+  },
+  async read_memory(ctx, call) {
+    const { deps, bot, context } = ctx;
+    const result = await readMemoryDocument(
+      deps.memory,
+      bot.id,
+      context,
+      withoutBlankFields(call.args),
+    );
+    return call.finish(redactConnectorPayload(result, ctx.secrets));
   },
   async recall_memory(ctx, call) {
     const { bot, thread, context } = ctx;
