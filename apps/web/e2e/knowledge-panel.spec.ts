@@ -34,7 +34,7 @@ test("memory and skills are readable and editable in the app", async ({ page }, 
         )?.content,
       { timeout: 30_000 },
     )
-    .toBe(retiredContent);
+    .toBe(`${retiredContent}\n`);
   await expect(page.getByRole("button", { name: "Allow once", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Deny", exact: true })).toHaveCount(0);
 

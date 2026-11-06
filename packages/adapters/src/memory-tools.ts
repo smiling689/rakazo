@@ -30,6 +30,11 @@ export function appendMemoryFact(existing: string, fact: string): string {
 
 export type MemoryEdit = { content: string } | { error: string; entries: string[] };
 
+/** A document's size cap and the unit it is measured in. */
+export type MemoryLimit = { max: number; unit: "bytes" | "characters" };
+
+export const BOT_MEMORY_LIMIT: MemoryLimit = { max: BOT_MEMORY_MAX_BYTES, unit: "bytes" };
+
 /**
  * Adds a fact, or with `oldText` replaces (or, given an empty fact, removes) the
  * lines holding its one match. A save that would grow the document past the cap
@@ -39,7 +44,7 @@ export function editMemory(
   existing: string,
   fact: string,
   oldText = "",
-  maxBytes = BOT_MEMORY_MAX_BYTES,
+  limit = BOT_MEMORY_LIMIT,
 ): MemoryEdit {
   const target = oldText.trim().replace(/\r\n/g, "\n");
   let content = existing;
@@ -70,10 +75,10 @@ export function editMemory(
       ? `${current.slice(0, start)}${next}${current.slice(end)}`
       : `${current.slice(0, start)}${current.slice(lineEnd === -1 ? end : end + 1)}`;
   }
-  const bytes = byteLength(content);
-  if (bytes > maxBytes && bytes > byteLength(existing)) {
+  const size = (text: string) => (limit.unit === "bytes" ? byteLength(text) : text.length);
+  if (size(content) > limit.max && size(content) > size(existing)) {
     return {
-      error: `Memory is full (${maxBytes} bytes). Make room by merging, shortening or removing entries with old_text, then save again.`,
+      error: `Memory is full (${limit.max} ${limit.unit}). Make room by merging, shortening or removing entries with old_text, then save again.`,
       entries: entriesOf(existing),
     };
   }
