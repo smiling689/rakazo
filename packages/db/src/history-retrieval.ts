@@ -4,7 +4,7 @@ import { HistoryQueriesSchema } from "@rakazo/contracts";
 import { shortenedTextLength, textBoundary } from "@rakazo/core";
 import type { PrismaClient } from "./client.js";
 import { Prisma } from "./client.js";
-import { searchTerms } from "./content-crypto.js";
+import { searchSegments, searchTerms } from "./content-crypto.js";
 import { contentEncryptionOf, INDEXED_MESSAGE, UNINDEXED_MESSAGE } from "./content-encryption.js";
 import { historyMessageText } from "./history-text.js";
 
@@ -130,22 +130,46 @@ async function messageRows(prisma: PrismaClient, sql: Prisma.Sql): Promise<Histo
 }
 
 /**
+ * Rows not yet encrypted. The full-text index splits words at spaces and
+ * punctuation, so a run of CJK text is one lexeme it cannot look inside. A query
+ * with CJK text instead matches each of its words as a substring (letters and
+ * digits only, so no LIKE wildcards), which scans the rows the scope allows: one
+ * chat, or the user's chats for my_chats.
+ */
+function plaintextMatch(query: string): Prisma.Sql {
+  const segments = searchSegments(query);
+  if (!segments.some((segment) => segment.cjk))
+    return Prisma.sql`to_tsvector('simple', ${searchableText}) @@ plainto_tsquery('simple', ${query})`;
+  const unique = new Map(segments.map((segment) => [segment.text, segment.cjk]));
+  return Prisma.join(
+    [...unique].map(([text, cjk]) => {
+      const pattern = `%${text}%`;
+      // CJK has no case, and LIKE skips ILIKE's lowercasing of every row.
+      const like = cjk ? Prisma.sql`LIKE` : Prisma.sql`ILIKE`;
+      // The whole-row text is cheaper to check and rules out most rows first.
+      return Prisma.sql`(m.blocks::text ${like} ${pattern} AND ${searchableText} ${like} ${pattern})`;
+    }),
+    " AND ",
+  );
+}
+
+/**
  * Encrypted rows match on blind-index word tokens (one token list per key
- * version); rows not yet encrypted keep matching through the full-text index.
+ * version); rows not yet encrypted match their text.
  */
 async function historyMatch(
   prisma: PrismaClient,
   spaceId: string,
   query: string,
 ): Promise<Prisma.Sql> {
-  const fullText = Prisma.sql`to_tsvector('simple', ${searchableText}) @@ plainto_tsquery('simple', ${query})`;
+  const plaintext = plaintextMatch(query);
   const encryption = contentEncryptionOf(prisma);
-  if (!encryption) return fullText;
+  if (!encryption) return plaintext;
   const tokenSets = (await encryption.messageSearchTokens(spaceId, query, "word")).filter(
     (tokens) => tokens.length,
   );
   const encrypted = tokenSets.map((tokens) => Prisma.sql`m."searchTokens" @> ${tokens}::int[]`);
-  return Prisma.sql`(${Prisma.join([...encrypted, Prisma.sql`(${UNINDEXED_MESSAGE} AND ${fullText})`], " OR ")})`;
+  return Prisma.sql`(${Prisma.join([...encrypted, Prisma.sql`(${UNINDEXED_MESSAGE} AND ${plaintext})`], " OR ")})`;
 }
 function pageSize(value = 10): number {
   if (!Number.isInteger(value) || value < 1)
@@ -262,7 +286,7 @@ export async function searchHistory(
   // Blind-index tokens are 32-bit and share the array with prefix tokens, so an
   // indexed candidate is kept only if its decrypted text has every word of a query.
   // False candidates are skipped and the scan continues, so pages stay full.
-  const terms = queries.map(searchTerms);
+  const terms = queries.map((query) => searchTerms(query));
   const indexed = contentEncryptionOf(prisma) ? INDEXED_MESSAGE : Prisma.sql`false`;
   const rows: Array<HistoryRow & { matchedQueryIndexes: number[]; nextOffset: number }> = [];
   let cursor = beforeSeq;
@@ -292,7 +316,7 @@ export async function searchHistory(
     );
     for (const row of batch) {
       scanned += 1;
-      const text = new Set(searchTerms(historyMessageText(row.blocks)));
+      const text = new Set(searchTerms(historyMessageText(row.blocks), "index"));
       const matchedQueryIndexes = terms.flatMap((words, index) =>
         words.every((word) => text.has(word)) ? [index] : [],
       );

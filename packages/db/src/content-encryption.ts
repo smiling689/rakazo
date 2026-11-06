@@ -5,6 +5,7 @@ import {
   decryptText,
   encryptText,
   jsonKeyIds,
+  legacyQuerySearchTokens,
   openJson,
   querySearchTokens,
   sealJson,
@@ -124,6 +125,14 @@ function stringsIn(value: unknown, out: string[] = []): string[] {
   return out;
 }
 
+/** Blind-index tokens for a message's plaintext blocks. */
+export function messageIndexTokens(key: DataKey, blocks: unknown): number[] {
+  return searchTokens(key, {
+    words: historyMessageText(blocks as Prisma.JsonValue),
+    strings: stringsIn(blocks),
+  });
+}
+
 const ownerOf = (spec: ModelSpec) => ROW_OWNER[spec.table];
 
 /** Columns a row needs beside its encrypted fields to be decrypted and verified. */
@@ -147,8 +156,9 @@ export interface ContentEncryption {
    */
   openRows<T extends { id: string }>(model: keyof typeof ENCRYPTED_MODELS, rows: T[]): Promise<T[]>;
   /**
-   * One token list per key version of the space; a match must contain every token
-   * of one list. Empty when the space has no keys, so it has no encrypted rows.
+   * Token lists for each key version of the space (and, for CJK queries, as rows
+   * indexed before CJK bigrams hold them); a match must contain every token of one
+   * list. Empty when the space has no keys, so it has no encrypted rows.
    */
   messageSearchTokens(
     spaceId: string,
@@ -361,11 +371,7 @@ export function withContentEncryption(prisma: PrismaClient, ring: ContentKeyRing
       if (!plainKeys && isRecord(value) && "set" in value) value = value.set;
       if (value === null) next[field] = null;
       else if (plainKeys) {
-        if (spec.searchTokens)
-          next.searchTokens = searchTokens(key, {
-            words: historyMessageText(value as Prisma.JsonValue),
-            strings: stringsIn(value),
-          });
+        if (spec.searchTokens) next.searchTokens = messageIndexTokens(key, value);
         next[field] = sealJson(value, plainKeys, encrypt);
       } else if (typeof value === "string") next[field] = encrypt(value);
       else throw new Error(`Unsupported write to encrypted ${spec.table}.${field}`);
@@ -501,7 +507,14 @@ export function withContentEncryption(prisma: PrismaClient, ring: ContentKeyRing
     },
     async messageSearchTokens(spaceId, query, domain) {
       const keys = await ring.allFresh(spaceId);
-      return keys.map((key) => querySearchTokens(key, query, domain));
+      return keys.flatMap((key) => {
+        const tokens = querySearchTokens(key, query, domain);
+        const legacy = legacyQuerySearchTokens(key, query, domain);
+        // A query with no indexable term falls back to a scan, which finds old rows too.
+        return legacy && tokens.length && legacy.join() !== tokens.join()
+          ? [tokens, legacy]
+          : [tokens];
+      });
     },
   };
 

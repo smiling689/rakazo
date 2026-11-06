@@ -75,8 +75,11 @@ read-only and runs across spaces.
 Postgres full-text search cannot read ciphertext. Messages carry a
 `searchTokens` integer array with a GIN index: keyed HMACs (per space) of each
 normalized word in the conversational text, plus word prefixes of 2 to 10
-characters from every string in the message. Agent history search matches
-whole words, as before. Space search matches word prefixes, then decrypts the
+characters from every string in the message. Chinese, Japanese and Korean text
+has no spaces between words, so each run of it is indexed as overlapping
+two-character pairs (and, in the conversational text, single characters); a
+query matches when the text holds all of its pairs. Agent history search
+matches whole words, as before. Space search matches word prefixes, then decrypts the
 candidates and applies its usual filter. Rows not yet migrated keep matching
 through the old full-text and substring predicates.
 
