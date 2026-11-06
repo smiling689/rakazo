@@ -478,6 +478,22 @@ describe("storeInboundAttachment", () => {
     }
   });
 
+  it("waits for a slow download until the caller's deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const { put, store } = setup();
+      const fetch = () =>
+        new Promise<Uint8Array>((resolve) => setTimeout(() => resolve(new Uint8Array(3)), 20_000));
+      const result = store({ name: "a.png", mimeType: "image/png", fetch }, Date.now() + 30_000);
+      const reached = expect(result).rejects.toBe(reachedStorage);
+      await vi.advanceTimersByTimeAsync(20_000);
+      await reached;
+      expect(put).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not start another download after the shared deadline", async () => {
     const { put, store } = setup();
     const fetch = vi.fn(async () => new Uint8Array(3));

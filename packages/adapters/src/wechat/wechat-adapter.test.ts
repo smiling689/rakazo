@@ -288,6 +288,21 @@ describe("WechatAdapter", () => {
       );
   });
 
+  it("marks polled messages as pulled, so their files get the longer download time", async () => {
+    const server = fakeIlink();
+    server.batches.push({ ret: 0, get_updates_buf: "c", msgs: [inbound({})] });
+    const adapter = adapterFor(server, true);
+    const [platform] = messagingPlatformsFromEnv({ wechatBotToken: "t", dataDir });
+    const surface = new ChatSdkMessagingSurface([{ ...platform!, adapter }]);
+    const events: unknown[] = [];
+    surface.onInbound(async (event) => {
+      events.push(event);
+    });
+    await surface.initialize();
+    await vi.waitFor(() => expect(events).toHaveLength(1));
+    expect(events[0]).toMatchObject({ type: "message", provider: "wechat", pulled: true });
+  });
+
   it("decrypts inbound images on demand", async () => {
     const server = fakeIlink();
     const key = Buffer.from("00112233445566778899aabbccddeeff", "hex");

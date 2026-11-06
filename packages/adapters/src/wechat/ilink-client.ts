@@ -325,7 +325,8 @@ export class IlinkClient {
         ? `${ILINK_CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(media.encrypt_query_param)}`
         : undefined);
     if (!url) throw new IlinkError("media has no download location");
-    const response = await this.fetchImpl(url, { signal: AbortSignal.timeout(60_000) });
+    // Long enough for a video; the caller's own budget per kind of file is usually shorter.
+    const response = await this.fetchImpl(url, { signal: AbortSignal.timeout(120_000) });
     if (!response.ok) throw new IlinkError(`media download failed: HTTP ${response.status}`);
     const declared = Number(response.headers.get("content-length"));
     if (declared > ILINK_MEDIA_MAX_BYTES) throw new IlinkError("media is too large");

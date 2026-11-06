@@ -524,6 +524,8 @@ export class ChatSdkMessagingSurface implements MessagingSurface {
         .join("\n"),
       mediaUrl: message.attachments.find((attachment) => attachment.url)?.url ?? null,
       ...(attachments.length ? { attachments } : {}),
+      // Webhook deliveries run inside the drain that answers the webhook.
+      ...(webhookDrain.getStore() ? {} : { pulled: true }),
       ...(!isDirect && message.isMention ? { mentionsBot: true } : {}),
       ...(departures ? { departures } : {}),
     };
