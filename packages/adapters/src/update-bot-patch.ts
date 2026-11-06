@@ -1,5 +1,25 @@
 import { BOT_DESCRIPTION_MAX_LENGTH, BOT_NAME_MAX_LENGTH } from "@rakazo/contracts";
 
+/**
+ * `update_bot` fields that change a setting. A call applies only those it names in `change`:
+ * some models fill in every field, with `false` or "off" for the ones they mean to leave alone,
+ * and a plain read then turned switches off. Without `change` the call is a read.
+ */
+export const UPDATE_BOT_SETTING_FIELDS = [
+  "name",
+  "description",
+  "instructions",
+  "color",
+  "artifact_id",
+  "use_attached_image",
+  "notifyOnFinish",
+  "dailyCheckIns",
+  "model",
+  "thinkingLevel",
+  "readAloud",
+  "voice",
+] as const;
+
 export type UpdateBotPatch = {
   name?: string;
   description?: string;

@@ -6,7 +6,7 @@ import {
   normalizeOpenAiToolParameters,
   openAiToolParametersNeedNormalization,
 } from "./openai-tool-parameters.js";
-import { argumentGiven } from "./update-bot-patch.js";
+import { argumentGiven, UPDATE_BOT_SETTING_FIELDS } from "./update-bot-patch.js";
 
 export function parametersFor(tool: ConnectorTool) {
   const builtin = builtinParameters(tool);
@@ -117,6 +117,7 @@ function builtinParameters(tool: ConnectorTool) {
       readAloud: Type.Optional(Type.Boolean()),
       voice: Type.Optional(Type.String()),
       bot_id: Type.Optional(Type.String()),
+      change: Type.Optional(Type.Array(stringEnum(UPDATE_BOT_SETTING_FIELDS, {}))),
     });
   }
   if (tool.name === "list_fleet") return Type.Object({ bot_id: Type.Optional(Type.String()) });
@@ -382,6 +383,10 @@ export function prepareFleetArguments(
   // The read pager's offset is a number; the handler validates it.
   if (toolName === "update_bot" && argumentGiven(raw.instructions_offset))
     out.instructions_offset = raw.instructions_offset;
+  if (toolName === "update_bot") {
+    const change = new Set(Array.isArray(raw.change) ? raw.change.map(String) : []);
+    for (const key of UPDATE_BOT_SETTING_FIELDS) if (!change.has(key)) delete out[key];
+  }
   return out;
 }
 
