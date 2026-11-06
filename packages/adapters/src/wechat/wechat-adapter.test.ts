@@ -409,6 +409,7 @@ describe("WeChat platform wiring", () => {
       direct: true,
       groups: false,
       receipt: "typing",
+      typingRefreshMs: 5_000,
       files: true,
     });
   });

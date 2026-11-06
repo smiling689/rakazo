@@ -26,7 +26,7 @@ import { Domain } from "./lark/thread-id.js";
 import { LazyPhotonAdapter } from "./photon/lazy-adapter.js";
 import { isVitestRuntime } from "./test-runtime.js";
 import { IlinkError } from "./wechat/ilink-client.js";
-import { WechatAdapter } from "./wechat/wechat-adapter.js";
+import { WECHAT_TYPING_REFRESH_MS, WechatAdapter } from "./wechat/wechat-adapter.js";
 
 /**
  * Parsed platform credentials, filled from process.env at the composition
@@ -395,7 +395,13 @@ export function messagingPlatformsFromEnv(
     platforms.push({
       provider: "wechat",
       // Pictures and files a reply attaches are uploaded to WeChat's CDN and sent after the text.
-      capabilities: { direct: true, groups: false, receipt: "typing", files: true },
+      capabilities: {
+        direct: true,
+        groups: false,
+        receipt: "typing",
+        typingRefreshMs: WECHAT_TYPING_REFRESH_MS,
+        files: true,
+      },
       adapter: new WechatAdapter({
         token: env.wechatBotToken,
         baseUrl: env.wechatBaseUrl,

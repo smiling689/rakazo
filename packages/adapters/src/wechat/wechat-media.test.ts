@@ -5,22 +5,16 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { splitOutboundBody, wechatChatBubbles } from "../messaging-platforms.js";
 import { WechatActivity } from "./activity.js";
-import type { IlinkMessage } from "./ilink-client.js";
 import type { Sticker, StickerEntry } from "./stickers.js";
 import {
-  chooseSticker,
   COLLECTED_FAMILY,
+  chooseSticker,
   extractStickerTags,
   rankStickers,
   StickerLibrary,
   sniffImageExtension,
 } from "./stickers.js";
-import {
-  encodeWechatThreadId,
-  WECHAT_TYPING_MAX_MS,
-  WECHAT_TYPING_REFRESH_MS,
-  WechatAdapter,
-} from "./wechat-adapter.js";
+import { encodeWechatThreadId, WechatAdapter } from "./wechat-adapter.js";
 
 const user = "o9cq80abc@im.wechat";
 const GIF = Buffer.from("GIF89a-fake-gif");
@@ -68,7 +62,11 @@ function fakeServer(options: { cdnStatus?: number } = {}) {
       });
     }
     if (path === "ilink/bot/getuploadurl") {
-      uploads.push({ key: Buffer.from(String(body.aeskey), "hex"), ciphertext: Buffer.alloc(0), request: body });
+      uploads.push({
+        key: Buffer.from(String(body.aeskey), "hex"),
+        ciphertext: Buffer.alloc(0),
+        request: body,
+      });
       return Response.json({ ret: 0, upload_param: "upload-param" });
     }
     if (path === "ilink/bot/getconfig") return Response.json({ ret: 0, typing_ticket: "ticket-1" });
@@ -77,7 +75,14 @@ function fakeServer(options: { cdnStatus?: number } = {}) {
     }
     return Response.json({ ret: 0 });
   });
-  return { fetch: fetch as unknown as typeof globalThis.fetch, sent, requests, uploads, batches, media };
+  return {
+    fetch: fetch as unknown as typeof globalThis.fetch,
+    sent,
+    requests,
+    uploads,
+    batches,
+    media,
+  };
 }
 
 function adapterFor(
@@ -89,7 +94,11 @@ function adapterFor(
     dataDir,
     pollInboundMessages: options.poll ?? false,
     fetch: server.fetch,
-    stickers: options.stickers ?? { pick: async () => undefined, collect: async () => true, remove: async () => {} },
+    stickers: options.stickers ?? {
+      pick: async () => undefined,
+      collect: async () => true,
+      remove: async () => {},
+    },
   });
   adapters.push(adapter);
   return adapter;
@@ -157,7 +166,10 @@ describe("WeChat pictures and files", () => {
       {
         type: 4,
         file_item: {
-          media: expect.objectContaining({ encrypt_query_param: "download-param", encrypt_type: 1 }),
+          media: expect.objectContaining({
+            encrypt_query_param: "download-param",
+            encrypt_type: 1,
+          }),
           file_name: "report.pdf",
           len: String(pdf.byteLength),
         },
@@ -188,10 +200,9 @@ describe("WeChat stickers", () => {
   it("strips the tag from the text and sends one matching sticker after it", async () => {
     const server = fakeServer();
     const pick = vi.fn(async () => sticker);
-    await adapterFor(server, { stickers: { pick, collect: async () => true, remove: async () => {} } }).postMessage(
-      encodeWechatThreadId(user),
-      "这也太离谱了 [表情:无语] [表情：开心]",
-    );
+    await adapterFor(server, {
+      stickers: { pick, collect: async () => true, remove: async () => {} },
+    }).postMessage(encodeWechatThreadId(user), "这也太离谱了 [表情:无语] [表情：开心]");
     expect(pick).toHaveBeenCalledTimes(1);
     expect(pick).toHaveBeenCalledWith("无语");
     expect(server.sent[0]).toEqual({ type: 1, text_item: { text: "这也太离谱了" } });
@@ -201,10 +212,9 @@ describe("WeChat stickers", () => {
 
   it("sends a sticker on its own and drops one it cannot find without failing", async () => {
     const server = fakeServer();
-    await adapterFor(server, { stickers: { pick: async () => sticker, collect: async () => true, remove: async () => {} } }).postMessage(
-      encodeWechatThreadId(user),
-      "[表情:晚安]",
-    );
+    await adapterFor(server, {
+      stickers: { pick: async () => sticker, collect: async () => true, remove: async () => {} },
+    }).postMessage(encodeWechatThreadId(user), "[表情:晚安]");
     expect(server.sent).toEqual([expect.objectContaining({ type: 2 })]);
 
     const quiet = fakeServer();
@@ -214,7 +224,10 @@ describe("WeChat stickers", () => {
       remove: async () => {},
     };
     await expect(
-      adapterFor(quiet, { stickers: failing }).postMessage(encodeWechatThreadId(user), "好的 [表情:好的]"),
+      adapterFor(quiet, { stickers: failing }).postMessage(
+        encodeWechatThreadId(user),
+        "好的 [表情:好的]",
+      ),
     ).resolves.toMatchObject({ threadId: encodeWechatThreadId(user) });
     expect(quiet.sent).toEqual([{ type: 1, text_item: { text: "好的" } }]);
   });
@@ -252,7 +265,9 @@ describe("WeChat stickers", () => {
       { file: "b.gif", label: "无语", text: "熊猫", family: "萌宠" },
       { file: "c.gif", label: "猫猫无语了", text: "", family: "萌宠" },
     ];
-    expect(rankStickers(entries, "猫猫 无语").map((match) => [match.entry.file, match.score])).toEqual([
+    expect(
+      rankStickers(entries, "猫猫 无语").map((match) => [match.entry.file, match.score]),
+    ).toEqual([
       ["c.gif", 6],
       ["b.gif", 3],
       ["a.gif", 2],
@@ -287,7 +302,10 @@ describe("WeChat stickers", () => {
       { file: "pets/../../../escape.gif", label: "开心", text: "", family: "萌宠", data: GIF },
     ]);
     const library = new StickerLibrary({ dataDir, random: () => 0 });
-    expect(await library.pick("开心")).toMatchObject({ name: "cat-happy.gif", mimeType: "image/gif" });
+    expect(await library.pick("开心")).toMatchObject({
+      name: "cat-happy.gif",
+      mimeType: "image/gif",
+    });
     expect(await library.pick("生日")).toBeUndefined();
 
     expect(await library.collect(PNG, "我的 生日 快乐")).toBe(true);
@@ -298,7 +316,9 @@ describe("WeChat stickers", () => {
     const index = JSON.parse(
       await readFile(join(dataDir, "messaging", "stickers-collected", "index.json"), "utf8"),
     ) as StickerEntry[];
-    expect(index).toEqual([expect.objectContaining({ label: "我的 生日 快乐", family: COLLECTED_FAMILY })]);
+    expect(index).toEqual([
+      expect.objectContaining({ label: "我的 生日 快乐", family: COLLECTED_FAMILY }),
+    ]);
   });
 
   it("takes a removed sticker out of use: library ones are skipped, collected ones deleted", async () => {
@@ -322,13 +342,17 @@ describe("WeChat stickers", () => {
     expect(mine?.ref.collected).toBe(true);
     await library.remove(mine!.ref);
     expect(await library.pick("生日")).toBeUndefined();
-    await expect(readFile(join(dataDir, "messaging", "stickers-collected", mine!.ref.file))).rejects.toThrow();
+    await expect(
+      readFile(join(dataDir, "messaging", "stickers-collected", mine!.ref.file)),
+    ).rejects.toThrow();
   });
 
   it("removes the sticker it sent last when a later reply carries [删除表情]", async () => {
     const server = fakeServer();
     const remove = vi.fn(async () => {});
-    const adapter = adapterFor(server, { stickers: { pick: async () => sticker, collect: async () => true, remove } });
+    const adapter = adapterFor(server, {
+      stickers: { pick: async () => sticker, collect: async () => true, remove },
+    });
     await adapter.postMessage(encodeWechatThreadId(user), "哈哈 [表情:开心]");
     await adapter.postMessage(encodeWechatThreadId(user), "好，那张不发了 [删除表情]");
     expect(remove).toHaveBeenCalledWith({ file: "pets/cat.gif", collected: false });
@@ -361,10 +385,9 @@ describe("WeChat stickers", () => {
       aeskey: key.toString("hex"),
     });
     const collect = vi.fn(async () => true);
-    await adapterFor(server, { stickers: { pick: async () => undefined, collect, remove: async () => {} } }).postMessage(
-      encodeWechatThreadId(user),
-      "收好啦～ [收藏表情:猫猫 害羞]",
-    );
+    await adapterFor(server, {
+      stickers: { pick: async () => undefined, collect, remove: async () => {} },
+    }).postMessage(encodeWechatThreadId(user), "收好啦～ [收藏表情:猫猫 害羞]");
     expect(collect).toHaveBeenCalledWith(GIF, "猫猫 害羞");
     expect(server.sent).toEqual([{ type: 1, text_item: { text: "收好啦～" } }]);
   });
@@ -376,7 +399,10 @@ describe("WeChat chat bubbles", () => {
       "哈哈哈真的假的",
       "那你今天早点睡吧 [表情:晚安]",
     ]);
-    expect(splitOutboundBody("wechat", "好呀\n\n我等会儿提醒你")).toEqual(["好呀", "我等会儿提醒你"]);
+    expect(splitOutboundBody("wechat", "好呀\n\n我等会儿提醒你")).toEqual([
+      "好呀",
+      "我等会儿提醒你",
+    ]);
   });
 
   it("keeps lists, choices, single paragraphs and long replies in one message", () => {
@@ -385,53 +411,5 @@ describe("WeChat chat bubbles", () => {
     expect(wechatChatBubbles("就一句话")).toBeUndefined();
     expect(wechatChatBubbles("一\n\n二\n\n三\n\n四")).toBeUndefined();
     expect(wechatChatBubbles(`${"很长".repeat(60)}\n\n短`)).toBeUndefined();
-  });
-});
-
-describe("WeChat reply watch", () => {
-  const inbound = (id: number): IlinkMessage => ({
-    message_id: id,
-    from_user_id: user,
-    message_type: 1,
-    context_token: "ctx-1",
-    item_list: [{ type: 1, text_item: { text: "帮我查一下" } }],
-  });
-
-  async function pollingAdapter(server: ReturnType<typeof fakeServer>) {
-    const adapter = adapterFor(server, { poll: true });
-    const { Chat } = await import("chat");
-    const { createMemoryState } = await import("@chat-adapter/state-memory");
-    const chat = new Chat({
-      userName: "rakazo",
-      adapters: { wechat: adapter },
-      state: createMemoryState(),
-      concurrency: "concurrent",
-    });
-    chat.onDirectMessage(async () => undefined);
-    await chat.initialize();
-    return adapter;
-  }
-
-  it("keeps typing until a reply goes out, and never sends words of its own", async () => {
-    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
-    const server = fakeServer();
-    server.batches.push({ ret: 0, msgs: [inbound(1)], get_updates_buf: "c1" });
-    const adapter = await pollingAdapter(server);
-    await vi.waitFor(() => expect(server.requests).toContain("ilink/bot/getupdates"));
-    const typing = () => server.requests.filter((path) => path === "ilink/bot/sendtyping").length;
-    // Each check reads a file, so step the clock until typing has been re-sent a few times.
-    await vi.waitFor(async () => {
-      await vi.advanceTimersByTimeAsync(WECHAT_TYPING_REFRESH_MS);
-      expect(typing()).toBeGreaterThan(3);
-    });
-    expect(server.sent).toEqual([]);
-
-    // The reply goes out (from any process); typing stops.
-    await adapter.postMessage(encodeWechatThreadId(user), "查好了");
-    await vi.advanceTimersByTimeAsync(WECHAT_TYPING_REFRESH_MS * 2);
-    const typingAfter = typing();
-    await vi.advanceTimersByTimeAsync(WECHAT_TYPING_MAX_MS);
-    expect(typing()).toBe(typingAfter);
-    expect(server.sent).toEqual([{ type: 1, text_item: { text: "查好了" } }]);
   });
 });

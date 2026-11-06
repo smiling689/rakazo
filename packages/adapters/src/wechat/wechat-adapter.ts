@@ -70,10 +70,11 @@ export const WECHAT_POLL_BACKOFF_MS = 30_000;
 /** An expired login stays expired until someone scans a new QR code; check back rarely. */
 export const WECHAT_EXPIRED_PAUSE_MS = 10 * 60_000;
 const TYPING_TICKET_TTL_MS = 10 * 60_000;
-/** WeChat's typing indicator fades after a few seconds; the reference client re-sends it every 5. */
+/**
+ * WeChat's typing indicator fades after a few seconds; the reference client re-sends it every 5.
+ * The messaging receipts re-send it at this pace until the run's reply is out.
+ */
 export const WECHAT_TYPING_REFRESH_MS = 5_000;
-/** Stop showing "typing" when no reply came for this long (the bot may have chosen not to answer). */
-export const WECHAT_TYPING_MAX_MS = 5 * 60_000;
 /** `[收藏表情:...]` keeps the picture the owner sent within this long. */
 const COLLECT_MAX_AGE_MS = 30 * 60_000;
 /** `[删除表情]` removes the sticker sent within this long. */
@@ -108,7 +109,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
   private readonly typingTickets = new Map<string, { ticket: string; expires: number }>();
   private readonly stickers: Pick<StickerLibrary, "pick" | "collect" | "remove">;
   private readonly activity: WechatActivity;
-  private readonly watchers = new Map<string, () => void>();
   /** Context tokens iLink called stale, per contact; a newer one arrives with their next message. */
   private readonly staleContexts = new Map<string, string>();
   /** The last inbound message each contact has in processing; their next one waits for it. */
@@ -139,7 +139,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     this.polling = undefined;
     for (const timer of this.retries) clearTimeout(timer);
     this.retries.clear();
-    for (const stop of [...this.watchers.values()]) stop();
   }
 
   async disconnect() {
@@ -214,7 +213,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
           })
           .catch(() => undefined);
       }
-      this.watchReply(raw.from_user_id);
     }
     const userId = raw.from_user_id;
     const options: WebhookOptions = { waitUntil: (task) => void task.catch(() => undefined) };
@@ -250,38 +248,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     void done.finally(() => {
       if (this.inbound.get(userId) === done) this.inbound.delete(userId);
     });
-  }
-
-  /**
-   * Until a reply to `userId` goes out (from any process), keep "typing" showing: a run's reply
-   * only goes out when it ends. The bot's own first line (message_user) stops it like a reply.
-   */
-  private watchReply(userId: string) {
-    this.watchers.get(userId)?.();
-    const since = Date.now();
-    let busy = false;
-    const timer = setInterval(() => {
-      if (busy) return;
-      busy = true;
-      (async () => {
-        const elapsed = Date.now() - since;
-        if (elapsed >= WECHAT_TYPING_MAX_MS || (await this.activity.repliedSince(userId, since))) {
-          stop();
-          return;
-        }
-        await this.startTyping(encodeWechatThreadId(userId));
-      })()
-        .catch(() => undefined)
-        .finally(() => {
-          busy = false;
-        });
-    }, WECHAT_TYPING_REFRESH_MS);
-    timer.unref?.();
-    const stop = () => {
-      clearInterval(timer);
-      if (this.watchers.get(userId) === stop) this.watchers.delete(userId);
-    };
-    this.watchers.set(userId, stop);
   }
 
   private async replyUnsupported(userId: string) {
@@ -406,7 +372,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
         getLogger().warn("wechat sticker failed", { error: String(error) });
       }
     }
-    if (id) await this.activity.markReplied(userId).catch(() => undefined);
     return { id, threadId, raw: { client_id: id } as IlinkMessage };
   }
 

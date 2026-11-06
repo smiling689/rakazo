@@ -888,6 +888,8 @@ export interface MessagingCapabilities {
   direct: boolean;
   groups: boolean;
   receipt: MessagingReceipt | null;
+  /** Typing fades after a few seconds here; re-send it this often until the reply is out. */
+  typingRefreshMs?: number;
   /** Sends image and file attachments. Absent means replies go out as text only. */
   files?: boolean;
 }

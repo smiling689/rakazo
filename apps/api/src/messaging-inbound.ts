@@ -237,7 +237,8 @@ async function handleDirectEvent(
       if (run.status === "failed" || run.status === "cancelled") return true;
       if (!run.messagingMirroredAt) return false;
       // Mirroring only queues the reply in the outbox. It has gone out once
-      // none of this run's queued rows are still waiting to be sent.
+      // none of this run's queued rows are still waiting to be sent (a row
+      // that failed for good is not coming either).
       const replies = await deps.prisma.message.findMany({
         where: { runId, role: "bot" },
         select: { id: true },
@@ -246,7 +247,7 @@ async function handleDirectEvent(
       const unsent = await deps.prisma.messagingOutbound.count({
         where: {
           sourceMessageId: { in: replies.map((reply) => reply.id) },
-          status: { not: "sent" },
+          status: "pending",
         },
       });
       return unsent === 0;
