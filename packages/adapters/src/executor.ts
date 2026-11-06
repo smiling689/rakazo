@@ -1428,7 +1428,15 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           run.trigger === "created"
             ? strategicBuiltins
             : [...strategicBuiltins, ...strategicConnectorTools];
-        const taskCatalogInstruction = tools.some((tool) => tool.name === "task_catalog")
+        // Fork (lean tools): a deferred tool's usage notes come back with find_tool, so the
+        // instructions treat it like a tool that is off; only listed tools get prompt guidance.
+        const deferredToolNames = partitionTools(tools).deferred.map((tool) => tool.name);
+        const guidanceDisabled = deferredToolNames.length
+          ? new Set([...disabledBuiltinTools, ...deferredToolNames])
+          : disabledBuiltinTools;
+        const taskCatalogInstruction = tools.some(
+          (tool) => tool.name === "task_catalog" && !guidanceDisabled.has(tool.name),
+        )
           ? TASK_CATALOG_GUIDANCE
           : undefined;
         const approvedEffects = await deps.prisma.externalEffect.findMany({
@@ -1441,12 +1449,9 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           heldForTakeover,
           graphicalToolsAllowed,
           graphical,
-          disabled: disabledBuiltinTools,
+          disabled: guidanceDisabled,
         });
-        const dockerToolInstruction = dockerComputerToolInstruction(
-          computerKind,
-          disabledBuiltinTools,
-        );
+        const dockerToolInstruction = dockerComputerToolInstruction(computerKind, guidanceDisabled);
         const hostEnvironment =
           computerKind && usesNativeShell(computerKind)
             ? await deps.sandbox
@@ -1889,7 +1894,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
                           .map((tool) => tool.name)
                           .filter((name) => !strategicBuiltins.some((tool) => tool.name === name)),
                       )
-                    : disabledBuiltinTools,
+                    : guidanceDisabled,
                 offeredFleetTools: offeredFleetTools(strategicBuiltins),
                 followUpsOffered: followUpsOffered(strategicBuiltins, ownerStartedRun),
                 userComputer,

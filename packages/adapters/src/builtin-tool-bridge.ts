@@ -1,5 +1,6 @@
 import type { ConnectorTool } from "@rakazo/adapter-kit";
 import { FLEET_TOOL_NAMES } from "@rakazo/contracts";
+import { deferredToolGuidance } from "./deferred-tool-guidance.js";
 import type { CatalogEntry } from "./lazy-tool-catalog.js";
 import {
   catalogEntries,
@@ -27,33 +28,49 @@ export const CORE_BUILTIN_TOOL_NAMES: ReadonlySet<string> = new Set([
   "attach_file",
   "web_search",
   "web_fetch",
+  // The runtime itself drives these (computer mode, nested helpers, resumed own-settings writes).
   "computer_observe",
   "computer_act",
   "browser_navigate",
   "browser_snapshot",
   "browser_act",
+  "run_subagent",
+  "update_bot",
+  "skill_read",
   "ask_user",
   "message_user",
   "request_takeover",
   "request_secret",
   "connect_app",
-  "run_subagent",
-  "skill_read",
-  "update_bot",
-  "update_preferences",
   "remember",
   "save_memory",
   "recall_memory",
-  "schedule_create",
-  "schedule_list",
   "search_history",
   "read_history",
   "end_call",
 ]);
 
+// Fork (lean tools, 2026-11-06): schedule_create/schedule_list (4.4k characters) and update_preferences
+// left the core list: measured over 451 runs they ran in under 3 % of runs. They sit behind
+// find_tool, as do the usage notes of every deferred tool (deferred-tool-guidance.ts). Page, desktop,
+// subagent, update_bot and skill_read stay: computer mode, helpers, checkpoints and the verbatim skill
+// result handle them by name.
+
+/** Composio's meta tools (search, schemas, multi-execute): ~11.7k characters, used in 16 % of runs. */
+const DEFERRED_CONNECTOR_TOOL = /^COMPOSIO_[A-Z_]+$/;
+
 const FLEET_NAMES: ReadonlySet<string> = new Set(FLEET_TOOL_NAMES);
 
 const AREAS: Array<[area: string, matches: (name: string) => boolean]> = [
+  [
+    "connected apps (Gmail, Drive, Calendar, Notion, GitHub ...)",
+    (name) => DEFERRED_CONNECTOR_TOOL.test(name),
+  ],
+  ["browser", (name) => name.startsWith("browser_")],
+  [
+    "desktop",
+    (name) => ["computer_observe", "computer_act", "open_path", "launch_app"].includes(name),
+  ],
   ["secrets", (name) => name.includes("secret")],
   ["bots", (name) => FLEET_NAMES.has(name) || name.endsWith("_bot")],
   [
@@ -73,6 +90,7 @@ const AREAS: Array<[area: string, matches: (name: string) => boolean]> = [
 ];
 
 export function isDeferredTool(name: string): boolean {
+  if (DEFERRED_CONNECTOR_TOOL.test(name)) return true;
   return BUILTIN_AGENT_TOOL_NAMES.has(name) && !CORE_BUILTIN_TOOL_NAMES.has(name);
 }
 
@@ -107,7 +125,7 @@ function bridgeTools(deferred: readonly ConnectorTool[]): ConnectorTool[] {
   return [
     {
       name: FIND_TOOL,
-      description: `Get the parameters of built-in tools not in your tool list, including ones your instructions name. Call this before use_tool. Pass names for exact tools or query to search.\n${formatNameIndexText(groupedNames(searchEntries(deferred)))}`,
+      description: `Get the parameters of tools not in your tool list (built-ins and connected apps), including ones your instructions name. Call this before use_tool. Pass names for exact tools or query to search.\n${formatNameIndexText(groupedNames(searchEntries(deferred)))}`,
       inputSchema: {
         type: "object",
         properties: {
@@ -119,7 +137,7 @@ function bridgeTools(deferred: readonly ConnectorTool[]): ConnectorTool[] {
     },
     {
       name: USE_TOOL,
-      description: "Run a built-in tool whose parameters find_tool returned in this turn.",
+      description: "Run a tool whose parameters find_tool returned in this turn.",
       inputSchema: {
         type: "object",
         properties: {
@@ -147,7 +165,10 @@ export function findTools(deferred: readonly ConnectorTool[], args: Record<strin
       : [];
   const unknown = names.filter((name) => !found.some((tool) => tool.name === name));
   return {
-    tools: found.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+    tools: found.map(({ name, description, inputSchema }) => {
+      const note = deferredToolGuidance(name);
+      return { name, description: note ? `${description}\n\n${note}` : description, inputSchema };
+    }),
     ...(unknown.length ? { unknown } : {}),
     ...(found.length ? {} : { hint: "Pass names from this tool's list or other words." }),
   };
