@@ -113,8 +113,8 @@ function fakeDeps(rows: { runs: Row[]; messages: Row[]; threads: Row[]; identiti
 
 const approval = {
   kind: "ask",
-  text: "Run mcp\\_\\_smiling-ops\\_\\_run\\_command?",
-  detail: "systemctl reload caddy",
+  text: "Run mcp\\_\\_ops\\_\\_run\\_command?",
+  detail: "echo ok",
   approvalEffectId: "eff-1",
   actions: [
     { id: "allow", label: "Allow" },
@@ -123,19 +123,19 @@ const approval = {
   ],
 };
 
-/** WeChat (messaging run) asked Server, which now waits on an approval. */
+/** WeChat (messaging run) asked Helper, which now waits on an approval. */
 function chain(): { runs: Row[]; messages: Row[]; threads: Row[]; identities: Row[] } {
   const earlier = new Date("2026-11-04T10:00:00Z");
   return {
     runs: [
       { id: "run-wechat", botId: "bot-wechat", trigger: "messaging", createdAt: earlier },
       {
-        id: "run-server",
+        id: "run-helper",
         spaceId: "space-1",
         userId: "user-1",
-        botId: "bot-server",
-        botName: "Server",
-        threadId: "thread-server",
+        botId: "bot-helper",
+        botName: "Helper",
+        threadId: "thread-helper",
         status: "waiting_input",
         trigger: "bot_message",
         clientNonce: null,
@@ -150,12 +150,12 @@ function chain(): { runs: Row[]; messages: Row[]; threads: Row[]; identities: Ro
         role: "bot",
         runId: "run-wechat",
         blocks: [
-          { kind: "bot_message_sent", toBotId: "bot-server", toBotName: "Server", text: "reload" },
+          { kind: "bot_message_sent", toBotId: "bot-helper", toBotName: "Helper", text: "reload" },
         ],
       },
       {
         id: "msg-received",
-        threadId: "thread-server",
+        threadId: "thread-helper",
         blocks: [
           {
             kind: "bot_message_received",
@@ -167,15 +167,15 @@ function chain(): { runs: Row[]; messages: Row[]; threads: Row[]; identities: Ro
       },
       {
         id: "msg-ask",
-        threadId: "thread-server",
+        threadId: "thread-helper",
         role: "bot",
-        runId: "run-server",
+        runId: "run-helper",
         blocks: [approval],
       },
     ],
     threads: [
       { id: "thread-wechat", botId: "bot-wechat" },
-      { id: "thread-server", botId: "bot-server" },
+      { id: "thread-helper", botId: "bot-helper" },
     ],
     identities: [{ id: "identity-1", botId: "bot-wechat" }],
   };
@@ -189,21 +189,21 @@ beforeEach(() => {
 describe("approval relay", () => {
   it("copies a waiting peer's approval to the chat the owner is in, and to their chat app", async () => {
     const { deps, outbound, created } = fakeDeps(chain());
-    await relayPeerAsk(deps, "run-server");
+    await relayPeerAsk(deps, "run-helper");
 
     expect(created).toEqual([
       expect.objectContaining({
         botId: "bot-wechat",
         threadId: "thread-wechat",
         status: "waiting_input",
-        clientNonce: "approval-relay:run-server:msg-ask:0",
+        clientNonce: "approval-relay:run-helper:msg-ask:0",
       }),
     ]);
     expect(stored[0]!.threadId).toBe("thread-wechat");
     expect(stored[0]!.blocks).toEqual([
       {
         kind: "ask",
-        text: "Server 请求你批准：Run mcp__smiling-ops__run_command?\nsystemctl reload caddy",
+        text: "Helper 请求你批准：Run mcp__ops__run_command?\necho ok",
         status: "pending",
         actions: [
           { id: "allow", label: "允许" },
@@ -220,7 +220,7 @@ describe("approval relay", () => {
     ]);
 
     // Idempotent per card.
-    await relayPeerAsk(deps, "run-server");
+    await relayPeerAsk(deps, "run-helper");
     expect(created).toHaveLength(1);
   });
 
@@ -228,7 +228,7 @@ describe("approval relay", () => {
     const rows = chain();
     rows.runs[1]!.trigger = "user";
     const { deps, created } = fakeDeps(rows);
-    await relayPeerAsk(deps, "run-server");
+    await relayPeerAsk(deps, "run-helper");
     expect(created).toHaveLength(0);
   });
 
@@ -242,7 +242,7 @@ describe("approval relay", () => {
       threadId: "thread-wechat",
       taskId: "relay-task",
       status: "queued",
-      clientNonce: "approval-relay:run-server:msg-ask:0",
+      clientNonce: "approval-relay:run-helper:msg-ask:0",
     });
     rows.messages.push({
       id: "relay-msg",
@@ -252,7 +252,7 @@ describe("approval relay", () => {
       blocks: [
         {
           kind: "ask",
-          text: "Server 请求你批准：…",
+          text: "Helper 请求你批准：…",
           status: "answered",
           answer: "allow",
           actions: [
@@ -267,14 +267,14 @@ describe("approval relay", () => {
     expect(await settleApprovalRelay(deps, "relay-1")).toBe(true);
     expect(deps.events.answerRunInput).toHaveBeenCalledWith({
       spaceId: "space-1",
-      threadId: "thread-server",
-      runId: "run-server",
+      threadId: "thread-helper",
+      runId: "run-helper",
       messageId: "msg-ask",
       answeredByUserId: "user-1",
       answer: "allow",
     });
     expect(deps.jobs.enqueue).toHaveBeenCalledWith(
-      expect.objectContaining({ name: "run.continue", payload: { runId: "run-server" } }),
+      expect.objectContaining({ name: "run.continue", payload: { runId: "run-helper" } }),
     );
     expect(rows.runs.find((run) => run.id === "relay-1")!.status).toBe("completed");
   });
@@ -289,7 +289,7 @@ describe("approval relay", () => {
       threadId: "thread-wechat",
       taskId: "relay-task",
       status: "queued",
-      clientNonce: "approval-relay:run-server:msg-ask:0",
+      clientNonce: "approval-relay:run-helper:msg-ask:0",
     });
     rows.messages.push({
       id: "relay-msg",
@@ -299,7 +299,7 @@ describe("approval relay", () => {
       blocks: [
         {
           kind: "ask",
-          text: "Server 请求你批准：…",
+          text: "Helper 请求你批准：…",
           status: "answered",
           answer: "sure, but first tell me why",
           actions: [
@@ -314,13 +314,13 @@ describe("approval relay", () => {
     await settleApprovalRelay(deps, "relay-1");
     expect(deps.events.answerRunInput).not.toHaveBeenCalled();
     expect(created).toEqual([
-      expect.objectContaining({ clientNonce: "approval-relay:run-server:msg-ask:1" }),
+      expect.objectContaining({ clientNonce: "approval-relay:run-helper:msg-ask:1" }),
     ]);
   });
 
   it("ignores ordinary runs", async () => {
     const { deps } = fakeDeps(chain());
-    expect(await settleApprovalRelay(deps, "run-server")).toBe(false);
+    expect(await settleApprovalRelay(deps, "run-helper")).toBe(false);
   });
 
   it("retires relay cards once the original card moved on", async () => {
@@ -334,10 +334,10 @@ describe("approval relay", () => {
       threadId: "thread-wechat",
       taskId: "relay-task",
       status: "waiting_input",
-      clientNonce: "approval-relay:run-server:msg-ask:0",
+      clientNonce: "approval-relay:run-helper:msg-ask:0",
     });
     const { deps } = fakeDeps(rows);
-    await retireStaleRelays(deps, "run-server");
+    await retireStaleRelays(deps, "run-helper");
     expect(retired).toEqual(["relay-1"]);
   });
 });
