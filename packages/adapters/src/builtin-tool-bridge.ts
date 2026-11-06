@@ -94,14 +94,27 @@ export function isDeferredTool(name: string): boolean {
   return BUILTIN_AGENT_TOOL_NAMES.has(name) && !CORE_BUILTIN_TOOL_NAMES.has(name);
 }
 
-/** Splits a run's offered tools into the ones listed to the model and the deferred built-ins. */
-export function partitionTools(tools: readonly ConnectorTool[]): {
+/**
+ * Splits a run's offered tools into the ones listed to the model and the deferred built-ins.
+ * `advertised` names deferred tools this run may not use but the thread's other turns can: they
+ * join find_tool's name index so the tool list, part of the cached prompt prefix, stays the same.
+ */
+export function partitionTools(
+  tools: readonly ConnectorTool[],
+  advertised: readonly string[] = [],
+): {
   listed: ConnectorTool[];
   deferred: ConnectorTool[];
 } {
   const deferred = tools.filter((tool) => isDeferredTool(tool.name));
   const listed = tools.filter((tool) => !isDeferredTool(tool.name));
-  return { listed: deferred.length ? [...listed, ...bridgeTools(deferred)] : listed, deferred };
+  const indexed = [
+    ...deferred,
+    ...advertised
+      .filter((name) => isDeferredTool(name) && !deferred.some((tool) => tool.name === name))
+      .map((name): ConnectorTool => ({ name, description: "", inputSchema: { type: "object" } })),
+  ];
+  return { listed: indexed.length ? [...listed, ...bridgeTools(indexed)] : listed, deferred };
 }
 
 function searchEntries(deferred: readonly ConnectorTool[]): CatalogEntry[] {

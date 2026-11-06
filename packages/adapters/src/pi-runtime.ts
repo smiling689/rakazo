@@ -300,7 +300,7 @@ export class PiAgentRuntime implements AgentRuntime {
           modelResponses: 0,
         };
         resumeHost = host;
-        const allTools = toAgentTools(toolDefs, host);
+        const allTools = toAgentTools(toolDefs, host, request.advertisedToolNames);
         let tools = allTools;
         const seenSteeringIds: string[] = [];
         const initialSteering = request.claimSteering ? await request.claimSteering([]) : [];
