@@ -15,6 +15,7 @@ import {
   encodeWechatThreadId,
   WECHAT_EXPIRED_PAUSE_MS,
   WECHAT_UNSUPPORTED_REPLY,
+  WECHAT_VOICE_UNREADABLE_REPLY,
   WechatAdapter,
 } from "./wechat-adapter.js";
 
@@ -172,6 +173,49 @@ describe("WechatAdapter", () => {
     const sent = server.requests.find((request) => request.path === "ilink/bot/sendmessage")!;
     expect(JSON.stringify(sent.body)).toContain(WECHAT_UNSUPPORTED_REPLY);
     expect(received).toHaveLength(0);
+  });
+
+  it("says plainly that an untranscribed voice note cannot be heard", async () => {
+    const server = fakeIlink();
+    server.batches.push({
+      ret: 0,
+      get_updates_buf: "cursor-1",
+      msgs: [
+        inbound({
+          message_id: 8,
+          item_list: [{ type: 3, voice_item: { media: { encrypt_query_param: "q" } } }],
+        }),
+      ],
+    });
+    const received = await chatWith(adapterFor(server, true));
+    await vi.waitFor(() =>
+      expect(server.requests.some((request) => request.path === "ilink/bot/sendmessage")).toBe(
+        true,
+      ),
+    );
+    const sent = server.requests.find((request) => request.path === "ilink/bot/sendmessage")!;
+    expect(JSON.stringify(sent.body)).toContain(WECHAT_VOICE_UNREADABLE_REPLY);
+    expect(received).toHaveLength(0);
+  });
+
+  it("brings along the picture a message quotes", () => {
+    const adapter = adapterFor(fakeIlink(), false);
+    const message = adapter.parseMessage(
+      inbound({
+        item_list: [
+          {
+            type: 1,
+            text_item: { text: "这是什么" },
+            ref_msg: {
+              title: "图片",
+              message_item: { type: 2, image_item: { media: { encrypt_query_param: "q" } } },
+            },
+          },
+        ],
+      }),
+    );
+    expect(message.text).toBe("> 图片\n这是什么");
+    expect(message.attachments.map((attachment) => attachment.type)).toEqual(["image"]);
   });
 
   it("resumes from the saved cursor and replies with the saved context from any process", async () => {

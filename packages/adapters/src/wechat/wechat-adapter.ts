@@ -63,6 +63,13 @@ const THREAD_PREFIX = "wechat:";
 export const WECHAT_UNSUPPORTED_REPLY =
   "这条消息我收不到内容：微信的 bot 接口只转发文字、语音、图片、文件和视频，合并转发的聊天记录、链接卡片和小程序都过不来。可以把文字复制过来，或者截图发我。";
 
+/**
+ * Sent back for a voice note WeChat did not transcribe. Its audio is SILK, which no voice
+ * provider here reads, so the words never reach the bot.
+ */
+export const WECHAT_VOICE_UNREADABLE_REPLY =
+  "这条语音微信没转出文字，我听不了原声。麻烦打字发我，或者重录一条试试。";
+
 export const WECHAT_RETRY_DELAYS_MS = [5_000, 30_000, 120_000];
 /** After this many failed polls in a row, wait before polling again. */
 const POLL_FAILURES_BEFORE_BACKOFF = 3;
@@ -198,7 +205,11 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
       getLogger().info("wechat message without readable content", {
         itemTypes: (raw.item_list ?? []).map((item) => item.type),
       });
-      void this.replyUnsupported(raw.from_user_id);
+      const voice = (raw.item_list ?? []).some((item) => item.type === ILINK_ITEM.voice);
+      void this.replyUnsupported(
+        raw.from_user_id,
+        voice ? WECHAT_VOICE_UNREADABLE_REPLY : WECHAT_UNSUPPORTED_REPLY,
+      );
       return;
     }
     if (attempt === 0) {
@@ -250,11 +261,9 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     });
   }
 
-  private async replyUnsupported(userId: string) {
+  private async replyUnsupported(userId: string, reply: string) {
     try {
-      await this.sendWithContext(userId, (context) =>
-        this.client.sendText(userId, WECHAT_UNSUPPORTED_REPLY, context),
-      );
+      await this.sendWithContext(userId, (context) => this.client.sendText(userId, reply, context));
     } catch (error) {
       getLogger().warn("wechat unsupported-message reply failed", { error: String(error) });
     }
@@ -275,7 +284,11 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
       formatted: root([paragraph([text(body)])]),
       raw,
       author: { userId, userName: userId, fullName: "", isBot: false, isMe: false },
-      attachments: items.flatMap((item) => this.attachment(item)),
+      // A quoted picture or file comes along, so "what is this?" on a quoted image can be answered.
+      attachments: items.flatMap((item) => [
+        ...this.attachment(item),
+        ...(item.ref_msg?.message_item ? this.attachment(item.ref_msg.message_item) : []),
+      ]),
       isMention: true,
       metadata: {
         dateSent: new Date(raw.create_time_ms ?? Date.now()),
