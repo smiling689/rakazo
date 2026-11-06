@@ -129,7 +129,7 @@ function fixture({
   builtin?: boolean;
   disabledBuiltinTools?: string[];
   existingSharedMemory?: string;
-  /** Simulates another writer landing between the save's read and its commit. */
+  /** Simulates another writer landing between the save's first read and its commit. */
   advanceRevisionAfterRead?: boolean;
   name?: string;
   route?: ConnectorTool["route"];
@@ -596,7 +596,8 @@ function fixture({
               ]
             : [];
         if (advanceRevisionAfterRead && request.path === "MEMORY.md") {
-          sharedMemoryState.content = "Someone else edited";
+          advanceRevisionAfterRead = false;
+          sharedMemoryState.content = "Someone else edited\n";
           sharedMemoryState.revision += 1;
         }
         return { documents };
@@ -801,7 +802,7 @@ describe("connector read-only metadata and approval enforcement", () => {
       expect.objectContaining({
         scope: "user",
         path: "MEMORY.md",
-        content: args.content,
+        content: `${args.content}\n`,
         expectedRevision: 0,
       }),
       expect.objectContaining({ spaceId: "space-1", userId: "user-1" }),
@@ -810,37 +811,65 @@ describe("connector read-only metadata and approval enforcement", () => {
     expect(f.results.at(-1)).toEqual({ ok: true, path: "MEMORY.md", revision: 1 });
   });
 
-  it("replaces an existing shared document at the revision it just read", async () => {
+  it("adds a fact to an existing shared document instead of replacing it", async () => {
     const f = fixture({
       name: "save_shared_memory",
       builtin: true,
-      existingSharedMemory: "Old rule",
+      existingSharedMemory: "Old rule\n",
     });
     f.setCalls([{ args: { path: "MEMORY.md", content: "New rule" }, executionId: "call-1" }]);
     await f.run();
     expect(f.pauseRunForInput).not.toHaveBeenCalled();
     expect(f.commit).toHaveBeenCalledWith(
-      expect.objectContaining({ content: "New rule", expectedRevision: 1 }),
+      expect.objectContaining({ content: "Old rule\nNew rule\n", expectedRevision: 1 }),
       expect.anything(),
     );
     expect(f.results.at(-1)).toEqual({ ok: true, path: "MEMORY.md", revision: 2 });
   });
 
-  it("does not overwrite shared memory that changed after it was read", async () => {
+  it("keeps a fact another bot saved after this one read the document", async () => {
     const f = fixture({
       name: "save_shared_memory",
       builtin: true,
-      existingSharedMemory: "Old rule",
+      existingSharedMemory: "Old rule\n",
       advanceRevisionAfterRead: true,
     });
     f.setCalls([{ args: { path: "MEMORY.md", content: "New rule" }, executionId: "call-1" }]);
     await f.run();
-    expect(f.commit).toHaveBeenCalledWith(
-      expect.objectContaining({ expectedRevision: 1 }),
+    expect(f.commit).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ content: "Old rule\nNew rule\n", expectedRevision: 1 }),
       expect.anything(),
     );
-    expect(f.sharedMemoryState.content).toBe("Someone else edited");
-    expect(f.results.at(-1)).toEqual({ error: MEMORY_REVISION_CONFLICT_ERROR });
+    expect(f.commit).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ content: "Someone else edited\nNew rule\n", expectedRevision: 2 }),
+      expect.anything(),
+    );
+    expect(f.sharedMemoryState.content).toBe("Someone else edited\nNew rule\n");
+    expect(f.results.at(-1)).toEqual({ ok: true, path: "MEMORY.md", revision: 3 });
+  });
+
+  it("returns the current entries when the entry to change was edited by another bot", async () => {
+    const f = fixture({
+      name: "save_shared_memory",
+      builtin: true,
+      existingSharedMemory: "Old rule\n",
+      advanceRevisionAfterRead: true,
+    });
+    f.setCalls([
+      {
+        args: { path: "MEMORY.md", content: "Newer rule", old_text: "Old rule" },
+        executionId: "call-1",
+      },
+    ]);
+    await f.run();
+    expect(f.commit).toHaveBeenCalledOnce();
+    expect(f.sharedMemoryState.content).toBe("Someone else edited\n");
+    expect(f.results.at(-1)).toEqual({
+      error: expect.stringContaining("No entry contains old_text"),
+      entries: ["Someone else edited"],
+    });
   });
 
   it("rejects shared memory content over the size limit", async () => {

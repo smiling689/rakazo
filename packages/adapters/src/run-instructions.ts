@@ -227,6 +227,16 @@ function secretGuidance(disabled?: ReadonlySet<string>): string[] {
   return clauses;
 }
 
+/** Facts about the user go where every bot in the Space reads them; a bot's own notes stay its own. */
+function memoryClause(disabled?: ReadonlySet<string>): string | undefined {
+  const own = builtinOffered(disabled, "remember");
+  const shared = builtinOffered(disabled, "save_shared_memory");
+  if (own && shared)
+    return "Use save_shared_memory for facts about the user that every bot should know (preferences, personal details, standing requests) and remember for your own working notes; save each fact once.";
+  if (own) return "Use remember for durable facts.";
+  return shared ? "Use save_shared_memory for durable facts about the user." : undefined;
+}
+
 function scratchpadClause(disabled?: ReadonlySet<string>): string | undefined {
   const pads = ["scratchpad_add", "scratchpad_update", "scratchpad_complete"].filter((name) =>
     builtinOffered(disabled, name),
@@ -310,7 +320,7 @@ function toolUsageLine(parts: {
     builtinOffered(disabled, "connect_app")
       ? "Use connect_app when an app needs connecting or the user asks to connect one, then wait for them."
       : undefined,
-    builtinOffered(disabled, "remember") ? "Use remember for durable facts." : undefined,
+    memoryClause(disabled),
     scratchpadClause(disabled),
     parts.followUpsOffered ? FOLLOW_UP_INSTRUCTION : undefined,
     builtinOffered(disabled, "request_takeover")

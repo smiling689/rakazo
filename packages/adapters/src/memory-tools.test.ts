@@ -138,14 +138,22 @@ describe("editMemory", () => {
 
   it("refuses a save that grows memory past the cap and returns the entries", () => {
     const full = `${"a".repeat(30)}\n`;
-    expect(editMemory(full, "b".repeat(10), "", 32)).toEqual({
+    expect(editMemory(full, "b".repeat(10), "", { max: 32, unit: "bytes" })).toEqual({
       error: expect.stringContaining("Memory is full"),
       entries: ["a".repeat(30)],
     });
   });
 
+  it("measures a character cap in characters, not bytes", () => {
+    expect(editMemory("猫猫猫\n", "狗狗", "", { max: 8, unit: "characters" })).toEqual({
+      content: "猫猫猫\n狗狗\n",
+    });
+  });
+
   it("lets a save that shrinks oversized memory through", () => {
     const oversized = `${"a".repeat(40)}\n${"b".repeat(40)}\n`;
-    expect(editMemory(oversized, "", "bbb", 32)).toEqual({ content: `${"a".repeat(40)}\n` });
+    expect(editMemory(oversized, "", "bbb", { max: 32, unit: "bytes" })).toEqual({
+      content: `${"a".repeat(40)}\n`,
+    });
   });
 });

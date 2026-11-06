@@ -6,10 +6,11 @@ import {
 } from "@rakazo/contracts";
 import { readHistory, searchHistory } from "@rakazo/db";
 import type { z } from "zod";
-import { sharedMemorySaveError } from "./builtin-tools.js";
+import { MAX_SHARED_MEMORY_CHARS, sharedMemorySaveError } from "./builtin-tools.js";
 import { redactConnectorPayload } from "./connector-safety.js";
 import { MAX_RECALLED_MEMORIES } from "./history-compaction.js";
-import { editMemory } from "./memory-tools.js";
+import type { MemoryEdit, MemoryLimit } from "./memory-tools.js";
+import { BOT_MEMORY_LIMIT, editMemory } from "./memory-tools.js";
 import type { RunContext } from "./run-context.js";
 import type { ToolCall, ToolHandlers } from "./run-tool-gate.js";
 
@@ -91,73 +92,66 @@ async function readHistoryTool(ctx: RunContext, call: ToolCall) {
   return call.finish(redacted);
 }
 
-/** Memory documents, semantic memory and thread history. */
-export const memoryTools: ToolHandlers = {
-  async remember(ctx, call) {
-    const { deps, runId, bot, thread, context } = ctx;
-    const { args } = call;
-    // One document per bot keeps the size cap meaningful.
-    const path = MEMORY_INDEX_PATH;
-    // A concurrent save changes the revision, so re-read and apply the edit again.
-    for (let attempt = 1; ; attempt += 1) {
-      const snapshot = await deps.memory.read({ scope: "bot", botId: bot.id, path }, context);
-      const existing = snapshot.documents[0];
-      const edit = editMemory(
-        existing?.content ?? "",
-        String(args.content ?? ""),
-        String(args.old_text ?? ""),
-      );
-      if ("error" in edit) return call.finish(edit);
-      const { content } = edit;
-      if (content === (existing?.content ?? "")) return call.finish({ ok: true });
-      try {
-        await deps.memory.commit(
-          {
-            scope: "bot",
-            botId: bot.id,
-            path,
-            content,
-            expectedRevision: existing?.revision ?? 0,
-            sourceRunId: runId,
-            sourceThreadId: thread.id,
-          },
-          context,
-        );
-        return call.finish({ ok: true });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "";
-        if (message !== MEMORY_REVISION_CONFLICT_ERROR || attempt >= 3) throw error;
-      }
-    }
-  },
-  async save_shared_memory(ctx, call) {
-    const { deps, runId, thread, context } = ctx;
-    const { args } = call;
-    const invalid = sharedMemorySaveError(args);
-    if (invalid) return call.finish({ error: invalid });
-    const path = String(args.path ?? "").trim();
-    // The save replaces the whole document. Pass the revision just read so a
-    // concurrent edit is rejected instead of overwritten.
-    const snapshot = await deps.memory.read({ scope: "user", path }, context);
-    const expectedRevision = snapshot.documents[0]?.revision ?? 0;
+/**
+ * Applies one entry edit (see editMemory) to the latest copy of a memory document. The
+ * model's copy may be old: the prompt pins memory per conversation and only notes later
+ * changes. So a concurrent save is never overwritten; the edit is applied again on top of it.
+ */
+async function editMemoryDocument(
+  ctx: RunContext,
+  args: Record<string, unknown>,
+  target: { scope: "bot"; botId: string; path: string } | { scope: "user"; path: string },
+  limit: MemoryLimit,
+): Promise<Extract<MemoryEdit, { error: string }> | { path: string; revision: number }> {
+  const { deps, runId, thread, context } = ctx;
+  for (let attempt = 1; ; attempt += 1) {
+    const snapshot = await deps.memory.read(target, context);
+    const existing = snapshot.documents[0];
+    const edit = editMemory(
+      existing?.content ?? "",
+      String(args.content ?? ""),
+      String(args.old_text ?? ""),
+      limit,
+    );
+    if ("error" in edit) return edit;
+    if (edit.content === (existing?.content ?? ""))
+      return { path: target.path, revision: existing?.revision ?? 0 };
     try {
       const saved = await deps.memory.commit(
         {
-          scope: "user",
-          path,
-          content: String(args.content ?? ""),
-          expectedRevision,
+          ...target,
+          content: edit.content,
+          expectedRevision: existing?.revision ?? 0,
           sourceRunId: runId,
           sourceThreadId: thread.id,
         },
         context,
       );
-      return call.finish({ ok: true, path: saved.path, revision: saved.revision });
+      return { path: saved.path, revision: saved.revision };
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Could not save shared memory.";
-      if (message === MEMORY_REVISION_CONFLICT_ERROR) return call.finish({ error: message });
-      throw error;
+      const message = error instanceof Error ? error.message : "";
+      if (message !== MEMORY_REVISION_CONFLICT_ERROR || attempt >= 3) throw error;
     }
+  }
+}
+
+/** Memory documents, semantic memory and thread history. */
+export const memoryTools: ToolHandlers = {
+  async remember(ctx, call) {
+    // One document per bot keeps the size cap meaningful.
+    const target = { scope: "bot" as const, botId: ctx.bot.id, path: MEMORY_INDEX_PATH };
+    const result = await editMemoryDocument(ctx, call.args, target, BOT_MEMORY_LIMIT);
+    return call.finish("error" in result ? result : { ok: true });
+  },
+  async save_shared_memory(ctx, call) {
+    const invalid = sharedMemorySaveError(call.args);
+    if (invalid) return call.finish({ error: invalid });
+    const target = { scope: "user" as const, path: String(call.args.path ?? "").trim() };
+    const result = await editMemoryDocument(ctx, call.args, target, {
+      max: MAX_SHARED_MEMORY_CHARS,
+      unit: "characters",
+    });
+    return call.finish("error" in result ? result : { ok: true, ...result });
   },
   async recall_memory(ctx, call) {
     const { bot, thread, context } = ctx;

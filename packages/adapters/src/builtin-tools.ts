@@ -772,12 +772,13 @@ export const builtinAgentTools: ConnectorTool[] = [
   {
     name: "save_shared_memory",
     description:
-      "Save a Space shared memory document every bot reads. Replaces the full content, so include everything it should keep.",
+      "Save one fact to a shared memory document every bot reads, one call per fact. To change or drop a fact, pass old_text from its entry with new or empty content.",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Document name, for example MEMORY.md." },
-        content: { type: "string", description: "The document's complete new content." },
+        content: { type: "string" },
+        old_text: { type: "string" },
       },
       required: ["path", "content"],
     },
