@@ -37,7 +37,6 @@ describe("history search arguments", () => {
     ).toEqual(["Aurora", "orbit"]);
     for (const input of [
       {},
-      { query: "a", queries: ["b"] },
       { queries: [] },
       { queries: [" "] },
       { queries: Array(6).fill("a") },
@@ -62,5 +61,33 @@ describe("history query byte budget", () => {
         queries: Array.from({ length: 5 }, (_, i) => "星".repeat(499) + i),
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("history query folding", () => {
+  it("folds query and queries given together into queries", () => {
+    expect(HistorySearchInputSchema.parse({ query: "黑五", queries: ["VPS", "黑五"] })).toEqual({
+      queries: ["黑五", "VPS"],
+    });
+    expect(
+      HistorySearchInputSchema.parse({ query: "a", queries: ["b", "c", "d", "e", "f"] }).queries,
+    ).toEqual(["a", "b", "c", "d", "e"]);
+  });
+  it("drops an empty or null partner and wraps a bare string", () => {
+    expect(HistorySearchInputSchema.parse({ query: " ", queries: ["VPS"] })).toEqual({
+      queries: ["VPS"],
+    });
+    expect(HistorySearchInputSchema.parse({ query: null, queries: ["VPS"] })).toEqual({
+      queries: ["VPS"],
+    });
+    expect(HistorySearchInputSchema.parse({ query: "VPS", queries: null })).toEqual({
+      query: "VPS",
+    });
+    expect(HistorySearchInputSchema.parse({ queries: "VPS" })).toEqual({ queries: ["VPS"] });
+  });
+  it("names the expected date form", () => {
+    const result = HistorySearchInputSchema.safeParse({ query: "a", after: "2026-11-04 08:00" });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues[0]?.message).toContain("2026-01-01T08:00:00+08:00");
   });
 });
