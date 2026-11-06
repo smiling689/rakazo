@@ -423,6 +423,8 @@ export function threadContextForRun<T extends { id?: string; role: string }>(
   },
   messagingChannelRun: boolean,
   sourceMessageId?: string | null,
+  /** A session memory flush is a routine-trigger run that must read the conversation it saves from. */
+  readsHistory = runReadsThreadHistory(trigger),
 ) {
   // The current reaction is supplied with its target in the prompt, once.
   if (trigger === "reaction" && sourceMessageId) {
@@ -433,7 +435,7 @@ export function threadContextForRun<T extends { id?: string; role: string }>(
   }
   // Routine runs stay isolated from thread history. The creation intro does
   // too: a message that arrives during it waits and is answered afterward.
-  if (!runReadsThreadHistory(trigger)) {
+  if (!readsHistory) {
     return {
       messages: [] as T[],
       summary: null,

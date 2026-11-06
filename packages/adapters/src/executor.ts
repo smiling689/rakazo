@@ -801,6 +801,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           },
           nonOwnerChatRun,
           run.sourceMessageId,
+          isMemoryFlushRun(run) || undefined,
         );
         const compactedHistory = selectCompactedHistory({
           messages: threadContext.messages,

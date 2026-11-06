@@ -1945,6 +1945,19 @@ describe("persistentComputerInstruction", () => {
 });
 
 describe("createRunExecutor", () => {
+  it("keeps routine runs off the thread history except a session memory flush", () => {
+    const context = {
+      messages: [{ role: "user", content: "Earlier request" }],
+      summary: "Earlier summary",
+      historyCompactedUpToSeq: 4,
+    };
+    expect(threadContextForRun("routine", context, false).messages).toEqual([]);
+    expect(threadContextForRun("routine", context, false, null, true)).toEqual({
+      ...context,
+      includeSemanticRecall: true,
+    });
+  });
+
   it("excludes private summaries and memory tools from group messaging runs", () => {
     const messages = [{ role: "user", content: "Group request" }];
     expect(
