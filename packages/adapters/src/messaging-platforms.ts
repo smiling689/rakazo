@@ -25,6 +25,7 @@ import { LazyLarkAdapter } from "./lark/lazy-adapter.js";
 import { Domain } from "./lark/thread-id.js";
 import { LazyPhotonAdapter } from "./photon/lazy-adapter.js";
 import { isVitestRuntime } from "./test-runtime.js";
+import { IlinkError } from "./wechat/ilink-client.js";
 import { WechatAdapter } from "./wechat/wechat-adapter.js";
 
 /**
@@ -401,6 +402,11 @@ export function messagingPlatformsFromEnv(
         dataDir: env.dataDir ?? "./data",
         pollInboundMessages: options.pollInboundMessages ?? false,
       }),
+      // A rate limit carries its own retry-after; a refused upload, or a session still stale
+      // after the send without a context token, will not change on a retry.
+      isPermanentSendError: (error) =>
+        error instanceof IlinkError &&
+        (error.failure === "permanent" || error.failure === "stale_session"),
     });
   }
 

@@ -7,7 +7,8 @@ import type { Message, Thread } from "chat";
 import { Chat } from "chat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { messagingPlatformsFromEnv, splitOutboundBody } from "../messaging-platforms.js";
-import type { IlinkMessage } from "./ilink-client.js";
+import type { IlinkError, IlinkMessage } from "./ilink-client.js";
+import { ILINK_RATE_LIMIT_RETRY_SECONDS } from "./ilink-client.js";
 import {
   decodeWechatThreadId,
   encodeWechatThreadId,
@@ -21,6 +22,8 @@ function fakeIlink() {
   const batches: Record<string, unknown>[] = [];
   const requests: { path: string; body: Record<string, unknown>; headers: Headers }[] = [];
   const media = new Map<string, Uint8Array>();
+  /** Answers for the next sendmessage calls, in order; then success. */
+  const sendReplies: Record<string, unknown>[] = [];
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input));
     if (url.pathname.endsWith("/download")) {
@@ -38,9 +41,16 @@ function fakeIlink() {
       });
     }
     if (path === "ilink/bot/getconfig") return Response.json({ ret: 0, typing_ticket: "ticket-1" });
+    if (path === "ilink/bot/sendmessage") return Response.json(sendReplies.shift() ?? { ret: 0 });
     return Response.json({ ret: 0 });
   });
-  return { fetch: fetch as unknown as typeof globalThis.fetch, batches, requests, media };
+  return {
+    fetch: fetch as unknown as typeof globalThis.fetch,
+    batches,
+    requests,
+    media,
+    sendReplies,
+  };
 }
 
 const user = "o9cq80abc@im.wechat";
@@ -191,6 +201,54 @@ describe("WechatAdapter", () => {
     expect(restarted.requests[0]!.body.get_updates_buf).toBe("cursor-9");
   });
 
+  it("sends once more without a stale context token, then stops using it", async () => {
+    const server = fakeIlink();
+    server.batches.push({ ret: 0, get_updates_buf: "c", msgs: [inbound({})] });
+    const received = await chatWith(adapterFor(server, true));
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    const sender = adapterFor(server, false);
+    server.sendReplies.push({ ret: -14, errmsg: "session timeout" });
+
+    await sender.postMessage(encodeWechatThreadId(user), "Reminder: call back.");
+    await sender.postMessage(encodeWechatThreadId(user), "And one more thing.");
+    const sends = server.requests
+      .filter((request) => request.path === "ilink/bot/sendmessage")
+      .map((request) => request.body.msg as Record<string, unknown>);
+    expect(sends.map((msg) => msg.context_token)).toEqual(["ctx-1", undefined, undefined]);
+  });
+
+  it("classifies send failures for the outbox", async () => {
+    const [platform] = messagingPlatformsFromEnv({ wechatBotToken: "t", dataDir });
+    const server = fakeIlink();
+    const sender = adapterFor(server, false);
+    const failure = async (reply: Record<string, unknown>) => {
+      server.sendReplies.push(reply);
+      return sender.postMessage(encodeWechatThreadId(user), "hi").then(
+        () => {
+          throw new Error("expected the send to fail");
+        },
+        (error: unknown) => error as IlinkError,
+      );
+    };
+
+    // The frequency limit waits minutes, through the outbox's retry-after.
+    const limited = await failure({ ret: -2, errmsg: "freq limit" });
+    expect(limited.failure).toBe("rate_limited");
+    expect(limited.retryAfter).toBe(ILINK_RATE_LIMIT_RETRY_SECONDS);
+    expect(platform!.isPermanentSendError!(limited)).toBe(false);
+
+    // With no context token to drop, a stale session cannot recover until the owner writes.
+    const stale = await failure({ ret: -2, errmsg: "prepare failed" });
+    expect(stale.failure).toBe("stale_session");
+    expect(stale.retryAfter).toBeUndefined();
+    expect(platform!.isPermanentSendError!(stale)).toBe(true);
+
+    // Unknown codes stay retryable.
+    const other = await failure({ ret: -1, errmsg: "system error" });
+    expect(other.failure).toBeUndefined();
+    expect(platform!.isPermanentSendError!(other)).toBe(false);
+  });
+
   it("decrypts inbound images on demand", async () => {
     const server = fakeIlink();
     const key = Buffer.from("00112233445566778899aabbccddeeff", "hex");
@@ -257,7 +315,12 @@ describe("WeChat platform wiring", () => {
     expect(messagingPlatformsFromEnv({}).map((platform) => platform.provider)).toEqual([]);
     const [platform] = messagingPlatformsFromEnv({ wechatBotToken: "t", dataDir: "/tmp/x" });
     expect(platform!.provider).toBe("wechat");
-    expect(platform!.capabilities).toEqual({ direct: true, groups: false, receipt: "typing", files: true });
+    expect(platform!.capabilities).toEqual({
+      direct: true,
+      groups: false,
+      receipt: "typing",
+      files: true,
+    });
   });
 
   it("splits long replies at line breaks under the part limit", () => {
