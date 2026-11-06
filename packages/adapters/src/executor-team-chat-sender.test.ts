@@ -24,6 +24,8 @@ async function teamChatRun(input: {
   ownerAddress?: string | null;
   linkedAddresses?: string[];
   sharedChannel?: boolean;
+  /** A direct chat-app message rather than a team chat. */
+  direct?: boolean;
 }) {
   const [waking, ...batched] = input.senders.map((sender, index) => ({
     id: `external-${index}`,
@@ -86,7 +88,7 @@ async function teamChatRun(input: {
       findUniqueOrThrow: vi.fn(async () => ({
         id: run.threadId,
         groupId: null,
-        externalConversationId: "conversation-1",
+        externalConversationId: input.direct ? null : "conversation-1",
       })),
       update: vi.fn(async () => ({ nextMessageSeq: 2, nextEventSeq: 2 })),
     },
@@ -94,6 +96,8 @@ async function teamChatRun(input: {
       findMany: vi.fn(async () => []),
       findFirst: vi.fn(async () => null),
       findUnique: vi.fn(async () => ({
+        role: "user",
+        threadId: run.threadId,
         blocks: input.sharedChannel
           ? [{ kind: "channel_message", channelId: "channel-1" }]
           : [{ kind: "text", text: "Slack message from Pat:\n\nWhat do you remember?" }],
@@ -302,6 +306,22 @@ describe("team chat runs from the owner", () => {
     expect(result.sawOwnerState).toBe(true);
     expect(result.toldNonOwner).toBe(false);
     for (const tool of ownerOnlyTools) expect(result.tools).toContain(tool);
+  });
+
+  it("does not count as a run the owner started, since others read the reply", async () => {
+    const result = await teamChatRun({
+      senders: [{ senderId: "T1:U-OWNER" }],
+      ownerAddress: "T1:U-OWNER",
+    });
+    expect(result.tools).not.toContain("update_preferences");
+  });
+});
+
+describe("direct chat-app runs", () => {
+  it("count as a run the owner started", async () => {
+    const result = await teamChatRun({ senders: [{ senderId: "owner" }], direct: true });
+    expect(result.sawOwnerState).toBe(true);
+    expect(result.tools).toContain("update_preferences");
   });
 });
 

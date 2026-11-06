@@ -1277,7 +1277,9 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           }
         }
         // The owner's own direct message from a linked chat app counts like one sent in the app.
-        const ownerDirectMessage = run.trigger === "messaging" && !nonOwnerChatRun;
+        // Team chats do not, even when only the owner spoke: others there read the reply.
+        const ownerDirectMessage =
+          run.trigger === "messaging" && !teamChatConversationId && !nonOwnerChatRun;
         const mainRunModel: AgentRunRequest["model"] = pinnedComputerModels?.main ?? {
           provider: runModelProvider,
           id: runModelId,
