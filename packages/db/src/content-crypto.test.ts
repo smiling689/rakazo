@@ -10,11 +10,13 @@ import {
   isSealedArtifact,
   jsonKeyIds,
   jsonNeedsSealing,
+  legacyQuerySearchTokens,
   openArtifact,
   openJson,
   querySearchTokens,
   sealArtifact,
   sealJson,
+  searchTerms,
   searchTokens,
 } from "./content-crypto.js";
 
@@ -106,6 +108,38 @@ describe("blind index tokens", () => {
     expect(querySearchTokens(key, "x", "prefix")).toEqual([]);
     const other = querySearchTokens({ ...key, key: randomBytes(32) }, "pelican", "word");
     expect(tokens.has(other[0]!)).toBe(false);
+  });
+
+  it("indexes CJK runs as bigrams and single characters", () => {
+    expect(searchTerms("我喜欢喝咖啡")).toEqual(["我喜", "喜欢", "欢喝", "喝咖", "咖啡"]);
+    expect(searchTerms("咖啡")).toEqual(["咖啡"]);
+    expect(searchTerms("茶")).toEqual(["茶"]);
+    expect(searchTerms("我用Python写爬虫")).toEqual(["我用", "python", "写爬", "爬虫"]);
+    expect(searchTerms("喝茶", "index")).toEqual(["喝", "茶", "喝茶"]);
+    expect(searchTerms("コーヒーが好き").slice(0, 2)).toEqual(["コー", "ーヒ"]);
+    expect(searchTerms("Ship the report")).toEqual(["ship", "the", "report"]);
+  });
+
+  it("finds Chinese words inside a sentence, alone and mixed with English", () => {
+    const text = "我昨天用Python写了一个爬虫，顺便喝了咖啡";
+    const tokens = new Set(searchTokens(key, { words: text, strings: [text] }));
+    const finds = (query: string, domain: "word" | "prefix" = "word") =>
+      querySearchTokens(key, query, domain).every((token) => tokens.has(token));
+    for (const query of ["咖啡", "爬虫", "写了", "喝", "python", "Python 爬虫", "一个爬虫"])
+      expect(finds(query), query).toBe(true);
+    expect(finds("咖啡", "prefix")).toBe(true);
+    expect(finds("奶茶")).toBe(false);
+    expect(finds("java 爬虫")).toBe(false);
+  });
+
+  it("keeps the query's tokens as older rows hold them, only for CJK queries", () => {
+    // Releases before bigrams indexed each letter-or-digit run whole.
+    const legacy = new Set(legacyQuerySearchTokens(key, "我喜欢喝咖啡 report", "word"));
+    expect(legacy.size).toBe(2);
+    expect(legacyQuerySearchTokens(key, "report", "word")).toBeUndefined();
+    expect([...legacy].some((token) => querySearchTokens(key, "report", "word")[0] === token)).toBe(
+      true,
+    );
   });
 
   it("only indexes history text as words", () => {

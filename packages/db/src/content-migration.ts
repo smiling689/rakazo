@@ -1,15 +1,17 @@
 import type { PrismaClient } from "./client.js";
 import { Prisma } from "./client.js";
 import { ciphertextKeyId, isCiphertext, jsonKeyIds, jsonNeedsSealing } from "./content-crypto.js";
-import { contentEncryptionOf, ENCRYPTED_MODELS } from "./content-encryption.js";
+import type { ContentEncryption } from "./content-encryption.js";
+import { contentEncryptionOf, ENCRYPTED_MODELS, messageIndexTokens } from "./content-encryption.js";
 import type { ContentKeyRing } from "./content-keys.js";
 
 /**
  * - encrypt: seal plaintext rows (the rollout migration).
  * - reencrypt: also rewrite rows sealed under an older data key version.
  * - decrypt: write plaintext back, for rolling back to a release without encryption.
+ * - reindex: rewrite encrypted messages whose search tokens an older release made.
  */
-export type ContentMigrationMode = "encrypt" | "reencrypt" | "decrypt";
+export type ContentMigrationMode = "encrypt" | "reencrypt" | "decrypt" | "reindex";
 
 interface TableSpec {
   model: keyof typeof ENCRYPTED_MODELS;
@@ -28,6 +30,7 @@ interface ScannedRow {
   spaceId: string | null;
   owner: string;
   tokens?: boolean;
+  searchTokens?: number[] | null;
 }
 
 const TABLES: TableSpec[] = [
@@ -38,7 +41,7 @@ const TABLES: TableSpec[] = [
     json: true,
     scan: (cursor, limit) => Prisma.sql`
       SELECT m.id, m.blocks AS value, t."spaceId", m."threadId" AS owner,
-        m."searchTokens" IS NOT NULL AS tokens
+        m."searchTokens" IS NOT NULL AS tokens, m."searchTokens"
       FROM messages m JOIN threads t ON t.id = m."threadId"
       WHERE m.id > ${cursor} ORDER BY m.id LIMIT ${limit}`,
     writePlaintext: (id, value) =>
@@ -126,6 +129,30 @@ async function needsWork(
   return ids.some((id) => id !== current.id);
 }
 
+/**
+ * Sealed messages whose stored tokens differ from what this release's tokenizer
+ * makes of their text, such as rows indexed before CJK bigrams. A row that does
+ * not open here (deleted since the scan, or a missing key) goes to the locked
+ * rewrite, which skips deleted rows and fails loudly on the rest.
+ */
+async function staleTokenRows(encryption: ContentEncryption, rows: ScannedRow[]) {
+  const stale: string[] = [];
+  for (const row of rows) {
+    const keyId = jsonKeyIds(row.value)[0];
+    if (!row.spaceId || !keyId || jsonNeedsSealing(row.value)) continue;
+    try {
+      const [opened] = await encryption.openRows("Message", [
+        { id: row.id, threadId: row.owner, blocks: row.value },
+      ]);
+      const tokens = messageIndexTokens(await encryption.ring.byId(keyId), opened!.blocks);
+      if (tokens.join() !== (row.searchTokens ?? []).join()) stale.push(row.id);
+    } catch {
+      stale.push(row.id);
+    }
+  }
+  return stale;
+}
+
 export interface ContentMigrationProgress {
   table: string;
   scanned: number;
@@ -152,7 +179,11 @@ export async function migrateContent(
   if (!encryption) throw new Error("Content migration needs an encrypting database client");
   const batchSize = options.batchSize ?? 200;
   const results: ContentMigrationProgress[] = [];
-  for (const table of TABLES) {
+  const reindex = options.mode === "reindex";
+  const tables = reindex
+    ? TABLES.filter((table) => ENCRYPTED_MODELS[table.model]!.searchTokens)
+    : TABLES;
+  for (const table of tables) {
     const progress = { table: ENCRYPTED_MODELS[table.model]!.table, scanned: 0, updated: 0 };
     let cursor = "";
     while (true) {
@@ -168,8 +199,10 @@ export async function migrateContent(
             spaceId: row.spaceId,
             owner: row.owner,
           });
-        if (await needsWork(table, row, options.mode, encryption.ring)) ids.push(row.id);
+        if (!reindex && (await needsWork(table, row, options.mode, encryption.ring)))
+          ids.push(row.id);
       }
+      if (reindex) ids.push(...(await staleTokenRows(encryption, batch)));
       if (ids.length && !options.dryRun) await rewrite(prisma, table, ids, options.mode);
       progress.updated += ids.length;
       options.report?.({ ...progress });

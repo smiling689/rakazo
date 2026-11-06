@@ -3,8 +3,8 @@ import type { MessageBlock } from "@rakazo/contracts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { PrismaClient } from "./client.js";
 import { createDb } from "./client.js";
-import { ContentDecryptionError } from "./content-crypto.js";
-import { contentEncryptionOf } from "./content-encryption.js";
+import { ContentDecryptionError, legacyQuerySearchTokens } from "./content-crypto.js";
+import { contentEncryptionOf, messageIndexTokens } from "./content-encryption.js";
 import type { ContentExportRecord } from "./content-export.js";
 import { exportContent } from "./content-export.js";
 import { LocalKeyProvider, masterKeysFromEnv } from "./content-keys.js";
@@ -353,6 +353,54 @@ describePostgres("content encryption (PostgreSQL)", () => {
           },
         }),
       ).rejects.toThrow(/nested write/);
+    }));
+
+  it("finds Chinese words in encrypted messages and reindexes rows an older release tokenized", () =>
+    runAsSystem("test fixture", async () => {
+      const chat = `enc-cjk-thread-${suffix}`;
+      const cjkBot = `enc-cjk-bot-${suffix}`;
+      await prisma.bot.create({ data: { id: cjkBot, spaceId, userId, name: "Lin", color: "ink" } });
+      await prisma.thread.create({ data: { id: chat, spaceId, userId, botId: cjkBot } });
+      const write = (text: string) =>
+        createThreadMessage(prisma, {
+          threadId: chat,
+          role: "user",
+          blocks: [{ kind: "text", text }],
+        });
+      const coffee = await write("我喜欢喝咖啡");
+      const glued = await write("我昨天用Python写了一个爬虫");
+      const spaced = await write("周末用 Rust 重写了爬虫");
+      const ids = async (query: string) =>
+        (
+          await searchHistory(prisma, { ...scope, threadId: chat, botId: cjkBot }, { query })
+        ).messages
+          .map((message) => message.messageId)
+          .sort();
+      expect(await ids("咖啡")).toEqual([coffee.id]);
+      expect(await ids("喝")).toEqual([coffee.id]);
+      expect(await ids("爬虫")).toEqual([glued.id, spaced.id].sort());
+      expect(await ids("Python 爬虫")).toEqual([glued.id]);
+      expect(await ids("python")).toEqual([glued.id]);
+      expect(await ids("奶茶")).toEqual([]);
+
+      // Releases before CJK bigrams indexed each run of letters whole.
+      const key = await contentEncryptionOf(prisma)!.ring.current(spaceId);
+      const legacy = legacyQuerySearchTokens(key, "周末用 Rust 重写了爬虫", "word")!;
+      await raw.query(`UPDATE messages SET "searchTokens" = $2 WHERE id = $1`, [spaced.id, legacy]);
+      expect(await ids("爬虫")).toEqual([glued.id]);
+      expect(await ids("rust")).toEqual([spaced.id]);
+      expect(await ids("重写了爬虫")).toEqual([spaced.id]);
+
+      const [messages] = await migrateContent(prisma, { mode: "reindex" });
+      expect(messages!.table).toBe("messages");
+      expect(messages!.updated).toBeGreaterThanOrEqual(1);
+      expect(await ids("爬虫")).toEqual([glued.id, spaced.id].sort());
+      const stored = await raw.query(
+        `SELECT "searchTokens" AS tokens FROM messages WHERE id = $1`,
+        [spaced.id],
+      );
+      const current = await contentEncryptionOf(prisma)!.ring.current(spaceId);
+      expect(stored.rows[0].tokens).toEqual(messageIndexTokens(current, spaced.blocks));
     }));
 
   it("re-wraps space keys under a new master key and re-encrypts content", () =>

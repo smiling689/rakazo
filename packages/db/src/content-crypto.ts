@@ -151,7 +151,57 @@ function searchKey(key: DataKey): Buffer {
   return Buffer.from(hkdfSync("sha256", key.key, Buffer.alloc(0), "rakazo/search/v1", 32));
 }
 
-export function searchTerms(text: string): string[] {
+// Chinese, Japanese and Korean, written without spaces between words.
+const CJK = String.raw`\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}\p{scx=Hangul}`;
+const SEGMENT = new RegExp(`[${CJK}]+|[^${CJK}]+`, "gu");
+const CJK_START = new RegExp(`^[${CJK}]`, "u");
+
+export interface SearchSegment {
+  text: string;
+  cjk: boolean;
+}
+
+/**
+ * Normalized words, with each word's CJK runs split from the rest, so "用Python写"
+ * is 用, python and 写.
+ */
+export function searchSegments(text: string): SearchSegment[] {
+  const words =
+    text
+      .normalize("NFKC")
+      .toLowerCase()
+      .match(/[\p{L}\p{N}]+/gu) ?? [];
+  return words.flatMap((word) =>
+    (word.match(SEGMENT) ?? []).map((segment) => ({
+      text: segment,
+      cjk: CJK_START.test(segment),
+    })),
+  );
+}
+
+/**
+ * Search terms: words as they are and CJK runs as overlapping character bigrams,
+ * so a CJK word matches inside a longer run. Indexed text also gets every CJK
+ * character, for one-character queries; a query uses a single character only
+ * when that is all a run has.
+ */
+export function searchTerms(text: string, use: "index" | "query" = "query"): string[] {
+  const terms = new Set<string>();
+  for (const segment of searchSegments(text)) {
+    if (!segment.cjk) {
+      terms.add(segment.text);
+      continue;
+    }
+    const chars = Array.from(segment.text);
+    if (chars.length === 1 || use === "index") for (const char of chars) terms.add(char);
+    for (let index = 0; index < chars.length - 1; index += 1)
+      terms.add(chars[index]! + chars[index + 1]!);
+  }
+  return [...terms];
+}
+
+/** Terms as releases before CJK bigrams indexed them: each letter-or-digit run whole. */
+function legacySearchTerms(text: string): string[] {
   return [
     ...new Set(
       text
@@ -170,11 +220,18 @@ function token(hmacKey: Buffer, domain: SearchTokenDomain, term: string): number
 export function searchTokens(key: DataKey, input: { words: string; strings: string[] }): number[] {
   const hmacKey = searchKey(key);
   const tokens = new Set<number>();
-  for (const term of searchTerms(input.words)) tokens.add(token(hmacKey, "word", term));
-  for (const term of searchTerms(input.strings.join("\n")))
+  for (const term of searchTerms(input.words, "index")) tokens.add(token(hmacKey, "word", term));
+  for (const term of searchTerms(input.strings.join("\n"), "index"))
     for (let length = MIN_PREFIX; length <= Math.min(term.length, MAX_PREFIX); length += 1)
       tokens.add(token(hmacKey, "prefix", term.slice(0, length)));
   return [...tokens].sort((a, b) => a - b);
+}
+
+function termTokens(hmacKey: Buffer, terms: string[], domain: SearchTokenDomain): number[] {
+  if (domain === "word") return terms.map((term) => token(hmacKey, "word", term));
+  return terms
+    .filter((term) => term.length >= MIN_PREFIX)
+    .map((term) => token(hmacKey, "prefix", term.slice(0, MAX_PREFIX)));
 }
 
 /**
@@ -186,12 +243,21 @@ export function querySearchTokens(
   query: string,
   domain: SearchTokenDomain,
 ): number[] {
-  const hmacKey = searchKey(key);
-  const terms = searchTerms(query);
-  if (domain === "word") return terms.map((term) => token(hmacKey, "word", term));
-  return terms
-    .filter((term) => term.length >= MIN_PREFIX)
-    .map((term) => token(hmacKey, "prefix", term.slice(0, MAX_PREFIX)));
+  return termTokens(searchKey(key), searchTerms(query), domain);
+}
+
+/**
+ * The query's tokens as rows indexed before CJK bigrams hold them, when they
+ * differ (the query has CJK text). Matching them too keeps those rows findable
+ * as before until `content-encryption reindex` rewrites their tokens.
+ */
+export function legacyQuerySearchTokens(
+  key: DataKey,
+  query: string,
+  domain: SearchTokenDomain,
+): number[] | undefined {
+  if (!searchSegments(query).some((segment) => segment.cjk)) return;
+  return termTokens(searchKey(key), legacySearchTerms(query), domain);
 }
 
 // Artifact files: a header naming the key, then 64 KiB AES-GCM segments. Each

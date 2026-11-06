@@ -164,6 +164,47 @@ postgres("history retrieval (PostgreSQL)", () => {
       })}\n`,
     );
   });
+  it("finds Chinese words inside longer runs of text, alone and mixed with English", async () => {
+    await pool.query(`
+      INSERT INTO threads VALUES ('cjk-thread','synthetic-space','synthetic-user','synthetic-bot');
+      INSERT INTO messages SELECT 'cjk-filler-' || n, 'cjk-thread', n, 'user', NULL, NULL,
+        '2026-01-01'::timestamptz + n * interval '1 minute',
+        jsonb_build_array(jsonb_build_object('kind','text','text', '今天的天气不错，我们聊了第' || n || '次'))
+        FROM generate_series(1,10000) n;
+      INSERT INTO messages VALUES
+        ('cjk-coffee','cjk-thread',10001,'user',NULL,NULL,'2026-02-01','[{"kind":"text","text":"我喜欢喝咖啡"}]'),
+        ('cjk-mixed','cjk-thread',10002,'bot',NULL,NULL,'2026-02-01','[{"kind":"text","text":"我昨天用Python写了一个爬虫"}]'),
+        ('cjk-tea','cjk-thread',10003,'user',NULL,NULL,'2026-02-01','[{"kind":"text","text":"下午喝茶"}]'),
+        ('cjk-tool','cjk-thread',10004,'bot',NULL,NULL,'2026-02-01','[{"kind":"progress","text":"咖啡爬虫"}]');
+      ANALYZE messages;
+    `);
+    const chat = { ...scope, threadId: "cjk-thread" };
+    const ids = async (query: string) =>
+      (await searchHistory(prisma, chat, { query })).messages
+        .map((message) => message.messageId)
+        .sort();
+    expect(await ids("咖啡")).toEqual(["cjk-coffee"]);
+    expect(await ids("爬虫")).toEqual(["cjk-mixed"]);
+    expect(await ids("Python 爬虫")).toEqual(["cjk-mixed"]);
+    expect(await ids("python 咖啡")).toEqual([]);
+    expect(await ids("喝")).toEqual(["cjk-coffee", "cjk-tea"]);
+    // A word missing from every row scans the whole chat: the worst case.
+    const querySpy = vi.spyOn(prisma, "$queryRaw");
+    expect(await ids("奶茶")).toEqual([]);
+    const missQuery = querySpy.mock.calls[0]![0] as Prisma.Sql;
+    querySpy.mockRestore();
+    const explained = await pool.query(
+      `EXPLAIN (ANALYZE, FORMAT JSON) ${missQuery.text}`,
+      missQuery.values,
+    );
+    const plan = explained.rows[0]["QUERY PLAN"][0];
+    expect(JSON.stringify(plan)).toContain("synthetic_history_seq");
+    process.stdout.write(
+      `Synthetic CJK substring miss over a 10k chat ${JSON.stringify({
+        executionMs: plan["Execution Time"],
+      })}\n`,
+    );
+  });
   it("keeps query-specific continuation available after a narrower empty query in the 10k corpus", async () => {
     await pool.query(`INSERT INTO messages SELECT 'continuation-' || n, 'synthetic-thread', n, 'user', NULL, NULL,
       '2026-01-01T00:00:00Z'::timestamptz,
