@@ -35,12 +35,14 @@ const USAGE = `Usage: content-encryption <command> [--dry-run]
   rotate [--reencrypt] Re-wrap space keys under the active master key; with
                        --reencrypt also add new data keys and re-encrypt content
   reencrypt            Re-encrypt content still under an older data key
+  reindex              Rebuild search tokens of encrypted messages that an
+                       older release indexed
   decrypt              Write plaintext back, after CONTENT_ENCRYPTION=off or
                        before rolling back to an older release
   export [--space <id>] [--thread <id>] [--bot <id>] [--output <file>]
                        Write decrypted threads, messages and memory as JSON lines`;
 
-const COMMANDS = ["status", "migrate", "rotate", "reencrypt", "decrypt", "export"];
+const COMMANDS = ["status", "migrate", "rotate", "reencrypt", "reindex", "decrypt", "export"];
 const EXPORT_OPTIONS = ["space", "thread", "bot", "output"] as const;
 
 function parseCommand() {
@@ -85,7 +87,7 @@ if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
 
 // Encrypting commands seal content whatever CONTENT_ENCRYPTION says; the rest
 // only read, or write plaintext back.
-const encrypting = ["migrate", "rotate", "reencrypt"].includes(command);
+const encrypting = ["migrate", "rotate", "reencrypt", "reindex"].includes(command);
 const { prisma, pool, contentKeys } = createDb(process.env.DATABASE_URL, {
   applicationName: "rakazo-content-encryption",
   keyProvider: contentKeyProviderFromEnv(),
@@ -120,7 +122,7 @@ async function exportJsonLines() {
   }
 }
 
-async function rewriteContent(mode: ContentMigrationMode) {
+async function rewriteContent(mode: Exclude<ContentMigrationMode, "reindex">) {
   if (!(await artifacts.hasDirectory()))
     write("artifacts: no artifact directory under DATA_DIR; files were not checked");
   else if (!dryRun) {
@@ -228,6 +230,15 @@ try {
       }
     } else if (command === "reencrypt") {
       await rewriteContent("reencrypt");
+    } else if (command === "reindex") {
+      for (const table of await migrateContent(prisma, {
+        mode: "reindex",
+        dryRun,
+        signal: controller.signal,
+      }))
+        write(
+          `${table.table}: ${table.updated} of ${table.scanned} ${dryRun ? "to reindex" : "reindexed"}`,
+        );
     } else if (command === "export") {
       await exportJsonLines();
     } else {

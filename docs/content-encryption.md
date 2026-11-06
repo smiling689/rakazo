@@ -150,6 +150,16 @@ Does not protect against:
 To roll back to a release without encryption, run
 `content-encryption decrypt` first; older releases cannot read ciphertext.
 
+Messages encrypted by a release that indexed CJK runs whole are found by
+whole runs and other words until their tokens are rebuilt. `reindex` decrypts
+each encrypted message and rewrites the ones whose tokens differ, in batches,
+and can be interrupted and rerun:
+
+```bash
+pnpm --filter @rakazo/api content-encryption reindex --dry-run
+pnpm --filter @rakazo/api content-encryption reindex
+```
+
 ## Rotation
 
 Rotate the master key:
