@@ -2,6 +2,8 @@ import type { AgentRunRequest, AgentSteeringMessage } from "@rakazo/adapter-kit"
 import type { MessageBlock } from "@rakazo/contracts";
 import { ATTACHMENT_MAX_BYTES, isAttachmentImageMimeType } from "@rakazo/contracts";
 import { blocksToAgentHistoryText } from "@rakazo/core";
+import type { BatchedWindowLimits } from "./batched-window.js";
+import { batchedWindowStart } from "./batched-window.js";
 import type { ExecutorDeps } from "./executor-deps.js";
 import { loadReplyContext } from "./reply-context.js";
 import { currentTurnFilesInstruction, listCurrentTurnFiles } from "./thread-artifacts.js";
@@ -110,46 +112,6 @@ function declaredArtifactBytes(size: unknown): number | undefined {
   return size;
 }
 
-type ImageWindowLimits = { turns: number; images: number; bytes: number };
-
-/**
- * Index of the oldest image still sent, for images in prompt order (`turn` groups one message's).
- *
- * A window of the newest images would turn one older message back into text on every new
- * picture, rewriting the cached prompt from there on. Instead the start stays put until the
- * images after it break a limit, then jumps forward to the newest that fit half of every limit,
- * so the prompt is rewritten about once per several pictures. It is replayed from the first
- * image, so consecutive turns of a thread agree without storing anything.
- */
-export function imageWindowStart(
-  slots: readonly { turn: number; bytes: number }[],
-  limits: ImageWindowLimits,
-): number {
-  const half: ImageWindowLimits = {
-    turns: Math.ceil(limits.turns / 2),
-    images: Math.ceil(limits.images / 2),
-    bytes: Math.ceil(limits.bytes / 2),
-  };
-  const fits = (from: number, to: number, cap: ImageWindowLimits) => {
-    let turns = 0;
-    let bytes = 0;
-    for (let index = from; index <= to; index += 1) {
-      const slot = slots[index]!;
-      if (index === from || slot.turn !== slots[index - 1]!.turn) turns += 1;
-      bytes += slot.bytes;
-    }
-    return turns <= cap.turns && to - from + 1 <= cap.images && bytes <= cap.bytes;
-  };
-  let start = 0;
-  for (let end = 0; end < slots.length; end += 1) {
-    if (fits(start, end, limits)) continue;
-    // The newest image always stays; older ones join while half of each limit holds.
-    start = end;
-    while (start > 0 && fits(start - 1, end, half)) start -= 1;
-  }
-  return start;
-}
-
 function unavailableImageMarker(name: string): string {
   return `[image: ${name} (unavailable)]`;
 }
@@ -223,7 +185,7 @@ function markUnavailableHistoryImages(
  *
  * Earlier turns reached the model only as an `[image: name]` marker, so a question asked one
  * turn after the upload had nothing to look at. Which images are sent comes from
- * `imageWindowStart` over every image in the history, the current turn's included, so the window
+ * `batchedWindowStart` over every image in the history, the current turn's included, so the window
  * holds the prompt's image limit (`maxImages`), the byte ceiling, and `maxTurns` image turns. An
  * image larger than the ceiling is never sent. Bytes are read through the same artifact path and
  * space/user scope as the current turn; one that cannot be read is marked unavailable.
@@ -252,12 +214,12 @@ export async function withRecentTurnImages(
 ): Promise<AgentRunRequest["history"]> {
   const artifacts = deps.artifacts;
   if (!artifacts) return history;
-  const limits: ImageWindowLimits = {
+  const limits: BatchedWindowLimits = {
     turns: options.maxTurns ?? TURN_IMAGE_WINDOW_TURNS,
-    images: options.maxImages ?? Number.POSITIVE_INFINITY,
-    bytes: options.maxBytes ?? RECENT_TURN_IMAGE_BYTES,
+    items: options.maxImages ?? Number.POSITIVE_INFINITY,
+    size: options.maxBytes ?? RECENT_TURN_IMAGE_BYTES,
   };
-  if (limits.turns <= 0 || limits.images <= 0 || limits.bytes <= 0) return history;
+  if (limits.turns <= 0 || limits.items <= 0 || limits.size <= 0) return history;
   const blocksByMessageId = new Map(messages.map((message) => [message.id, message.blocks]));
   const imageBlocksOf = (blocks: MessageBlock[] | undefined) =>
     (blocks ?? []).filter(
@@ -301,11 +263,11 @@ export async function withRecentTurnImages(
       if (!isAttachmentImageMimeType(block.mimeType)) return [];
       const row = byId.get(block.artifactId);
       const bytes = row ? declaredArtifactBytes(row.size) : 0;
-      if (bytes === undefined || bytes > limits.bytes) return [];
-      return [{ turn: turnIndex, blockIndex, bytes, row }];
+      if (bytes === undefined || bytes > limits.size) return [];
+      return [{ turn: turnIndex, blockIndex, size: bytes, row }];
     }),
   );
-  const window = slots.slice(imageWindowStart(slots, limits));
+  const window = slots.slice(batchedWindowStart(slots, limits));
 
   const hydrated = new Map<
     string,
@@ -333,7 +295,7 @@ export async function withRecentTurnImages(
             return [];
           }
           // The window was sized from the stored size; never send more than it promised.
-          if (bytes.byteLength > slot.bytes) return [];
+          if (bytes.byteLength > slot.size) return [];
           return [
             {
               name: block.name,
