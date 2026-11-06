@@ -1786,16 +1786,14 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
             content: redactSecrets(recalledMemory, runSecrets),
           });
         }
-        const modelImageBudget =
-          resolved.maxImagesPerPrompt === undefined
-            ? undefined
-            : Math.max(0, resolved.maxImagesPerPrompt - (currentTurnImages?.length ?? 0));
         // A text-only model keeps the [image:] marker. Putting image parts in
         // history makes the provider reject a follow-up that used to be text.
+        // The limit covers the whole prompt: the window counts the current turn's
+        // images itself, so the same history gets the same pictures every turn.
         const historyWithImages = modelSeesImages
           ? await withRecentTurnImages(deps, history, historyMessages, context, {
               skipMessageId: currentTurnMessage?.id,
-              maxImages: modelImageBudget,
+              maxImages: resolved.maxImagesPerPrompt,
             })
           : history;
         const runtimeHistory = [...historicalContext, ...historyWithImages];
