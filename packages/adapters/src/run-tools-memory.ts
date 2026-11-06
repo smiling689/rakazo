@@ -5,6 +5,7 @@ import {
   MEMORY_INDEX_PATH,
 } from "@rakazo/contracts";
 import { readHistory, searchHistory } from "@rakazo/db";
+import type { z } from "zod";
 import { sharedMemorySaveError } from "./builtin-tools.js";
 import { redactConnectorPayload } from "./connector-safety.js";
 import { MAX_RECALLED_MEMORIES } from "./history-compaction.js";
@@ -46,10 +47,24 @@ async function readHistoryTool(ctx: RunContext, call: ToolCall) {
     allowMyChats,
     searchAt: run.createdAt,
   };
-  const response =
-    name === "search_history"
-      ? await searchHistory(deps.prisma, scope, HistorySearchInputSchema.parse(args))
-      : await readHistory(deps.prisma, scope, HistoryReadInputSchema.parse(args));
+  // A short field-by-field error instead of Zod's JSON dump (with regex patterns), so the
+  // model can fix the one field instead of guessing (fork).
+  const invalid = (error: z.ZodError) =>
+    call.finish({
+      error: `Invalid ${name} arguments: ${error.issues
+        .map((issue) => `${issue.path.join(".") || "arguments"}: ${issue.message}`)
+        .join("; ")}. Received fields: ${Object.keys(args).join(", ") || "none"}.`,
+    });
+  let response: Awaited<ReturnType<typeof searchHistory | typeof readHistory>>;
+  if (name === "search_history") {
+    const parsed = HistorySearchInputSchema.safeParse(args);
+    if (!parsed.success) return invalid(parsed.error);
+    response = await searchHistory(deps.prisma, scope, parsed.data);
+  } else {
+    const parsed = HistoryReadInputSchema.safeParse(args);
+    if (!parsed.success) return invalid(parsed.error);
+    response = await readHistory(deps.prisma, scope, parsed.data);
+  }
   const redacted = redactConnectorPayload(response, ctx.secrets);
   // Redaction can expand short synthetic credentials; never let Pi clip the JSON.
   if (Buffer.byteLength(JSON.stringify(redacted), "utf8") > 11_000) {
