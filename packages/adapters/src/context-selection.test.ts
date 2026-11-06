@@ -219,6 +219,17 @@ describe("bounded context selection", () => {
       }).messages,
     ).toHaveLength(2);
   });
+  it("keeps the whole compacted session history that fits, whatever the exchange limit", () => {
+    const history = Array.from({ length: 20 }, (_, index) => user(`exchange ${index}`));
+    expect(
+      selectContext(history, { budget, strategy: "session", recentExchanges: 2 }).messages,
+    ).toHaveLength(20);
+    const long = Array.from({ length: 20 }, (_, index) => user(`${index} ${"word ".repeat(100)}`));
+    // Over the budget it still keeps the newest messages that fit.
+    const selected = selectContext(long, { budget, strategy: "session" }).messages;
+    expect(selected.length).toBeLessThan(20);
+    expect(selected.at(-1)).toBe(long[19]);
+  });
   it("drops old tool groups together during long loops", () => {
     const history = [
       user("current objective"),

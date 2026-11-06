@@ -212,6 +212,12 @@ import {
 } from "./run-turn-images.js";
 import { loadAgentScratchpadContext } from "./scratchpad-context.js";
 import { inferScript } from "./scripted-runtime.js";
+import {
+  configuredContextStrategy,
+  isMemoryFlushRun,
+  SESSION_CONTEXT_STRATEGY,
+  SESSION_HISTORY_LOAD_LIMIT,
+} from "./session-context.js";
 import { builtinAgentSkillRecords, listAgentSkillRecords } from "./skill-tools.js";
 import {
   filterStrategicInitiativeTools,
@@ -259,7 +265,8 @@ async function verbatimMcpServersForRun(
 }
 
 export function createRunExecutor(executorDeps: ExecutorDeps) {
-  const contextStrategy = executorDeps.contextStrategy ?? DEFAULT_CONTEXT_STRATEGY;
+  const chosenStrategy = executorDeps.contextStrategy ?? configuredContextStrategy();
+  const contextStrategy = chosenStrategy ?? DEFAULT_CONTEXT_STRATEGY;
   const web = executorDeps.web ?? createWebProvider();
   const mediaGeneration = executorDeps.mediaGeneration ?? createMediaGenerationProvider();
   const browser =
@@ -287,7 +294,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
       return result;
     },
   };
-  const baseDeps: ExecutorDeps = { ...executorDeps, events };
+  const baseDeps: ExecutorDeps = { ...executorDeps, contextStrategy: chosenStrategy, events };
   return {
     resolveConnectedModel,
     contextStrategy,
@@ -615,7 +622,14 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
             include: { computer: true },
           }),
           deps.prisma.thread.findUniqueOrThrow({ where: { id: run.threadId } }),
-          loadRunHistoryMessages(deps.prisma, run, LEGACY_HISTORY_WINDOW_SIZE, channelId),
+          loadRunHistoryMessages(
+            deps.prisma,
+            run,
+            contextStrategy === SESSION_CONTEXT_STRATEGY
+              ? SESSION_HISTORY_LOAD_LIMIT
+              : LEGACY_HISTORY_WINDOW_SIZE,
+            channelId,
+          ),
           run.trigger === "bot_message"
             ? loadBotMessageContext(deps.prisma, run.sourceMessageId)
             : Promise.resolve(undefined),
@@ -913,7 +927,8 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
             getLogger().error("semantic memory recall failed", recalled.error);
           }
         }
-        if (!compactedHistory.usedLocalSummary) {
+        // Session history is bounded by its own compaction, not by a message window.
+        if (!compactedHistory.usedLocalSummary && contextStrategy !== SESSION_CONTEXT_STRATEGY) {
           history = history.slice(
             -historyWindowSize({
               semanticMemoryEnabled: semanticMemoryEnabled && !thread.historyCompactionSummary,
@@ -1866,13 +1881,14 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
                 agentSkillsLine,
                 taughtSkillsLine,
                 replyGuidance: runReplyGuidance(run.trigger),
-                disabledBuiltinTools: isStrategicInitiativeRun(run)
-                  ? new Set(
-                      builtinAgentTools
-                        .map((tool) => tool.name)
-                        .filter((name) => !strategicBuiltins.some((tool) => tool.name === name)),
-                    )
-                  : disabledBuiltinTools,
+                disabledBuiltinTools:
+                  isStrategicInitiativeRun(run) || isMemoryFlushRun(run)
+                    ? new Set(
+                        builtinAgentTools
+                          .map((tool) => tool.name)
+                          .filter((name) => !strategicBuiltins.some((tool) => tool.name === name)),
+                      )
+                    : disabledBuiltinTools,
                 offeredFleetTools: offeredFleetTools(strategicBuiltins),
                 followUpsOffered: followUpsOffered(strategicBuiltins, ownerStartedRun),
                 userComputer,

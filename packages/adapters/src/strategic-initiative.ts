@@ -11,6 +11,7 @@ import { STRATEGIC_INITIATIVE_NONCE_PREFIX, spaceHasModelAccess } from "@rakazo/
 import { getLogger } from "@rakazo/logging";
 import { isUniqueViolation } from "./run-messages.js";
 import { modelCreditBillingEnabled } from "./run-model.js";
+import { isMemoryFlushRun, MEMORY_FLUSH_TOOL_NAMES } from "./session-context.js";
 
 const STRATEGIC_INITIATIVE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // A failed check-in usually means the bot's model setup is broken; retrying daily only repeats it.
@@ -186,12 +187,15 @@ export function isStrategicInitiativeRun(input: {
   return Boolean(nonce?.startsWith(`${STRATEGIC_INITIATIVE_NONCE_PREFIX}:`));
 }
 
-/** Strategic sweeps are read-mostly and user-facing: no autonomous side effects. */
+/**
+ * Strategic sweeps are read-mostly and user-facing: no autonomous side effects. A session
+ * memory flush gets only its memory tool.
+ */
 export function filterStrategicInitiativeTools<T extends { name: string }>(
   tools: readonly T[],
   input: { trigger: string; clientNonce: string | null | undefined },
 ): T[] {
-  if (!isStrategicInitiativeRun(input)) return [...tools];
+  if (!isStrategicInitiativeRun(input) && !isMemoryFlushRun(input)) return [...tools];
   return tools.filter((tool) => strategicInitiativeToolAllowed(tool.name, input));
 }
 
@@ -200,6 +204,7 @@ export function strategicInitiativeToolAllowed(
   name: string,
   run: { trigger: string; clientNonce?: string | null },
 ): boolean {
+  if (isMemoryFlushRun(run)) return MEMORY_FLUSH_TOOL_NAMES.has(name);
   return !isStrategicInitiativeRun(run) || STRATEGIC_INITIATIVE_SAFE_TOOL_NAMES.has(name);
 }
 

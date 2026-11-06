@@ -4,6 +4,7 @@ import {
   HISTORY_COMPACT_MAX_ATTEMPTS,
   historyCompactJob,
   historyCompactJobKey,
+  historyIdleCompactJob,
   messagingDeliverJob,
   parseBackgroundJob,
   routineRetryJob,
@@ -117,5 +118,17 @@ describe("historyCompactJob", () => {
 
   it("keys different threads differently", () => {
     expect(historyCompactJobKey("thread-1")).not.toBe(historyCompactJobKey("thread-2"));
+  });
+
+  it("schedules one idle compaction per thread that a newer run moves later", () => {
+    const at = new Date("2026-11-06T13:00:00Z");
+    const job = historyIdleCompactJob("thread-1", at);
+    expect(job).toMatchObject({
+      name: "history.compact",
+      payload: { threadId: "thread-1", reason: "idle" },
+      availableAt: at,
+    });
+    expect(job.replaceKey).not.toBe(historyCompactJobKey("thread-1"));
+    expect(parseBackgroundJob("history.compact", job.payload).payload).toEqual(job.payload);
   });
 });
