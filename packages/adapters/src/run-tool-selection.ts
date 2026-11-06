@@ -22,6 +22,7 @@ export const READ_ONLY_AGENT_TOOLS = new Set([
   "list_fleet",
   "read_file",
   "read_history",
+  "read_memory",
   "search_history",
   "request_takeover",
   "run_subagent",
@@ -155,6 +156,7 @@ export function selectBuiltinToolsForRun(options: {
           ![
             "remember",
             "save_shared_memory",
+            "read_memory",
             "save_memory",
             "recall_memory",
             "forget_memory",

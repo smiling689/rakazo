@@ -114,7 +114,7 @@ import {
   USER_SPEAKER,
 } from "./history-speakers.js";
 import { createMediaGenerationProvider } from "./media-generation-factory.js";
-import { loadAgentMemoryContext } from "./memory-context.js";
+import { loadAgentMemoryContext, READ_MEMORY_TOOL } from "./memory-context.js";
 import { HostedModelCreditsRequiredError } from "./model-credit-observer.js";
 import {
   effectiveModelRole,
@@ -910,7 +910,12 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           loadCurrentTurnImages(deps, turnBlocks, context),
           nonOwnerChatRun
             ? Promise.resolve("")
-            : loadAgentMemoryContext(deps.memory, bot.id, context),
+            : loadAgentMemoryContext(deps.memory, bot.id, context, {
+                // The line naming memory that did not fit points at read_memory unless it is off.
+                ...(disabledBuiltinToolSet(bot.disabledBuiltinTools).has(READ_MEMORY_TOOL)
+                  ? {}
+                  : { readTool: READ_MEMORY_TOOL }),
+              }),
           nonOwnerChatRun
             ? Promise.resolve("")
             : loadAgentScratchpadContext(deps, {

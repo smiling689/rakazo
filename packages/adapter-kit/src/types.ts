@@ -328,6 +328,7 @@ export interface MemorySnapshot {
     path: string;
     content: string;
     revision: number;
+    createdAt?: string;
     updatedAt?: string;
   }>;
 }

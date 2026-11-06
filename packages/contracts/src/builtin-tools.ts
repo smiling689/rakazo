@@ -52,6 +52,7 @@ export const BUILTIN_TOOL_NAMES = [
   "add_mcp_server",
   "remember",
   "save_shared_memory",
+  "read_memory",
   "web_search",
   "web_fetch",
   "cloud_agent_launch",

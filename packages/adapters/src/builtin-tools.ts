@@ -784,6 +784,24 @@ export const builtinAgentTools: ConnectorTool[] = [
     },
   },
   {
+    name: "read_memory",
+    description:
+      "Read one memory document in full, such as one your memory block says was cut short or left out.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: { type: "string", enum: ["bot", "user"] },
+        path: { type: "string" },
+        offset: {
+          type: "integer",
+          minimum: 0,
+          description: "nextOffset from the previous read of a long document.",
+        },
+      },
+      required: ["scope", "path"],
+    },
+  },
+  {
     name: "web_search",
     description:
       "Search the public web. Returns titles, URLs, and snippets. Use when you need current information or links; follow with web_fetch to read a page. Does not need a computer.",

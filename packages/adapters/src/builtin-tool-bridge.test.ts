@@ -57,7 +57,8 @@ describe("built-in tool bridge", () => {
     // +15 bytes: the deferred catalog names post_to_group. +23: the catalog names update_default_models.
     // Fork (lean tools): schedule_create/schedule_list and update_preferences are deferred, 31,949 -> 18,601.
     // +317: update_bot names the fields a call changes, so a read cannot switch settings off.
-    expect(definitionBytes(listed)).toBeLessThanOrEqual(18_886);
+    // +13: the catalog names read_memory, which reads memory the prompt had no room for.
+    expect(definitionBytes(listed)).toBeLessThanOrEqual(18_899);
     expect(deferred.map((tool) => tool.name)).toEqual(
       expect.arrayContaining(["render_plot", "create_space", "generate_secret", "scratchpad_add"]),
     );
