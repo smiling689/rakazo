@@ -700,6 +700,8 @@ export function selectContext<T extends ContextMessage>(
   }
   const keepPrefix =
     options.strategy === "current" ||
+    // Session history arrives already bounded by compaction; keep all of it within the budget.
+    options.strategy === "session" ||
     (options.strategy === "cache-aware" && options.cacheWarmth === "likely-warm");
   const exchangeLimit = keepPrefix
     ? Number.POSITIVE_INFINITY

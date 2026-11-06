@@ -515,7 +515,13 @@ export interface AgentRunModel {
   };
 }
 
-export type AgentContextStrategy = "current" | "retrieval" | "snapshots" | "cache-aware";
+/** `session` keeps every message since the last compaction (summary + tail); see adapters' session-context. */
+export type AgentContextStrategy =
+  | "current"
+  | "retrieval"
+  | "snapshots"
+  | "cache-aware"
+  | "session";
 export const DEFAULT_CONTEXT_STRATEGY: AgentContextStrategy = "retrieval";
 
 export interface AgentRunRequest {
@@ -772,7 +778,7 @@ export interface BackgroundJobPayloads {
   "skill.teaching-expire": { skillId: string };
   /** The bot's call rang out: mark it missed if nobody answered. */
   "call.expire": { threadId: string; callId: string };
-  "history.compact": { threadId: string };
+  "history.compact": { threadId: string; reason?: "check" | "idle" };
   /** Hand a bot the group replies to its post once the members it named finish. */
   "group.collect": { messageId: string; askerRunId: string };
   "messaging.deliver": { runId?: string; progress?: boolean };

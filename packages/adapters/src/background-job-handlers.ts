@@ -37,6 +37,8 @@ import {
   mirrorMessagingProgress,
 } from "./messaging-delivery.js";
 import { pollPurchase } from "./purchase-poll.js";
+import { compactSessionHistory } from "./session-compaction.js";
+import { SESSION_CONTEXT_STRATEGY } from "./session-context.js";
 import { expireTaughtSkillTeaching } from "./teaching-session.js";
 
 type Tenant = { spaceId: string; userId: string };
@@ -242,21 +244,23 @@ export function createBackgroundJobHandlers(deps: {
       },
     ),
     "history.compact": asOwner(thread, async (payload) => {
+      const compactDeps = {
+        prisma: deps.prisma,
+        runtime: deps.runtime,
+        jobs: deps.jobs,
+        memoryProviders: deps.memoryProviders,
+        deploymentModelKey: deps.deploymentModelKey,
+        deploymentModelConfigured: deps.deploymentModelConfigured,
+        ...(deps.executor.resolveModel ? { resolveModel: deps.executor.resolveModel } : {}),
+      };
+      if (deps.executor.contextStrategy === SESSION_CONTEXT_STRATEGY) {
+        await compactSessionHistory(compactDeps, payload);
+        return;
+      }
       // Retrieval policies use stored context without paid message-count compaction.
       // Skip legacy backlog work after a policy change.
       if (deps.executor.contextStrategy && deps.executor.contextStrategy !== "current") return;
-      await compactHistory(
-        {
-          prisma: deps.prisma,
-          runtime: deps.runtime,
-          jobs: deps.jobs,
-          memoryProviders: deps.memoryProviders,
-          deploymentModelKey: deps.deploymentModelKey,
-          deploymentModelConfigured: deps.deploymentModelConfigured,
-          ...(deps.executor.resolveModel ? { resolveModel: deps.executor.resolveModel } : {}),
-        },
-        payload.threadId,
-      );
+      await compactHistory(compactDeps, payload.threadId);
     }),
   };
 }

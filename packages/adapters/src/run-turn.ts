@@ -2,6 +2,7 @@ import type { AgentRuntimeEvent } from "@rakazo/adapter-kit";
 import {
   DEFAULT_CONTEXT_STRATEGY,
   historyCompactJob,
+  historyIdleCompactJob,
   ModelAccountError,
   ModelOutputError,
   runContinueJob,
@@ -76,6 +77,11 @@ import {
 import { scheduleRoutineRetry } from "./run-routines.js";
 import { applyTool } from "./run-tools.js";
 import { withRuntimeCleanup } from "./runtime-stream.js";
+import {
+  isMemoryFlushRun,
+  SESSION_CONTEXT_STRATEGY,
+  sessionContextSettings,
+} from "./session-context.js";
 import {
   isNoResponseReply,
   isPlaceholderReply,
@@ -158,7 +164,7 @@ export async function consumeRunEvents(
       if (await runLeaseLost(ctx)) return true;
 
       if (
-        isStrategicInitiativeRun(run) &&
+        (isStrategicInitiativeRun(run) || isMemoryFlushRun(run)) &&
         (event.type === "takeover" || event.type === "subagent")
       ) {
         throw new Error("Daily check-ins cannot start a computer or helper.");
@@ -873,15 +879,17 @@ export async function completeRun(ctx: RunContext) {
           !reply.publishedMidTurnUserMessage
         ? peerReplyWithoutSentinel(reply.assembled, reply.messageSegments)
         : stripStrayNoResponse(reply.assembled, reply.messageSegments);
+  // A session memory flush only edits memory: nothing it says or did is posted.
+  const suppressOutput = isBackgroundRunTrigger(run.trigger) || isMemoryFlushRun(run);
   let completionBlocks = silentReply.blocks;
-  if (!silentReply.assembled || isBackgroundRunTrigger(run.trigger)) {
+  if (!silentReply.assembled || suppressOutput) {
     // Mid-turn progress already posted durable chat messages; skip the empty
     // "…" fallback so we do not add a junk final bubble.
     completionBlocks = completionMessageSegments(completionBlocks, {
       allowSilentEmpty:
         ctx.allowSilentEmptyRun || reply.publishedMidTurnUserMessage || groupSilentEnd,
       emptyResponseText: ctx.emptyResponseText,
-      suppressOutput: ctx.state.handedOff || isBackgroundRunTrigger(run.trigger),
+      suppressOutput: ctx.state.handedOff || suppressOutput,
       skipEmptyFallback: reply.publishedTerminalSubagent || reply.publishedMidTurnUserMessage,
     });
   }
@@ -891,9 +899,10 @@ export async function completeRun(ctx: RunContext) {
         redactBlocks(completionBlocks, ctx.secrets),
         reply.publishedMidTurnUserMessage || runAllowsSilentEmpty(run.trigger),
       );
-  const text = ctx.state.handedOff
-    ? ""
-    : redactSecrets(completionNotificationBody(silentReply.assembled, blocks), ctx.secrets);
+  const text =
+    ctx.state.handedOff || isMemoryFlushRun(run)
+      ? ""
+      : redactSecrets(completionNotificationBody(silentReply.assembled, blocks), ctx.secrets);
   if (containsSecret(text, ctx.secrets)) {
     throw new Error("refusing to persist a secret in the thread");
   }
@@ -979,6 +988,16 @@ export async function completeRun(ctx: RunContext) {
   // the failure path, where a second finalizeRun would match no rows and silently
   // skip the completion notification.
   try {
+    if (deps.contextStrategy === SESSION_CONTEXT_STRATEGY) {
+      // Session context: check the size now (a finished flush also lands here and lets the
+      // compaction go on), and compact once the thread has been quiet for the idle time.
+      await deps.jobs.enqueue(historyCompactJob(thread.id));
+      if (!isMemoryFlushRun(run)) {
+        const { idleMs } = sessionContextSettings();
+        await deps.jobs.enqueue(historyIdleCompactJob(thread.id, new Date(Date.now() + idleMs)));
+      }
+      return;
+    }
     const updatedThread = await deps.prisma.thread.findUniqueOrThrow({
       where: { id: thread.id },
       select: {
@@ -1129,6 +1148,7 @@ export async function failRun(
   if (
     runSendsFinishNotification(run.trigger) &&
     !isStrategicInitiativeRun(run) &&
+    !isMemoryFlushRun(run) &&
     !failed.continuationRunId &&
     !retrying
   ) {

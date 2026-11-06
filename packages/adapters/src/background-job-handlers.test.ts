@@ -19,7 +19,10 @@ import { compactHistory } from "./history-compaction.js";
 import { deliverMessagingOutbound, mirrorMessagingOutbound } from "./messaging-delivery.js";
 import type { EncryptedSecretStore } from "./secrets.js";
 
-vi.mock("./history-compaction.js", () => ({ compactHistory: vi.fn(async () => undefined) }));
+vi.mock("./history-compaction.js", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  compactHistory: vi.fn(async () => undefined),
+}));
 vi.mock("./computer-control.js", async (importOriginal) => ({
   ...(await importOriginal<typeof ComputerControl>()),
   expireComputerControl: vi.fn(async () => false),

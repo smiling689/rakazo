@@ -22,7 +22,11 @@ const payloadSchemas = {
   }),
   "skill.teaching-expire": z.object({ skillId: z.string().min(1) }),
   "call.expire": z.object({ threadId: z.string().min(1), callId: z.string().min(1) }),
-  "history.compact": z.object({ threadId: z.string().min(1) }),
+  "history.compact": z.object({
+    threadId: z.string().min(1),
+    /** Session context: `idle` compacts after the thread went quiet; default checks size. */
+    reason: z.enum(["check", "idle"]).optional(),
+  }),
   "group.collect": z.object({ messageId: z.string().min(1), askerRunId: z.string().min(1) }),
   "messaging.deliver": z.object({
     runId: z.string().min(1).optional(),
@@ -202,6 +206,17 @@ export function historyCompactJob(threadId: string): BackgroundJob {
     name: "history.compact",
     payload: { threadId },
     replaceKey: historyCompactJobKey(threadId),
+    maxAttempts: HISTORY_COMPACT_MAX_ATTEMPTS,
+  };
+}
+
+/** Session context: compact once the thread has been quiet until `availableAt`; a newer run moves it. */
+export function historyIdleCompactJob(threadId: string, availableAt: Date): BackgroundJob {
+  return {
+    name: "history.compact",
+    payload: { threadId, reason: "idle" },
+    availableAt,
+    replaceKey: `history.compact.idle:${threadId}`,
     maxAttempts: HISTORY_COMPACT_MAX_ATTEMPTS,
   };
 }

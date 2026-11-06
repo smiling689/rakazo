@@ -550,7 +550,9 @@ export function createRuntimeContextPolicy(
       verbatimMcpServers: request.verbatimMcpServers,
       cacheWarmth: predictedCache,
       recentExchanges:
-        retainShortHistory || standaloneHistoryFallback ? messages.length : 8 + laterUserMessages,
+        retainShortHistory || standaloneHistoryFallback || strategy === "session"
+          ? messages.length
+          : 8 + laterUserMessages,
     });
     const shortenedStructuredResults = selected.messages.filter((message) => {
       if (message.role !== "toolResult") return false;
