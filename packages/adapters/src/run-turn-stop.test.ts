@@ -55,8 +55,6 @@ async function context(row: { status: string }) {
       approval: { pausePending: false },
       lease: { valid: true, lastCheckAt: 0 },
       computerUse: {},
-      toolCallStreak: {},
-      toolResults: new Map(),
       overLimitActionCalls: 0,
     },
     abortController: new AbortController(),

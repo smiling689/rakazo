@@ -94,11 +94,9 @@ import { takeoverCheckpointOf } from "./takeover-resume.js";
 import { appendToolCompletionAudit, toolCompletionFromResult } from "./tool-completion-audit.js";
 import {
   advanceOverLimitActionCalls,
-  advanceToolCallLoopGuard,
   loopGuardStopText,
   MAX_CONSECUTIVE_OVER_LIMIT_ACTION_CALLS,
   overLimitStopText,
-  toolResultFingerprint,
 } from "./tool-loop.js";
 import {
   assistantTurnSeparator,
@@ -291,7 +289,6 @@ async function streamText(ctx: RunContext, event: RuntimeEvent<"text">) {
   }
   reply.assembled += event.text;
   reply.currentTextSegment += event.text;
-  ctx.state.toolCallStreak = { key: undefined, count: 0 };
   tryFlushPendingTools(reply);
   reply.pendingProgress += reply.redactor.push(event.text);
   const now = Date.now();
@@ -303,8 +300,6 @@ async function streamText(ctx: RunContext, event: RuntimeEvent<"text">) {
 async function streamProgress(ctx: RunContext, event: RuntimeEvent<"progress">) {
   const { deps, run, runId, bot, thread } = ctx;
   const { reply } = ctx.state;
-  // Tool status lines are not the model writing.
-  if (!event.activity) ctx.state.toolCallStreak = { key: undefined, count: 0 };
   if (run.trigger === "routine" || isBackgroundRunTrigger(run.trigger)) return;
   // The bot's own note stays the working line until it writes again.
   if (event.activity && reply.narrationStatusShowing) return;
@@ -546,31 +541,13 @@ async function onToolCalled(ctx: RunContext, event: RuntimeEvent<"tool">): Promi
   });
   await showNarrationStatus(ctx, heldNote);
   tryFlushPendingTools(reply);
-  // A call can finish before or after its own event is handled, so its result is read here.
-  const { toolCallStreak: streak, toolResults } = ctx.state;
-  const previousResult = streak.executionId ? toolResults.get(streak.executionId) : undefined;
-  const loopGuard = advanceToolCallLoopGuard(
-    streak,
-    event.name,
-    event.args,
-    previousResult,
-    event.response,
-  );
-  // A call from the same response as the streak's last one leaves it as it was.
-  if (loopGuard.streak !== streak) {
-    if (streak.executionId) toolResults.delete(streak.executionId);
-    ctx.state.toolCallStreak = { ...loopGuard.streak, executionId: event.executionId };
-  }
   ctx.state.overLimitActionCalls = advanceOverLimitActionCalls(
     ctx.state.overLimitActionCalls,
     event.name,
     event.args,
   );
-  if (
-    loopGuard.stuck ||
-    ctx.state.overLimitActionCalls >= MAX_CONSECUTIVE_OVER_LIMIT_ACTION_CALLS
-  ) {
-    await stopStuckToolLoop(ctx, event.name);
+  if (event.stuck || ctx.state.overLimitActionCalls >= MAX_CONSECUTIVE_OVER_LIMIT_ACTION_CALLS) {
+    await stopStuckToolLoop(ctx, event);
     return true;
   }
   if (!ctx.scripted) return false;
@@ -578,7 +555,6 @@ async function onToolCalled(ctx: RunContext, event: RuntimeEvent<"tool">): Promi
   const audit = { spaceId: run.spaceId, threadId: thread.id, botId: bot.id, runId };
   try {
     const result = await applyTool(ctx, event.name, event.args, event.executionId);
-    toolResults.set(event.executionId, toolResultFingerprint(result));
     await appendToolCompletionAudit(
       deps,
       audit,
@@ -609,8 +585,8 @@ async function onToolCalled(ctx: RunContext, event: RuntimeEvent<"tool">): Promi
   }
 }
 
-/** The model keeps repeating the same call: finish the run with what it has and say why. */
-async function stopStuckToolLoop(ctx: RunContext, toolName: string) {
+/** The model keeps repeating the same calls: finish the run with what it has and say why. */
+async function stopStuckToolLoop(ctx: RunContext, event: RuntimeEvent<"tool">) {
   const { deps, run, runId, bot, thread, workerId, fence } = ctx;
   const { reply } = ctx.state;
   ctx.tools.approvedReplays.assertDrained();
@@ -622,11 +598,10 @@ async function stopStuckToolLoop(ctx: RunContext, toolName: string) {
   await ctx.computer.checkpoint.flush();
   ctx.state.terminalCheckpointComplete = true;
   const overLimit = ctx.state.overLimitActionCalls;
-  const humanName = humanizeToolName(toolName);
   const stuckText =
-    overLimit >= MAX_CONSECUTIVE_OVER_LIMIT_ACTION_CALLS
-      ? overLimitStopText(humanName, overLimit)
-      : loopGuardStopText(humanName, ctx.state.toolCallStreak);
+    overLimit >= MAX_CONSECUTIVE_OVER_LIMIT_ACTION_CALLS || !event.stuck
+      ? overLimitStopText(humanizeToolName(event.name), overLimit)
+      : loopGuardStopText(event.stuck.tools.map(humanizeToolName), event.stuck.repeats);
   await ctx.settleRunningHelpers();
   const stopped = await deps.events.finalizeRun({
     spaceId: run.spaceId,

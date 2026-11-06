@@ -779,7 +779,7 @@ describe("createJobReconciler", () => {
       error: null,
       bot: { name: "Researcher" },
     };
-    const stuckText = loopGuardStopText("search", { key: undefined, count: 8 });
+    const stuckText = loopGuardStopText(["Search"], 5);
     const prisma = {
       run: {
         findMany: vi.fn(async (args: { where?: Record<string, unknown> } = {}) =>

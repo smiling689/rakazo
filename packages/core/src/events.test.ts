@@ -21,7 +21,6 @@ import {
   sanitizeUtf16ForJson,
   stripLiveStreamingProgress,
   toolNameFromLabel,
-  trackToolCallStreak,
   trackToolNameStreak,
   withLiveStreamingProgress,
   withoutLastToolStepNotes,
@@ -672,59 +671,6 @@ describe("appendToolStep", () => {
       { label: "Slack find channels", count: 1 },
       { label: "Slack fetch conversation history", count: 1 },
     ]);
-  });
-});
-
-describe("trackToolCallStreak", () => {
-  it("starts a streak of 1 for the first call", () => {
-    expect(
-      trackToolCallStreak({ key: undefined, count: 0 }, "SLACK_FIND_CHANNELS", { cursor: "a" }),
-    ).toMatchObject({ key: 'SLACK_FIND_CHANNELS:{"cursor":"a"}', count: 1 });
-  });
-
-  it("increments the count when the same tool and args repeat", () => {
-    const first = trackToolCallStreak({ key: undefined, count: 0 }, "SLACK_FIND_CHANNELS", {
-      cursor: "a",
-    });
-    expect(trackToolCallStreak(first, "SLACK_FIND_CHANNELS", { cursor: "a" })).toMatchObject({
-      key: 'SLACK_FIND_CHANNELS:{"cursor":"a"}',
-      count: 2,
-    });
-  });
-
-  it("resets the streak when the same tool is called with different args", () => {
-    const first = trackToolCallStreak({ key: undefined, count: 0 }, "SLACK_FIND_CHANNELS", {
-      cursor: "a",
-    });
-    expect(trackToolCallStreak(first, "SLACK_FIND_CHANNELS", { cursor: "b" })).toMatchObject({
-      key: 'SLACK_FIND_CHANNELS:{"cursor":"b"}',
-      count: 1,
-    });
-  });
-
-  it("resets the streak when a different tool is called", () => {
-    const first = trackToolCallStreak({ key: undefined, count: 0 }, "SLACK_FIND_CHANNELS", {
-      cursor: "a",
-    });
-    expect(
-      trackToolCallStreak(first, "SLACK_FETCH_CONVERSATION_HISTORY", { cursor: "a" }),
-    ).toMatchObject({ key: 'SLACK_FETCH_CONVERSATION_HISTORY:{"cursor":"a"}', count: 1 });
-  });
-
-  it("counts calls whose text arguments differ only by digits as one similar streak", () => {
-    let streak = trackToolCallStreak({ key: undefined, count: 0 }, "shell", {
-      command: "echo noop-1",
-    });
-    streak = trackToolCallStreak(streak, "shell", { command: "echo noop-22" });
-    expect(streak).toMatchObject({ count: 1, shapeCount: 2 });
-    streak = trackToolCallStreak(streak, "shell", { command: "echo other-3" });
-    expect(streak).toMatchObject({ count: 1, shapeCount: 1 });
-  });
-
-  it("does not blank numbers that are not part of a text argument", () => {
-    let streak = trackToolCallStreak({ key: undefined, count: 0 }, "read_file", { offset: 1 });
-    streak = trackToolCallStreak(streak, "read_file", { offset: 2 });
-    expect(streak).toMatchObject({ count: 1, shapeCount: 1 });
   });
 });
 

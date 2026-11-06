@@ -11,6 +11,7 @@ const fakeAgentState = vi.hoisted(() => ({
     | "silent-continuation"
     | "subagent-limit"
     | "two-subagents"
+    | "two-looping-subagents"
     | "parent-limit"
     | "parent-parallel"
     | "ask-pause"
@@ -381,6 +382,29 @@ vi.mock("@earendil-works/pi-agent-core", () => ({
       }
 
       const delegation = this.tools.find((tool) => tool.name === "run_subagent");
+      if (delegation && fakeAgentState.mode === "two-looping-subagents") {
+        await Promise.all(
+          ["a", "b"].map((name) => {
+            const args = { name, task: `cat ${name}.log` };
+            this.emit({ type: "tool_execution_start", toolName: delegation.name, args });
+            return delegation.execute(`delegate-${name}`, args);
+          }),
+        );
+        return;
+      }
+      if (fakeAgentState.mode === "two-looping-subagents") {
+        // Helper "a" reads its log again on every response; "b" runs a new command each time.
+        const shell = this.tools.find((tool) => tool.name === "shell");
+        if (!shell) throw new Error("shell was not exposed to the subagent");
+        const task = prompt.split("\n").at(-1) ?? "";
+        for (let index = 0; index < 8; index += 1) {
+          const args = { command: task === "cat a.log" ? task : `ls b-${index}` };
+          this.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+          this.emit({ type: "tool_execution_start", toolName: shell.name, args });
+          await shell.execute(`shell-${index}`, args);
+        }
+        return;
+      }
       if (delegation && fakeAgentState.mode === "two-subagents") {
         await Promise.all(
           ["a", "b"].map((name) => {
@@ -2293,6 +2317,61 @@ describe("Pi connector tool dispatch", () => {
     expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: "abc" })).toBe(0);
     expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: "80" })).toBe(80);
     expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: " 12.9 " })).toBe(12);
+  });
+
+  it("tracks each helper's repeats on its own while helpers run side by side", async () => {
+    fakeAgentState.mode = "two-looping-subagents";
+    const executeTool = vi.fn(async (_name: string, _args: Record<string, unknown>) => ({
+      error: "permission denied",
+    }));
+    const runtime = new PiAgentRuntime();
+    const events: Array<Record<string, unknown>> = [];
+
+    for await (const event of runtime.run(
+      {
+        botId: "b",
+        threadId: "t",
+        runId: "looping-helpers",
+        prompt: "delegate twice",
+        instructions: "Use run_subagent.",
+        history: [],
+        tools: [
+          {
+            name: "run_subagent",
+            description: "Delegate work",
+            inputSchema: { type: "object", properties: {} },
+          },
+          shellTool,
+        ],
+        model: { provider: "test", id: "dispatch-test-model" },
+        executeTool,
+        allowSilentEmpty: true,
+      },
+      {
+        operationId: "2k",
+        traceId: "2k",
+        spaceId: "w",
+        userId: "u",
+        signal: new AbortController().signal,
+      },
+    )) {
+      events.push(event as Record<string, unknown>);
+    }
+
+    const shellCalls = events.filter((event) => event.type === "tool" && event.name === "shell");
+    const commands = shellCalls.map((event) => (event.args as { command: string }).command);
+    // In the shared queue, helper "a"'s repeats never come twice in a row.
+    expect(commands.slice(0, 4)).toEqual(["cat a.log", "ls b-0", "cat a.log", "ls b-1"]);
+    const ran = executeTool.mock.calls.map((call) => String(call[1].command));
+    // "a" ran twice, had its third and fourth call refused with a warning, and its fifth stuck.
+    expect(ran.filter((command) => command === "cat a.log")).toHaveLength(2);
+    expect(shellCalls.find((event) => event.stuck)).toMatchObject({
+      args: { command: "cat a.log" },
+      stuck: { tools: ["shell"], repeats: 5 },
+    });
+    // "b" kept going.
+    expect(ran.filter((command) => command.startsWith("ls b-"))).toHaveLength(8);
+    expect(shellCalls.filter((event) => event.stuck)).toHaveLength(4);
   });
 
   it("lets a parallel tool batch finish before the optional fuse aborts", async () => {
