@@ -543,6 +543,11 @@ function splitWhatsAppPart(body: string): string[] {
 /** WeChat truncates very long texts; keep each part well under its limit. */
 const WECHAT_PART_LIMIT = 3000;
 
+/** Longest text one send may carry when queued replies are joined into it (see messaging-delivery). */
+export function outboundPartLimit(provider: string): number {
+  return provider === "wechat" ? WECHAT_PART_LIMIT : Number.POSITIVE_INFINITY;
+}
+
 /** Split at a paragraph or line break when one falls in the second half of the window. */
 /**
  * A short chatty reply in two or three one-line paragraphs goes out as that many bubbles, the
@@ -566,7 +571,8 @@ export function wechatChatBubbles(body: string): string[] | undefined {
   // A tag-only paragraph joins the one before it, so it never costs a bubble of its own.
   const bubbles: string[] = [];
   for (const paragraph of paragraphs) {
-    if (sticker.test(paragraph) && bubbles.length > 0) bubbles[bubbles.length - 1] += ` ${paragraph}`;
+    if (sticker.test(paragraph) && bubbles.length > 0)
+      bubbles[bubbles.length - 1] += ` ${paragraph}`;
     else bubbles.push(paragraph);
   }
   return bubbles;

@@ -24,7 +24,7 @@ import {
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import { MessagingSendError } from "./chat-sdk-surface.js";
-import { splitOutboundBody } from "./messaging-platforms.js";
+import { outboundPartLimit, splitOutboundBody } from "./messaging-platforms.js";
 
 /**
  * Margin under vendor consecutive-outbound caps (sendblue enforces one hard):
@@ -32,6 +32,22 @@ import { splitOutboundBody } from "./messaging-platforms.js";
  * until the next inbound resets the counter.
  */
 export const MESSAGING_DM_OUTBOUND_CAP = 140;
+
+/**
+ * WeChat's iLink starts refusing or rate-limiting a bot after about ten messages per message
+ * from the owner. Eight leaves room for a sticker that rides along with a text.
+ */
+export const WECHAT_REPLY_BUDGET = 8;
+
+/** Interim lines leave this many sends for the reply: a short reply goes out as up to three bubbles. */
+const PROGRESS_RESERVE = 3;
+
+/** DMs a provider takes between two messages from the owner, when it limits them. */
+function outboundCap(provider: string): number | undefined {
+  if (provider === "sendblue") return MESSAGING_DM_OUTBOUND_CAP;
+  if (provider === "wechat") return WECHAT_REPLY_BUDGET;
+  return undefined;
+}
 
 /** Provider-send attempts before a mirrored row is declared lost. */
 export const MESSAGING_OUTBOUND_MAX_ATTEMPTS = 5;
@@ -109,7 +125,23 @@ export async function mirrorMessagingProgress(
   if (run?.trigger !== "messaging") return;
   const sourceBlocks = (run.sourceMessage?.blocks ?? []) as MessageBlock[];
   if (sourceBlocks.some((block) => block.kind === "channel_message")) return;
+  if (!(await progressFitsCap(deps, run.botId))) return;
   await mirrorRun(deps, runId);
+}
+
+/**
+ * Whether an interim line still leaves the reply room under the provider's cap. One held back
+ * here is not lost: the end-of-run mirror queues it ahead of the reply, and the last send
+ * allowed carries both.
+ */
+async function progressFitsCap(deps: MessagingDeliveryDeps, botId: string): Promise<boolean> {
+  const identity = await deps.prisma.messagingIdentity.findUnique({ where: { botId } });
+  const cap = identity ? outboundCap(identity.provider) : undefined;
+  if (!identity || cap === undefined) return true;
+  const queued = await deps.prisma.messagingOutbound.count({
+    where: { identityId: identity.id, status: "pending" },
+  });
+  return identity.outboundSinceInbound + queued + PROGRESS_RESERVE < cap;
 }
 
 async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<void> {
@@ -518,6 +550,7 @@ async function deliverRow(
 ): Promise<boolean> {
   let attachmentName: string | null = null;
   let accepted = false;
+  let folded: FoldedRows | null = null;
   try {
     if (row.kind === "group" || row.kind === "intro") {
       if (!row.threadId) {
@@ -548,12 +581,10 @@ async function deliverRow(
       });
       return true;
     }
-    // Sendblue's consecutive-outbound vendor cap; other providers have no
-    // equivalent limit, so do not hold Slack/WhatsApp/Telegram DMs.
-    if (
-      identity.provider === "sendblue" &&
-      identity.outboundSinceInbound >= MESSAGING_DM_OUTBOUND_CAP
-    ) {
+    // Vendor caps on sends between two owner messages (sendblue, WeChat); other providers
+    // have no equivalent limit, so do not hold Slack/WhatsApp/Telegram DMs.
+    const cap = outboundCap(identity.provider);
+    if (cap !== undefined && identity.outboundSinceInbound >= cap) {
       // Cap holds are not failures: release the claim back to pending.
       await deps.prisma.messagingOutbound.update({
         where: { id: row.id },
@@ -580,8 +611,11 @@ async function deliverRow(
       }
       return true;
     }
+    if (cap !== undefined && identity.outboundSinceInbound + 1 >= cap) {
+      folded = await foldQueuedRows(deps, identity, row);
+    }
     let attachment: MessagingOutboundAttachment | undefined;
-    const artifactId = fileArtifactId(row.idempotencyKey);
+    const artifactId = folded ? null : fileArtifactId(row.idempotencyKey);
     if (artifactId) {
       // Scoped to the identity's Space: the drain runs across every Space.
       const artifact = await deps.prisma.artifact.findFirst({
@@ -607,7 +641,7 @@ async function deliverRow(
     const sent = await deps.messaging.sendToThread(
       {
         threadId,
-        body: row.body,
+        body: folded?.body ?? row.body,
         idempotencyKey: row.idempotencyKey,
         ...(attachment ? { attachment } : {}),
       },
@@ -618,6 +652,19 @@ async function deliverRow(
       where: { id: row.id },
       data: { providerHandle: sent.handle },
     });
+    for (const id of folded?.textRowIds ?? []) {
+      await deps.prisma.messagingOutbound.updateMany({
+        where: { id },
+        data: { providerHandle: sent.handle },
+      });
+    }
+    // Named in the message instead of sent.
+    for (const id of folded?.fileRowIds ?? []) {
+      await deps.prisma.messagingOutbound.updateMany({
+        where: { id },
+        data: { status: "failed" },
+      });
+    }
     await deps.prisma.messagingIdentity.update({
       where: { id: identity.id },
       data: { outboundSinceInbound: { increment: 1 } },
@@ -628,6 +675,13 @@ async function deliverRow(
       // Keep the sent claim even if saving the handle or counter fails.
       getLogger().error("messaging outbound bookkeeping error", error);
       return true;
+    }
+    // The rows this send would have carried go back in line behind it.
+    for (const id of [...(folded?.textRowIds ?? []), ...(folded?.fileRowIds ?? [])]) {
+      await deps.prisma.messagingOutbound.updateMany({
+        where: { id, status: "sent" },
+        data: { status: "pending" },
+      });
     }
     // Transient provider errors go back to pending with a backed-off
     // retry (no sooner than the provider's retry-after); a permanent error
@@ -682,6 +736,68 @@ async function deliverRow(
     }
     return false;
   }
+}
+
+type FoldedRows = { body: string; textRowIds: string[]; fileRowIds: string[] };
+
+/**
+ * The last send a capped provider allows before the owner writes again carries the replies
+ * queued behind it: their text joined into one message, and their files named in a closing note
+ * instead of sent. Rows that would make the message too long, and approval invites, stay queued
+ * for the owner's next message. Null when nothing is queued behind the row.
+ */
+async function foldQueuedRows(
+  deps: MessagingDeliveryDeps,
+  identity: IdentityRow & { spaceId: string },
+  row: MessagingOutboundRow,
+): Promise<FoldedRows | null> {
+  const queued = await deps.prisma.messagingOutbound.findMany({
+    where: { identityId: identity.id, status: "pending", createdAt: { gt: row.createdAt } },
+    orderBy: { createdAt: "asc" },
+  });
+  if (queued.length === 0) return null;
+  const limit = outboundPartLimit(identity.provider);
+  const texts: string[] = [];
+  const files: string[] = [];
+  const textRowIds: string[] = [];
+  const fileRowIds: string[] = [];
+  const fileName = async (artifactId: string) =>
+    (
+      await deps.prisma.artifact.findFirst({
+        where: { id: artifactId, spaceId: identity.spaceId },
+        select: { name: true },
+      })
+    )?.name ?? "file";
+  const headFile = fileArtifactId(row.idempotencyKey);
+  if (headFile) files.push(await fileName(headFile));
+  else if (row.body) texts.push(row.body);
+  for (const next of queued) {
+    if (connectInvitePair(next.idempotencyKey)) break;
+    const artifactId = fileArtifactId(next.idempotencyKey);
+    if (!artifactId && foldedBody([...texts, next.body], files).length > limit) break;
+    // Claimed like any send, so a concurrent drain never delivers it a second time.
+    const claim = await deps.prisma.messagingOutbound.updateMany({
+      where: { id: next.id, status: "pending" },
+      data: { status: "sent", nextAttemptAt: null },
+    });
+    if (claim.count === 0) break;
+    if (artifactId) {
+      files.push(await fileName(artifactId));
+      fileRowIds.push(next.id);
+    } else {
+      if (next.body) texts.push(next.body);
+      textRowIds.push(next.id);
+    }
+  }
+  if (textRowIds.length === 0 && fileRowIds.length === 0) return null;
+  return { body: foldedBody(texts, files), textRowIds, fileRowIds };
+}
+
+function foldedBody(texts: string[], files: string[]): string {
+  const note = files.length
+    ? `Message limit reached, so these were not sent: ${files.map((name) => `"${name}"`).join(", ")}.`
+    : "";
+  return [...texts, note].filter(Boolean).join("\n\n");
 }
 
 /** A claimed row still without a handle after this long is treated as abandoned. */
