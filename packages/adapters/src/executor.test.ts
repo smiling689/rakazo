@@ -12,6 +12,7 @@ import type { PrismaClient } from "@rakazo/db";
 import { RunHistoryWriteError } from "@rakazo/db";
 import { createLogger, createTestSink, installLogger } from "@rakazo/logging";
 import { describe, expect, it, vi } from "vitest";
+import { batchedWindowStart } from "./batched-window.js";
 import { builtinAgentTools } from "./builtin-tools.js";
 import { createRunExecutor as createExecutor } from "./executor.js";
 import { UnavailableModelForAuthError, validateConnectedModelChoice } from "./model-selection.js";
@@ -42,7 +43,6 @@ import {
 } from "./run-tool-selection.js";
 import { historyMyChatsAllowed } from "./run-tools-memory.js";
 import {
-  imageWindowStart,
   loadCurrentTurnImages,
   missingTurnImagesInstruction,
   settleSteeringAttachmentLoads,
@@ -1078,9 +1078,9 @@ describe("image window", () => {
 
   it("moves its start in batches of half the turn limit", () => {
     const starts = Array.from({ length: 12 }, (_, count) =>
-      imageWindowStart(
-        Array.from({ length: count + 1 }, (_, turn) => ({ turn, bytes: 1 })),
-        { turns: 5, images: Number.POSITIVE_INFINITY, bytes: 100 },
+      batchedWindowStart(
+        Array.from({ length: count + 1 }, (_, turn) => ({ turn, size: 1 })),
+        { turns: 5, items: Number.POSITIVE_INFINITY, size: 100 },
       ),
     );
     expect(starts).toEqual([0, 0, 0, 0, 0, 3, 3, 3, 6, 6, 6, 9]);

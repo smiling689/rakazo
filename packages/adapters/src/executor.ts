@@ -1,4 +1,9 @@
-import type { AgentRunRequest, ComputerRef, SemanticMemoryProvider } from "@rakazo/adapter-kit";
+import type {
+  AgentRunRequest,
+  AgentTurnTranscript,
+  ComputerRef,
+  SemanticMemoryProvider,
+} from "@rakazo/adapter-kit";
 import {
   DEFAULT_CONTEXT_STRATEGY,
   isModelCredentialRejected,
@@ -93,6 +98,7 @@ import {
   persistLivePluginConnections,
   selectRunConnections,
 } from "./connection-context.js";
+import { redactConnectorPayload } from "./connector-safety.js";
 import { formatCurrentTimeInstruction } from "./current-time.js";
 import { resolveDeploymentModel } from "./deployment-model.js";
 import type { ExecutorDeps } from "./executor-deps.js";
@@ -249,6 +255,7 @@ import {
   loadPinnedContextState,
   planPinnedContext,
   recordTurnReplay,
+  recordTurnTranscript,
   replayPrefixKey,
   withSentTurns,
 } from "./turn-replay.js";
@@ -1948,8 +1955,16 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
         let replayedHistory = runtimeHistory;
         if (replaysTurn) {
           try {
+            // This bot's own replies and the runs that wrote them, whose tool work is replayed.
+            const replyRuns = new Map(
+              messages.flatMap((message) =>
+                message.role === "bot" && message.botId === bot.id && message.runId
+                  ? [[message.id, message.runId] as const]
+                  : [],
+              ),
+            );
             const [sent, state] = await Promise.all([
-              withSentTurns(deps.prisma, thread.id, bot.id, runtimeHistory),
+              withSentTurns(deps.prisma, thread.id, bot.id, runtimeHistory, replyRuns),
               loadPinnedContextState(deps.prisma, { threadId: thread.id, botId: bot.id, runId }),
             ]);
             const plan = planPinnedContext(
@@ -1975,6 +1990,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
               "run.id": runId,
               replayed: sent.replayed,
               missing: sent.missing,
+              transcripts: sent.transcripts,
               pinned: plan.record.pinned,
               noteBytes: plan.record.noteBytes,
             });
@@ -1984,6 +2000,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           }
         }
 
+        let finishedTranscript: AgentTurnTranscript | undefined;
         try {
           if (checkpointLoadError) throw checkpointLoadError;
           const runtimeEvents = deps.runtime.run(
@@ -2083,6 +2100,13 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
               },
               resumeFromCheckpoint: takeoverResume?.checkpoint,
               turnCheckpoint,
+              ...(replaysTurn
+                ? {
+                    onTranscript: (transcript: AgentTurnTranscript) => {
+                      finishedTranscript = transcript;
+                    },
+                  }
+                : {}),
               onCheckpoint: async (capture, executionId) => {
                 effects.pendingTurnCheckpoints.set(executionId, capture);
               },
@@ -2152,6 +2176,18 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           );
           if (await consumeRunEvents(ctx, runtimeEvents)) return;
           if (await interruptedByShutdown()) return;
+          // Stored before the reply completes, so the next turn already replays it.
+          if (finishedTranscript) {
+            const messages = redactConnectorPayload(finishedTranscript.messages, runSecrets);
+            // A lost transcript only costs later turns this run's tool work.
+            if (Array.isArray(messages))
+              await recordTurnTranscript(deps.prisma, runId, {
+                messages,
+                steeringMessageIds: finishedTranscript.steeringMessageIds,
+              }).catch((error) =>
+                getLogger().warn("turn transcript was not recorded", { runId, error }),
+              );
+          }
           await completeRun(ctx);
         } catch (turnError) {
           if (await interruptedByShutdown()) return;

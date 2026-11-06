@@ -562,6 +562,11 @@ export interface AgentRunRequest {
      * conversation stays a prefix of what the provider already cached.
      */
     sentText?: string;
+    /**
+     * On this bot's own reply: the transcript the run that wrote it recorded (`onTranscript`).
+     * Replayed in place of `content`, so the bot keeps the tool work behind earlier answers.
+     */
+    sentReply?: unknown[];
     /** Images attached to this message, hydrated only for recent user turns. */
     images?: AgentInputImage[];
   }>;
@@ -592,6 +597,8 @@ export interface AgentRunRequest {
   resumeFromCheckpoint?: string;
   /** Opaque runtime transcript, persisted only on the server. */
   turnCheckpoint?: string;
+  /** Called once when a fresh turn finishes without pausing, before its `done` event. */
+  onTranscript?: (transcript: AgentTurnTranscript) => void;
   /** Cheap per-call capture; serialize only when persisting that call’s human pause. */
   onCheckpoint?: (capture: () => string, executionId: string) => Promise<void>;
   /** Human answer or takeover outcome for the pending interaction. Never secret input. */
@@ -675,6 +682,14 @@ export interface ModelCallObserver {
   }): string | Promise<string>;
   afterCall(reservationId: string, usage: AgentUsage | null): void | Promise<void>;
   onRequestId?(reservationId: string, providerRequestId: string): void | Promise<void>;
+}
+
+/** What a finished turn added after its opening user turn, for later turns to replay. */
+export interface AgentTurnTranscript {
+  /** Runtime-owned, JSON-safe messages, handed back on the reply as history `sentReply`. */
+  messages: unknown[];
+  /** Messages sent while the bot worked that `messages` already carries. */
+  steeringMessageIds: string[];
 }
 
 export type AgentRuntimeEvent =

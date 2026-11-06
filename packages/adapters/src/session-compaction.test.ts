@@ -20,6 +20,8 @@ function harness(options: {
   minutesSinceLast: number;
   cursor?: number | null;
   flush?: { seq: number; status: string; minutesAgo?: number } | null;
+  /** Characters of reply text in the stored transcript of each bot message's run. */
+  transcriptChars?: number;
 }) {
   const thread = {
     id: "thread-1",
@@ -37,6 +39,7 @@ function harness(options: {
     seq,
     role: seq % 2 === 0 ? "user" : "bot",
     botId: seq % 2 === 0 ? null : "bot-1",
+    runId: seq % 2 === 0 ? null : `run-${seq}`,
     blocks: text(options.charsEach),
     createdAt: new Date(
       now.getTime() - (options.minutesSinceLast + options.messages - 1 - seq) * 60_000,
@@ -74,6 +77,24 @@ function harness(options: {
         ),
       ),
     },
+    turnReplay: {
+      findMany: vi.fn(async (args: { where: { runId: { in: string[] } } }) =>
+        options.transcriptChars
+          ? args.where.runId.in.map((runId) => ({
+              runId,
+              transcript: JSON.stringify({
+                messages: [
+                  {
+                    role: "assistant",
+                    content: [{ type: "text", text: "字".repeat(options.transcriptChars!) }],
+                  },
+                ],
+                steeringMessageIds: [],
+              }),
+            }))
+          : [],
+      ),
+    },
     $transaction: vi.fn(async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx)),
   };
   const deps = {
@@ -100,6 +121,23 @@ describe("compactSessionHistory", () => {
     await compactSessionHistory(check.deps as never, { threadId: "thread-1" }, now);
     expect(recent.runCreate).not.toHaveBeenCalled();
     expect(check.runCreate).not.toHaveBeenCalled();
+  });
+
+  it("counts the bot's replayed tool work toward the threshold", async () => {
+    // The same 30k tokens of messages, plus about 7k tokens of replayed work per reply.
+    const h = harness({
+      messages: 30,
+      charsEach: 1_000,
+      minutesSinceLast: 90,
+      transcriptChars: 6_000,
+    });
+    await compactSessionHistory(h.deps as never, { threadId: "thread-1" }, now);
+    expect(h.deps.prisma.turnReplay.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ threadId: "thread-1", botId: "bot-1" }),
+      }),
+    );
+    expect(h.runCreate).toHaveBeenCalled();
   });
 
   it("queues a silent memory flush first when an idle history passes the floor", async () => {

@@ -385,7 +385,10 @@ export function createRuntimeContextPolicy(
         options.imageTokens,
       ) <= shortHistoryAllowance;
     if (useSnapshots && !retainShortHistory) {
-      const old = historical.slice(0, Math.max(0, historical.length - 8));
+      // Recent history never starts on a tool result: its call must come with it.
+      let recentStart = Math.max(0, historical.length - 8);
+      while (recentStart > 0 && historical[recentStart]?.role === "toolResult") recentStart -= 1;
+      const old = historical.slice(0, recentStart);
       let catalog = "";
       const maximum = Math.min(
         8192,
@@ -394,13 +397,13 @@ export function createRuntimeContextPolicy(
       catalogIds = [];
       for (const message of old.slice(-64).reverse()) {
         const stored = original(message);
-        if (!stored?.id) continue;
+        // A replayed turn's messages all point at the one reply they stand for.
+        if (!stored?.id || catalogIds.includes(stored.id)) continue;
         const entry = `[message ${stored.id}${stored.createdAt ? ` at ${stored.createdAt}` : ""}; ${stored.speaker ?? stored.role}] ${snapshot(stored.content)}\n`;
         if (Buffer.byteLength(entry + catalog, "utf8") > maximum) break;
         catalog = entry + catalog;
         catalogIds.unshift(stored.id);
       }
-      const recentStart = Math.max(0, historical.length - 8);
       const earlierSystem = historical
         .slice(0, recentStart)
         .filter((message) => message.role === "system");
@@ -411,7 +414,7 @@ export function createRuntimeContextPolicy(
       ];
       protectedIndexes = messages.flatMap((message, index) =>
         message.role === "system" ||
-        (index >= earlierSystem.length + Math.min(8, historical.length) && message.role === "user")
+        (index >= earlierSystem.length + historical.length - recentStart && message.role === "user")
           ? [index]
           : [],
       );

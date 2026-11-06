@@ -82,7 +82,7 @@ const TABLES: TableSpec[] = [
     writePlaintext: (id, value) =>
       Prisma.sql`UPDATE memory_revisions SET content = ${value as string} WHERE id = ${id}`,
   },
-  ...(["text", "context"] as const).map(
+  ...(["text", "context", "transcript"] as const).map(
     (column): TableSpec => ({
       model: "TurnReplay",
       delegate: "turnReplay",
@@ -356,7 +356,7 @@ export async function contentEncryptionStatus(
       count(*) FILTER (WHERE "historyCompactionSummary" NOT LIKE 'rkz1:%') FROM threads
     UNION ALL
     SELECT 'turn_replays', count(*), count(*) FILTER (WHERE text NOT LIKE 'rkz1:%'
-      OR context NOT LIKE 'rkz1:%') FROM turn_replays
+      OR context NOT LIKE 'rkz1:%' OR transcript NOT LIKE 'rkz1:%') FROM turn_replays
   `;
   const keys = await prisma.spaceKey.groupBy({ by: ["masterKeyId"], _count: { _all: true } });
   return {
