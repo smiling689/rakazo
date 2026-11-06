@@ -27,6 +27,19 @@ export function historyMyChatsAllowed(
   );
 }
 
+/**
+ * GPT fills optional fields it does not use with "" or null (`botId: ""`,
+ * `linkedRunId: ""`), and every such call failed validation (fork, 2026-11-06). No history
+ * field means anything when blank, so blank fields count as not given.
+ */
+export function withoutBlankFields(args: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(args).filter(
+      ([, value]) => value !== null && !(typeof value === "string" && !value.trim()),
+    ),
+  );
+}
+
 async function readHistoryTool(ctx: RunContext, call: ToolCall) {
   const { deps, run } = ctx;
   const { name, args } = call;
@@ -56,12 +69,13 @@ async function readHistoryTool(ctx: RunContext, call: ToolCall) {
         .join("; ")}. Received fields: ${Object.keys(args).join(", ") || "none"}.`,
     });
   let response: Awaited<ReturnType<typeof searchHistory | typeof readHistory>>;
+  const given = withoutBlankFields(args);
   if (name === "search_history") {
-    const parsed = HistorySearchInputSchema.safeParse(args);
+    const parsed = HistorySearchInputSchema.safeParse(given);
     if (!parsed.success) return invalid(parsed.error);
     response = await searchHistory(deps.prisma, scope, parsed.data);
   } else {
-    const parsed = HistoryReadInputSchema.safeParse(args);
+    const parsed = HistoryReadInputSchema.safeParse(given);
     if (!parsed.success) return invalid(parsed.error);
     response = await readHistory(deps.prisma, scope, parsed.data);
   }
