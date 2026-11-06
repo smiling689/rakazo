@@ -1,10 +1,11 @@
-import { DEFAULT_MODEL_MAX_TOKENS } from "@rakazo/contracts";
+import { DEFAULT_MODEL_CONTEXT_WINDOW, DEFAULT_MODEL_MAX_TOKENS } from "@rakazo/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   billedPromptTokens,
   clipToolResultContent,
   clipToolResultText,
   effectiveOutputReserve,
+  MAX_TOOL_RESULT_TEXT_LIMIT,
   MODEL_CONNECT_TIMEOUT_MS,
   MODEL_STREAM_IDLE_TIMEOUT_MS,
   MODEL_STREAM_TIMEOUT_MS,
@@ -16,6 +17,7 @@ import {
   REASONING_MODEL_MAX_TOKENS,
   resolveCompletionMaxTokens,
   TOOL_RESULT_TEXT_LIMIT,
+  toolResultTextLimit,
 } from "./pi-runtime-limits.js";
 
 describe("modelStreamMaxRetries", () => {
@@ -200,6 +202,22 @@ describe("resolveCompletionMaxTokens", () => {
     expect(resolveCompletionMaxTokens(128_000, 8_192, undefined, true)).toBe(8_192);
     expect(resolveCompletionMaxTokens(128_000, undefined, undefined, false)).toBe(
       DEFAULT_MODEL_MAX_TOKENS,
+    );
+  });
+});
+
+describe("toolResultTextLimit", () => {
+  it("scales with the window between the floor and the ceiling", () => {
+    expect(toolResultTextLimit(undefined, false)).toBe(TOOL_RESULT_TEXT_LIMIT);
+    expect(toolResultTextLimit(16_384, false)).toBe(TOOL_RESULT_TEXT_LIMIT);
+    expect(toolResultTextLimit(128_000, false)).toBe(25_600);
+    expect(toolResultTextLimit(1_000_000, false)).toBe(MAX_TOOL_RESULT_TEXT_LIMIT);
+  });
+
+  it("keeps the floor for the fallback window unless the connection sets it", () => {
+    expect(toolResultTextLimit(DEFAULT_MODEL_CONTEXT_WINDOW, false)).toBe(TOOL_RESULT_TEXT_LIMIT);
+    expect(toolResultTextLimit(DEFAULT_MODEL_CONTEXT_WINDOW, true)).toBe(
+      MAX_TOOL_RESULT_TEXT_LIMIT,
     );
   });
 });
