@@ -193,6 +193,7 @@ import {
   retryRoutineRun,
   wakeRoutine,
 } from "./run-routines.js";
+import { createToolResultFiles, toolResultFilesAllowed } from "./run-tool-result-files.js";
 import {
   BUILTIN_AGENT_TOOL_NAMES,
   followUpsOffered,
@@ -1173,6 +1174,14 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           context.signal,
         );
         const pendingTurnFiles: MessageBlock[][] = [turnBlocks ?? []];
+        const toolResultFiles = createToolResultFiles({
+          sandbox: deps.sandbox,
+          context,
+          computerMode,
+          botId: bot.id,
+          secrets: runSecrets,
+          ready: () => runComputer.ready,
+        });
         let copyingTurnFiles = Promise.resolve();
         // Serialize copies before each tool, including attachments received while a boot is in flight.
         const getRunComputer = async (reason: "tool" | "takeover" | "script", tool?: string) => {
@@ -1209,6 +1218,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
                   }
                 });
               await copyingTurnFiles;
+              await toolResultFiles.flush(computer);
               return computer;
             },
           );
@@ -2087,6 +2097,16 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
                     resolveConnectedModel(run, provider, modelId, (values) =>
                       runSecrets.push(...values),
                     ),
+              saveToolResult:
+                !scripted &&
+                toolResultFilesAllowed({
+                  computerKind,
+                  shellOffered:
+                    tools.some((tool) => tool.name === "shell") &&
+                    !disabledBuiltinTools.has("shell"),
+                })
+                  ? toolResultFiles.save
+                  : undefined,
               onToolCompleted: (completion) => {
                 if (effects.restoredPending?.executionId === completion.executionId)
                   effects.restoredPending = undefined;

@@ -1,5 +1,5 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { DEFAULT_MODEL_MAX_TOKENS } from "@rakazo/contracts";
+import { DEFAULT_MODEL_CONTEXT_WINDOW, DEFAULT_MODEL_MAX_TOKENS } from "@rakazo/contracts";
 import { LOCAL_PROVIDER_ID } from "./pi-local-provider-id.js";
 
 /** Per-attempt wait for response headers; this does not cap active streaming duration. */
@@ -44,6 +44,27 @@ export function modelStreamIdleTimeoutMs(): number {
 }
 
 export const TOOL_RESULT_TEXT_LIMIT = 12_000;
+/** Even a very large window gets no more of one result, which every later step sends again. */
+export const MAX_TOOL_RESULT_TEXT_LIMIT = 32_000;
+
+/**
+ * The characters of one tool result the model sees: about 5% of its window at four characters a
+ * token, from TOOL_RESULT_TEXT_LIMIT to MAX_TOOL_RESULT_TEXT_LIMIT. An endpoint that reports no
+ * window gets the shared fallback, which is a guess, so it keeps the floor unless the connection
+ * sets the window.
+ */
+export function toolResultTextLimit(contextWindow: number | undefined, configured: boolean) {
+  if (
+    contextWindow === undefined ||
+    !Number.isFinite(contextWindow) ||
+    (contextWindow === DEFAULT_MODEL_CONTEXT_WINDOW && !configured)
+  )
+    return TOOL_RESULT_TEXT_LIMIT;
+  return Math.min(
+    MAX_TOOL_RESULT_TEXT_LIMIT,
+    Math.max(TOOL_RESULT_TEXT_LIMIT, Math.floor(contextWindow / 5)),
+  );
+}
 
 export function clipToolResultText(text: string, limit: number = TOOL_RESULT_TEXT_LIMIT): string {
   return text.length > limit ? `${text.slice(0, limit)}…` : text;

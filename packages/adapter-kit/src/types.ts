@@ -610,6 +610,16 @@ export interface AgentRunRequest {
     route?: ConnectorRoute,
     observer?: AgentToolExecutionObserver,
   ) => Promise<unknown>;
+  /**
+   * Keep the whole text of a tool result too long for the model to see whole, redacted like
+   * everything the run stores. Resolves to a path the bot's shell can read it from, or undefined
+   * when this run cannot keep it.
+   */
+  saveToolResult?: (result: {
+    name: string;
+    executionId: string;
+    text: string;
+  }) => Promise<string | undefined>;
   /** Called after a tool returns; implementations must not persist raw result contents. */
   onToolCompleted?: (completion: AgentToolCompletion) => Promise<void> | void;
   /** Atomically claim durable user steering at the runtime's next safe turn boundary. */

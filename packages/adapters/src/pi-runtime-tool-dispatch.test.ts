@@ -502,6 +502,7 @@ import {
   OWNER_SETTINGS_REFUSAL_REPLY,
   terminatingToolResult,
 } from "./approval-effect.js";
+import { shortenToolResultText } from "./context-selection.js";
 import { MISSING_TOOL_FINAL_RESPONSE_ERROR, PiAgentRuntime } from "./pi-runtime.js";
 import { providerFailureText } from "./pi-runtime-errors.js";
 import { TOOL_RESULT_TEXT_LIMIT } from "./pi-runtime-limits.js";
@@ -2682,6 +2683,122 @@ describe("Pi connector tool dispatch", () => {
     expect(result.content[0]).toEqual({ type: "text", text: first });
     expect(result.content[1]).toEqual(image);
     expect(result.content[2]).toEqual({ type: "text", text: "bbbbb…" });
+  });
+
+  async function runLongResult(
+    invoke: { name: string; args: Record<string, unknown> },
+    toolResult: unknown,
+    saveToolResult?: (result: {
+      name: string;
+      executionId: string;
+      text: string;
+    }) => Promise<string | undefined>,
+    extra: Partial<Parameters<PiAgentRuntime["run"]>[0]> = {},
+  ) {
+    fakeAgentState.invoke = invoke;
+    const runtime = new PiAgentRuntime();
+    for await (const _event of runtime.run(
+      {
+        botId: "b",
+        threadId: "t",
+        runId: `long-${invoke.name}`,
+        prompt: "read it",
+        instructions: "Read the result.",
+        history: [],
+        tools: [
+          {
+            name: invoke.name,
+            description: "Read something long",
+            inputSchema: { type: "object", properties: {} },
+          },
+        ],
+        model: { provider: "test", id: "dispatch-test-model" },
+        executeTool: vi.fn(async () => toolResult),
+        ...(saveToolResult ? { saveToolResult } : {}),
+        ...extra,
+      },
+      {
+        operationId: "long",
+        traceId: "long",
+        spaceId: "w",
+        userId: "u",
+        signal: new AbortController().signal,
+      },
+    )) {
+      // Exhaust so the fake agent executes the tool.
+    }
+    return fakeAgentState.toolResult as { content: Array<{ type: string; text: string }> };
+  }
+
+  it("saves a result too long to show and names the file before the shortened result", async () => {
+    const body = Array.from({ length: 3_000 }, (_, line) => `line ${line} of the mail`).join("\n");
+    const mail = { content: [{ type: "text", text: body }] };
+    const saveToolResult = vi.fn(async () => ".cache/tool-results/mail_read-abc.txt");
+
+    const result = await runLongResult({ name: "mail_read", args: {} }, mail, saveToolResult);
+
+    expect(saveToolResult).toHaveBeenCalledWith({
+      name: "mail_read",
+      executionId: expect.any(String),
+      // An MCP text part is saved as its own text, so line tools see the mail's lines.
+      text: body,
+    });
+    expect(result.content).toHaveLength(2);
+    expect(result.content[0]!.text).toContain(".cache/tool-results/mail_read-abc.txt");
+    expect(result.content[1]!.text).toContain("line 0 of the mail");
+    expect(result.content[1]!.text).toContain("line 2999 of the mail");
+    expect(result.content[1]!.text).not.toContain("line 1500 of the mail");
+    const shown = result.content.reduce((sum, part) => sum + part.text.length, 0);
+    expect(shown).toBeLessThanOrEqual(TOOL_RESULT_TEXT_LIMIT + 1);
+    // Shortening the result once it is older keeps the head, and with it the path.
+    const older = shortenToolResultText(
+      result.content.map((part) => part.text).join("\n"),
+      1_024,
+      { name: "mail_read" },
+      { afterUse: true },
+    );
+    expect(older).toContain(".cache/tool-results/mail_read-abc.txt");
+  });
+
+  it("keeps the shortened result alone when the run cannot save it", async () => {
+    const long = { rows: Array.from({ length: 2_000 }, (_, id) => ({ id, name: `row ${id}` })) };
+
+    const unsaved = await runLongResult(
+      { name: "list_rows", args: {} },
+      long,
+      vi.fn(async () => undefined),
+    );
+    expect(unsaved.content).toHaveLength(1);
+    expect(unsaved.content[0]!.text).not.toContain("Full result saved at");
+
+    const failed = await runLongResult(
+      { name: "list_rows", args: {} },
+      long,
+      vi.fn(async () => {
+        throw new Error("disk full");
+      }),
+    );
+    expect(failed.content).toHaveLength(1);
+  });
+
+  it("does not save short results, workspace file reads, or results kept whole", async () => {
+    const saveToolResult = vi.fn(async () => ".cache/tool-results/x.txt");
+    await runLongResult({ name: "list_rows", args: {} }, { rows: [1, 2, 3] }, saveToolResult);
+    await runLongResult(
+      { name: "read_file", args: {} },
+      { path: "notes.txt", content: "x".repeat(40_000) },
+      saveToolResult,
+    );
+    const whole = { content: [{ type: "text", text: "y".repeat(40_000) }] };
+    const verbatim = await runLongResult(
+      { name: "mcp__docs__read", args: {} },
+      whole,
+      saveToolResult,
+      { verbatimMcpServers: { ids: [], slugs: ["docs"] } },
+    );
+
+    expect(saveToolResult).not.toHaveBeenCalled();
+    expect(JSON.parse(verbatim.content[0]!.text)).toEqual(whole);
   });
 
   it("delivers a skill read larger than the tool result bound verbatim", async () => {

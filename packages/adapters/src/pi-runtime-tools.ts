@@ -28,7 +28,12 @@ import { shortenToolResultText } from "./context-selection.js";
 import type { PiAgentRuntimeOptions } from "./pi-runtime.js";
 import { COMPUTER_MODE_TOOLS } from "./pi-runtime-computer-mode.js";
 import { sanitizeSensitiveText } from "./pi-runtime-errors.js";
-import { clipToolResultContent, clipToolResultText } from "./pi-runtime-limits.js";
+import {
+  clipToolResultContent,
+  clipToolResultText,
+  TOOL_RESULT_TEXT_LIMIT,
+  toolResultTextLimit,
+} from "./pi-runtime-limits.js";
 import type { RuntimeModelTarget } from "./pi-runtime-models.js";
 import { executeSubagent } from "./pi-runtime-subagent.js";
 import { parametersFor, prepareFleetArguments } from "./pi-runtime-tool-parameters.js";
@@ -448,6 +453,10 @@ function toAgentTool(
           const keepToolResultWhole = (name: string, callArgs: Record<string, unknown>) =>
             VERBATIM_TOOL_RESULTS.has(name) ||
             isVerbatimMcpResult(name, callArgs, host.request.verbatimMcpServers);
+          const textLimit = toolResultTextLimit(
+            host.activeModel.model.contextWindow,
+            host.activeModel.config.contextWindow !== undefined,
+          );
           recordPiTelemetryContent(span, "pi.agent.tool.arguments", args);
           const rawCallId =
             toolCallId || `${host.request.runId}:${tool.name}:${host.toolCallSeq.value++}`;
@@ -607,10 +616,19 @@ function toAgentTool(
                   if (isToolPauseResult(result)) host.pausePending = true;
                   return keepToolResultWhole(tool.name, args)
                     ? result
-                    : boundAgentToolResult(result);
+                    : boundAgentToolResult(result, textLimit);
                 }
                 return {
-                  content: [
+                  content: (keepToolResultWhole(tool.name, args)
+                    ? undefined
+                    : await savedToolResultContent(
+                        host,
+                        tool.name,
+                        args,
+                        executionId,
+                        result,
+                        textLimit,
+                      )) ?? [
                     {
                       type: "text",
                       text: serializeToolResult(
@@ -619,6 +637,7 @@ function toAgentTool(
                         tool.name,
                         args,
                         host.request.verbatimMcpServers,
+                        textLimit,
                       ),
                     },
                   ],
@@ -636,7 +655,7 @@ function toAgentTool(
               };
             })();
             if (keepToolResultWhole(tool.name, args)) return result as AgentToolResult<unknown>;
-            return boundAgentToolResult(result as AgentToolResult<unknown>);
+            return boundAgentToolResult(result as AgentToolResult<unknown>, textLimit);
           } catch (error) {
             failure = error;
             throw error;
@@ -706,30 +725,125 @@ export function serializeToolResult(
   name: string,
   args: Record<string, unknown>,
   verbatimMcpServers?: AgentRunRequest["verbatimMcpServers"],
+  limit: number = TOOL_RESULT_TEXT_LIMIT,
 ) {
   try {
     const text = JSON.stringify(result);
     if (!text) return "ok";
     // skill-tools.ts already bounds skill content; the context budget selector may still shorten it.
     if (
-      text.length <= 12_000 ||
+      text.length <= limit ||
       VERBATIM_TOOL_RESULTS.has(name) ||
       isVerbatimMcpResult(name, args, verbatimMcpServers)
     )
       return text;
-    return (strategy ?? DEFAULT_CONTEXT_STRATEGY) === "current"
-      ? clipToolResultText(text)
-      : shortenToolResultText(text, 12_000, { name, arguments: args });
+    return shortenSerializedResult(text, strategy, name, args, limit);
   } catch {
     return "ok";
   }
 }
 
-function boundAgentToolResult<T>(result: AgentToolResult<T>): AgentToolResult<T> {
+function shortenSerializedResult(
+  text: string,
+  strategy: AgentRunRequest["contextStrategy"],
+  name: string,
+  args: Record<string, unknown>,
+  limit: number,
+) {
+  return (strategy ?? DEFAULT_CONTEXT_STRATEGY) === "current"
+    ? clipToolResultText(text, limit)
+    : shortenToolResultText(text, limit, { name, arguments: args });
+}
+
+/**
+ * A result too long to show whole is saved where the bot's shell can read it, and the model sees
+ * the shortened result after a note naming the file. Undefined keeps the shortened result alone:
+ * the run cannot save it, or the result is a workspace file already (read_file), which saving
+ * again would only copy.
+ */
+async function savedToolResultContent(
+  host: ToolHost,
+  name: string,
+  args: Record<string, unknown>,
+  executionId: string,
+  result: unknown,
+  limit: number,
+): Promise<Array<{ type: "text"; text: string }> | undefined> {
+  const save = host.request.saveToolResult;
+  if (!save || name === "read_file") return undefined;
+  let text: string | undefined;
+  try {
+    text = JSON.stringify(result);
+  } catch {
+    return undefined;
+  }
+  if (!text || text.length <= limit) return undefined;
+  let saved: string | undefined;
+  try {
+    saved = await save({ name, executionId, text: toolResultFileText(result) });
+  } catch {
+    saved = undefined;
+  }
+  if (!saved) return undefined;
+  const note = savedToolResultNote(saved);
+  return [
+    { type: "text", text: note },
+    {
+      type: "text",
+      text: shortenSerializedResult(
+        text,
+        host.request.contextStrategy,
+        name,
+        args,
+        Math.max(1_000, limit - note.length),
+      ),
+    },
+  ];
+}
+
+// Kept short with the path first: shortening an older result keeps its head, so the path survives.
+function savedToolResultNote(path: string) {
+  return `Shortened below. Full result saved at ${path}; read parts of it with the shell (grep -n 'word' <file>, sed -n '40,120p' <file>, tail -c +10001 <file> | head -c 10000).`;
+}
+
+/**
+ * The saved copy is laid out for line tools: indented JSON, with an MCP result's text parts
+ * written as their own text so a document or mail body keeps its line breaks.
+ */
+function toolResultFileText(result: unknown): string {
+  const parts = (result as { content?: unknown } | null)?.content;
+  if (
+    result &&
+    typeof result === "object" &&
+    !("structuredContent" in result) &&
+    Array.isArray(parts) &&
+    parts.length > 0 &&
+    parts.every(
+      (part) =>
+        part &&
+        typeof part === "object" &&
+        (part as { type?: unknown }).type === "text" &&
+        typeof (part as { text?: unknown }).text === "string",
+    )
+  ) {
+    return (parts as Array<{ text: string }>)
+      .map(({ text }) => {
+        try {
+          return JSON.stringify(JSON.parse(text), null, 2);
+        } catch {
+          return text;
+        }
+      })
+      .join("\n\n");
+  }
+  return JSON.stringify(result, null, 2);
+}
+
+function boundAgentToolResult<T>(result: AgentToolResult<T>, limit: number): AgentToolResult<T> {
   if (!result || !Array.isArray(result.content)) return result;
   return {
     ...result,
-    content: clipToolResultContent(result.content),
+    content: clipToolResultContent(result.content, limit),
   };
 }
 
