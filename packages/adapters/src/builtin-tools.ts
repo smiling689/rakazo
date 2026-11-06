@@ -1833,6 +1833,28 @@ export const builtinAgentTools: ConnectorTool[] = [
     },
   },
   {
+    name: "update_default_models",
+    description:
+      "Read or change the user's default model, which their bots run unless a bot has its own, that model's thinking level, and the ordered backups tried when a model fails or is busy. Call with no fields to read them; pass only what the user asked to change. Use exact model ids.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        primary: { type: "string", description: "The new default model." },
+        thinking_level: {
+          type: "string",
+          description: "Thinking level of the default model, or default for the model's own.",
+        },
+        backups: {
+          type: "array",
+          items: { type: "string" },
+          description: "The whole backup list in order; it replaces the current one.",
+        },
+        clear_backups: { type: "boolean", description: "true removes every backup." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "update_preferences",
     description:
       "Read or change the user's own account preferences: timezone and Rakazo marketing emails. Change them only when the user asks. Call with no fields to read the current values. Email, password, sign-in, billing and account deletion are only in the app's settings.",
