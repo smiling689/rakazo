@@ -47,8 +47,11 @@ export interface ToolCallBudget {
   limit: number;
   inFlight: number;
 }
-// Optional fuse is process-local. continueRun on another worker starts at zero.
+// The fuse is process-local. continueRun on another worker starts at zero.
 const toolCallBudgetsByRun = new Map<string, ToolCallBudget>();
+// Paused and stopped runs keep their count for a continuation that may never come here, so the
+// oldest are dropped past this many; a dropped run that does continue starts at zero.
+const MAX_KEPT_TOOL_CALL_BUDGETS = 1_000;
 
 // Pi forwards these names to OpenAI Responses, whose function-name contract is
 // ^[a-zA-Z0-9_-]+$ with a maximum length of 64 characters.
@@ -56,13 +59,19 @@ const AGENT_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const MAX_AGENT_TOOL_NAME_LENGTH = 64;
 const FALLBACK_AGENT_TOOL_NAME = "connector_tool";
 
-/** Optional self-host fuse. Unset, empty, or 0 means unlimited (default). */
+/**
+ * Ends a runaway turn that keeps making different calls, which the repeat guard cannot see. The
+ * count includes helpers' calls; 300 leaves a long task room while a turn that would otherwise
+ * run for hours stops. Self-hosts can change it; 0 means unlimited.
+ */
+export const DEFAULT_MAX_TOOL_CALLS_PER_TURN = 300;
+
 export function maxToolCallsPerTurn(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.MAX_TOOL_CALLS_PER_TURN?.trim();
-  if (!raw) return 0;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
-  return Math.floor(parsed);
+  const parsed = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0
+    ? Math.floor(parsed)
+    : DEFAULT_MAX_TOOL_CALLS_PER_TURN;
 }
 
 export function toAgentTools(
@@ -797,6 +806,9 @@ export function toolCallBudgetFor(runId: string): ToolCallBudget {
     inFlight: 0,
   };
   if (budget.limit > 0) toolCallBudgetsByRun.set(runId, budget);
+  if (toolCallBudgetsByRun.size > MAX_KEPT_TOOL_CALL_BUDGETS) {
+    toolCallBudgetsByRun.delete(toolCallBudgetsByRun.keys().next().value!);
+  }
   return budget;
 }
 

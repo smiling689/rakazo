@@ -505,7 +505,7 @@ import {
 import { MISSING_TOOL_FINAL_RESPONSE_ERROR, PiAgentRuntime } from "./pi-runtime.js";
 import { providerFailureText } from "./pi-runtime-errors.js";
 import { TOOL_RESULT_TEXT_LIMIT } from "./pi-runtime-limits.js";
-import { maxToolCallsPerTurn } from "./pi-runtime-tools.js";
+import { DEFAULT_MAX_TOOL_CALLS_PER_TURN, maxToolCallsPerTurn } from "./pi-runtime-tools.js";
 import { toolCompletionAuditPayload } from "./tool-completion-audit.js";
 import { serializeTurnCheckpoint } from "./turn-checkpoint.js";
 import { midTaskMessageFromPrompt, midTaskMessagePrompt } from "./user-progress.js";
@@ -1948,7 +1948,7 @@ describe("Pi connector tool dispatch", () => {
     });
   });
 
-  it("allows more than 80 tool calls by default when no fuse is configured", async () => {
+  it("allows a hundred tool calls under the default fuse", async () => {
     fakeAgentState.mode = "parent-limit";
     const executeTool = vi.fn(async () => ({ ok: true }));
     const runtime = new PiAgentRuntime();
@@ -2309,12 +2309,18 @@ describe("Pi connector tool dispatch", () => {
     expect(second.at(-1)).toEqual({ type: "done", text: stopText });
   });
 
-  it("treats unset, empty, and non-positive MAX_TOOL_CALLS_PER_TURN as unlimited", () => {
-    expect(maxToolCallsPerTurn({})).toBe(0);
-    expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: "" })).toBe(0);
+  it("caps a turn at the default unless MAX_TOOL_CALLS_PER_TURN sets a number, where 0 is unlimited", () => {
+    expect(maxToolCallsPerTurn({})).toBe(DEFAULT_MAX_TOOL_CALLS_PER_TURN);
+    expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: "" })).toBe(
+      DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+    );
+    expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: "-5" })).toBe(
+      DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+    );
+    expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: "abc" })).toBe(
+      DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+    );
     expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: "0" })).toBe(0);
-    expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: "-5" })).toBe(0);
-    expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: "abc" })).toBe(0);
     expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: "80" })).toBe(80);
     expect(maxToolCallsPerTurn({ MAX_TOOL_CALLS_PER_TURN: " 12.9 " })).toBe(12);
   });
