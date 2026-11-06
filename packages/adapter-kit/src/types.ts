@@ -555,6 +555,12 @@ export interface AgentRunRequest {
      * message to the model as a user turn that starts with "[speaker]: ". Never a real person's name.
      */
     speaker?: string;
+    /**
+     * The whole user turn as an earlier run of this bot sent it for this message, label and
+     * per-turn context included. Replayed verbatim in place of `content` and `speaker`, so the
+     * conversation stays a prefix of what the provider already cached.
+     */
+    sentText?: string;
     /** Images attached to this message, hydrated only for recent user turns. */
     images?: AgentInputImage[];
   }>;

@@ -33,7 +33,7 @@ import {
 } from "./approval-effect.js";
 import { automated, withAutomatedLabels } from "./automated-messages.js";
 import { withCloudflareAuth } from "./cloudflare-ai-gateway.js";
-import { neutralizeSpeakerLabels } from "./history-speakers.js";
+import { neutralizeSpeakerLabels, speakerText } from "./history-speakers.js";
 import { estimatePiImageTokens } from "./pi-image-context.js";
 import {
   COMPUTER_MODE_TOOLS,
@@ -1277,15 +1277,12 @@ type HistoryMessage = Message & {
 };
 
 /** What the model reads for a message by someone other than this bot or the human of a direct chat. */
-function speakerText(speaker: string, text: string): string {
-  return `[${speaker}]: ${neutralizeSpeakerLabels(text)}`;
-}
-
 /**
  * Replays stored messages with their real roles. This bot's own replies are assistant turns;
  * a message with a `speaker` (another bot, or the human in a group) is a user turn that starts
  * with "[speaker]: ". The label exists only here: it is never stored or shown in the app.
- * Content is a pure function of the message, so replayed history is stable for prompt caching.
+ * Content is a pure function of the message, or the exact text an earlier run sent for it, so
+ * replayed history is stable for prompt caching.
  */
 function toHistory(
   history: AgentRunRequest["history"],
@@ -1331,7 +1328,7 @@ function toHistory(
           },
         ];
       }
-      const text = m.speaker ? speakerText(m.speaker, m.content) : m.content;
+      const text = m.sentText ?? (m.speaker ? speakerText(m.speaker, m.content) : m.content);
       // Pictures ride on the human's turn only, never on a bot's.
       const images = m.role === "assistant" ? [] : toPiImages(m.images);
       return [

@@ -433,6 +433,7 @@ model Space {
   botDeletions                BotDeletion[]
   threads                     Thread[]
   events                      Event[]
+  turnReplays                 TurnReplay[]
   tasks                       Task[]
   runs                        Run[]
   routines                    Routine[]
@@ -780,6 +781,7 @@ model Bot {
   tasks             Task[]
   runs              Run[]
   steeringMessages  SteeringMessage[]
+  turnReplays       TurnReplay[]
   mcpServers        BotMcpServer[]
   agentImports      AgentImport[]
   groupMembers      ChatGroupMember[]
@@ -893,6 +895,7 @@ model Thread {
   tasks                       Task[]
   runs                        Run[]
   routines                    Routine[]
+  turnReplays                 TurnReplay[]
 
   @@index([spaceId])
   @@index([spaceId, userId])
@@ -928,6 +931,38 @@ model Message {
   @@index([runId, seq])
   @@index([searchTokens], type: Gin)
   @@map("messages")
+}
+
+/// What one run of a bot sent the model, so later turns replay it byte for byte and the
+/// provider's prompt cache keeps matching. Sealed like messages; deleted with the thread.
+model TurnReplay {
+  id        String   @id @default(cuid())
+  spaceId   String
+  space     Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  threadId  String
+  thread    Thread   @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  botId     String
+  bot       Bot      @relation(fields: [botId], references: [id], onDelete: Cascade)
+  runId     String   @unique
+  /// The message the run answered; later history replays `text` in its place.
+  messageId String?
+  /// The user turn exactly as the run sent it.
+  text      String   @db.Text
+  /// The bot's memory, scratchpad and tickets as the model last saw them; null when unchanged.
+  context   String?  @db.Text
+  /// This run put `context` in the system prompt; later runs keep it there and send changes as notes.
+  pinned    Boolean  @default(false)
+  /// Size of the change notes sent since the last pinned context.
+  noteBytes Int      @default(0)
+  /// Hash of the system prompt (without the context) and the history's first item.
+  prefixKey String
+  createdAt DateTime @default(now())
+
+  @@index([threadId, botId, createdAt])
+  @@index([threadId, messageId])
+  @@index([spaceId])
+  @@index([botId])
+  @@map("turn_replays")
 }
 
 model Event {

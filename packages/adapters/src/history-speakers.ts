@@ -28,6 +28,11 @@ export function neutralizeSpeakerLabels(text: string): string {
   return text.replace(/^([ \t]*)\[([^\]\n]*)\]:/gm, "$1($2):");
 }
 
+/** A user turn from someone other than the bot itself, as the model reads it. */
+export function speakerText(speaker: string, text: string): string {
+  return `[${speaker}]: ${neutralizeSpeakerLabels(text)}`;
+}
+
 /**
  * Who is speaking in a group thread, from the receiving bot's side. Direct chats have no
  * speakers: the bot and the user are the only two parties there, so roles say it all.
