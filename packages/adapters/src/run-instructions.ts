@@ -1,5 +1,14 @@
 import { FLEET_WRITE_TOOL_NAMES } from "@rakazo/contracts";
 import { runReadsThreadHistory, toolRequiresExplicitApproval } from "@rakazo/core";
+import {
+  ADD_MCP_SERVER_GUIDANCE,
+  ARCHIVE_BOT_GUIDANCE,
+  CREATE_SPACE_GUIDANCE,
+  RENDER_PLOT_GUIDANCE,
+  RUN_SUBAGENT_GUIDANCE,
+  SAVE_PAGE_GUIDANCE,
+  UPDATE_BOT_GUIDANCE,
+} from "./deferred-tool-guidance.js";
 import { MODEL_CANNOT_SEE_MESSAGE } from "./model-vision.js";
 import { replyGuidanceForOfferedTools } from "./run-replies.js";
 import type { UserComputerState } from "./run-tools-user-computer.js";
@@ -351,28 +360,12 @@ export function userTurnInstructions(parts: {
     parts.workspaceInstruction,
     parts.agentEnvironmentInstruction,
     "A bot and a subagent are different. Never use both for the same request.",
-    offeredBuiltinClause(
-      parts.disabledBuiltinTools,
-      "create_space",
-      "create_space proposes a new privacy boundary inside the current organization. Use it when the user asks to create a space or separate data between teams or projects. Never claim the space exists before the tool succeeds.",
-    ),
+    offeredBuiltinClause(parts.disabledBuiltinTools, "create_space", CREATE_SPACE_GUIDANCE),
     spawnBotClause(parts.disabledBuiltinTools),
-    offeredBuiltinClause(
-      parts.disabledBuiltinTools,
-      "update_bot",
-      "update_bot reads and changes your own settings: name (chat header and list label), description (the one-line public summary teammates see), private instructions (how you do your job), avatar, notifyOnFinish, dailyCheckIns (switch it off when the user asks you to stop checking in), model, thinkingLevel (how hard you reason; a standing request to think harder, or to answer faster, is a request to change it) and readAloud. Call it with no fields to read them, for example when asked which model you run. Change a setting only when the user asks for that change; when you have no instructions yet and your job becomes clear, set your name, description and instructions yourself. Never claim a change without the tool. Pass color for a hex or encoded shape, artifact_id for an image in this space, or use_attached_image when they attached a picture on this message.",
-    ),
-    offeredBuiltinClause(
-      parts.disabledBuiltinTools,
-      "run_subagent",
-      "run_subagent is a short helper inside this turn only. It is not a bot, has no thread, and does not show in the list. Use it for parallel work you will summarize here.",
-    ),
+    offeredBuiltinClause(parts.disabledBuiltinTools, "update_bot", UPDATE_BOT_GUIDANCE),
+    offeredBuiltinClause(parts.disabledBuiltinTools, "run_subagent", RUN_SUBAGENT_GUIDANCE),
     parts.botDirectory,
-    offeredBuiltinClause(
-      parts.disabledBuiltinTools,
-      "archive_bot",
-      "archive_bot safely archives another bot in this space. Use it when the user asks to remove that bot or when it is finished and unused. The user can restore it or permanently delete it later. confirm_name must exactly match its name.",
-    ),
+    offeredBuiltinClause(parts.disabledBuiltinTools, "archive_bot", ARCHIVE_BOT_GUIDANCE),
     fleetClause(parts.offeredFleetTools),
     parts.pluginLine,
     parts.agentSkillsLine,
@@ -383,21 +376,9 @@ export function userTurnInstructions(parts: {
         "When asked how Rakazo or you work, or how to set something up (apps, the user's own computer, billing), read the Rakazo skill before answering or acting.",
       ),
     parts.taughtSkillsLine,
-    offeredBuiltinClause(
-      parts.disabledBuiltinTools,
-      "render_plot",
-      'For charts and data visualization, use the render_plot tool: it renders bar, line, scatter, histogram, heatmap, faceted and many more chart types from a JSON spec and attaches the PNG to the chat. Call render_plot with {"help": true} before your first chart to read the full guide.',
-    ),
-    offeredBuiltinClause(
-      parts.disabledBuiltinTools,
-      "save_page",
-      'For a dashboard, report, tracker or comparison, build a page with save_page (call it with {"help": true} first for the kit guide). To change a page, pass its pageId with edits or new source instead of making a new page. In your reply, mention the page by its title; never paste its source.',
-    ),
-    offeredBuiltinClause(
-      parts.disabledBuiltinTools,
-      "add_mcp_server",
-      "When the user asks you to add or connect an MCP server (and gives you its details), use add_mcp_server. When add_mcp_server posts an approval card, end with one short sentence asking the user to approve it. You will be told when they connect it.",
-    ),
+    offeredBuiltinClause(parts.disabledBuiltinTools, "render_plot", RENDER_PLOT_GUIDANCE),
+    offeredBuiltinClause(parts.disabledBuiltinTools, "save_page", SAVE_PAGE_GUIDANCE),
+    offeredBuiltinClause(parts.disabledBuiltinTools, "add_mcp_server", ADD_MCP_SERVER_GUIDANCE),
     "Never print API keys, access tokens, or secret values. Prefer tools over claiming you already did the work.",
     "Treat pagination cursors as opaque: copy the returned continuation value exactly, never calculate or guess it. When the tool reports no next page, stop; if a cursor is rejected, recheck the last successful result before retrying.",
     replyGuidanceForOfferedTools(parts.replyGuidance, parts.disabledBuiltinTools),

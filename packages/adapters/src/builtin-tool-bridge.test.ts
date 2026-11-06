@@ -43,13 +43,10 @@ describe("built-in tool bridge", () => {
       "request_secret",
       "request_takeover",
       "run_subagent",
-      "schedule_create",
-      "schedule_list",
       "search_history",
       "shell",
       "skill_read",
       "update_bot",
-      "update_preferences",
       "use_tool",
       "web_fetch",
       "web_search",
@@ -58,7 +55,8 @@ describe("built-in tool bridge", () => {
     // request_secret carries the card and contact kinds; update_bot carries instructions paging.
     // +1 byte over upstream: feat/memory-size makes remember say "Holds 16 KB" instead of "Holds 4 KB".
     // +15 bytes: the deferred catalog names post_to_group. +32: update_bot says any field is a change. +23: the catalog names update_default_models.
-    expect(definitionBytes(listed)).toBeLessThanOrEqual(31_949);
+    // Fork (lean tools): schedule_create/schedule_list and update_preferences are deferred, 31,949 -> 18,601.
+    expect(definitionBytes(listed)).toBeLessThanOrEqual(18_601);
     expect(deferred.map((tool) => tool.name)).toEqual(
       expect.arrayContaining(["render_plot", "create_space", "generate_secret", "scratchpad_add"]),
     );
@@ -127,5 +125,23 @@ describe("built-in tool bridge", () => {
     expect(
       describeToolActivity(USE_TOOL, { name: "create_space", arguments: { name: "Finance" } }),
     ).toBe("Creating space: Finance");
+  });
+
+  it("returns a deferred tool's usage notes and defers Composio's meta tools", () => {
+    const { deferred } = partitionTools(ownerChat);
+    const found = findTools(deferred, { names: ["render_plot", "schedule_create"] });
+    expect(found.tools.find((tool) => tool.name === "render_plot")!.description).toContain(
+      '{"help": true}',
+    );
+    const composio = {
+      name: "COMPOSIO_SEARCH_TOOLS",
+      description: "Search app tools",
+      inputSchema: {},
+    };
+    const split = partitionTools([...ownerChat, composio]);
+    expect(split.deferred.map((tool) => tool.name)).toContain("COMPOSIO_SEARCH_TOOLS");
+    expect(split.listed.find((tool) => tool.name === FIND_TOOL)!.description).toContain(
+      "COMPOSIO_SEARCH_TOOLS",
+    );
   });
 });
