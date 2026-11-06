@@ -42,6 +42,7 @@ import {
 } from "./run-tool-selection.js";
 import { historyMyChatsAllowed } from "./run-tools-memory.js";
 import {
+  imageWindowStart,
   loadCurrentTurnImages,
   missingTurnImagesInstruction,
   settleSteeringAttachmentLoads,
@@ -690,7 +691,7 @@ describe("recent turn images", () => {
       prisma: {
         artifact: {
           findMany: vi.fn(async ({ where }: { where: { id: { in: string[] } } }) =>
-            where.id.in.map((id) => ({ id, storageKey: `${id}.png` })),
+            where.id.in.map((id) => ({ id, storageKey: `${id}.png`, size: byteLength })),
           ),
         },
       },
@@ -709,23 +710,44 @@ describe("recent turn images", () => {
     { id: "m5", blocks: [{ kind: "text" as const, text: "what time is that flight?" }] },
   ];
 
-  it("hydrates recent user turns and leaves older ones as text", async () => {
-    const hydrated = await withRecentTurnImages(depsWithImages(), history, messages, context, {
+  it("hydrates the window's turns and leaves older ones as text", async () => {
+    const all = await withRecentTurnImages(depsWithImages(), history, messages, context, {
+      maxTurns: 3,
+    });
+    expect(all.map((entry) => entry.images?.length ?? 0)).toEqual([1, 0, 1, 1, 0]);
+
+    // A third image turn breaks a two-turn window, which jumps forward to half of it.
+    const jumped = await withRecentTurnImages(depsWithImages(), history, messages, context, {
       maxTurns: 2,
     });
-
-    expect(hydrated.map((entry) => entry.images?.length ?? 0)).toEqual([0, 0, 1, 1, 0]);
-    expect(hydrated[3]?.images?.[0]).toMatchObject({ name: "three.png", mimeType: "image/png" });
-    expect(hydrated[0]?.content).toBe("[image: one.png]");
+    expect(jumped.map((entry) => entry.images?.length ?? 0)).toEqual([0, 0, 0, 1, 0]);
+    expect(jumped[3]?.images?.[0]).toMatchObject({ name: "three.png", mimeType: "image/png" });
+    expect(jumped[0]?.content).toBe("[image: one.png]");
   });
 
-  it("skips the current turn and stops at the image budget", async () => {
-    const hydrated = await withRecentTurnImages(depsWithImages(), history, messages, context, {
+  it("counts the current turn's images toward the prompt limit without hydrating them", async () => {
+    const fits = await withRecentTurnImages(depsWithImages(), history, messages, context, {
       skipMessageId: "m4",
-      maxImages: 1,
+      maxImages: 3,
     });
+    expect(fits.map((entry) => entry.images?.length ?? 0)).toEqual([1, 0, 1, 0, 0]);
 
-    expect(hydrated.map((entry) => entry.images?.length ?? 0)).toEqual([0, 0, 1, 0, 0]);
+    const full = await withRecentTurnImages(depsWithImages(), history, messages, context, {
+      skipMessageId: "m4",
+      maxImages: 2,
+    });
+    expect(full.map((entry) => entry.images?.length ?? 0)).toEqual([0, 0, 0, 0, 0]);
+  });
+
+  it("counts a current turn that is not in the history", async () => {
+    const hydrated = await withRecentTurnImages(
+      depsWithImages(),
+      history.slice(0, 3),
+      [...messages, { id: "now", blocks: [imageBlock("art-now", "now.png")] }],
+      context,
+      { skipMessageId: "now", maxImages: 2 },
+    );
+    expect(hydrated.map((entry) => entry.images?.length ?? 0)).toEqual([0, 0, 0]);
   });
 
   it("hydrates nothing beyond the byte ceiling or without an artifact store", async () => {
@@ -929,7 +951,7 @@ describe("recent turn images", () => {
     expect(get.mock.calls.map((call) => call[0])).toEqual(["art-new.png"]);
   });
 
-  it("measures an image with no stored size before reading the next one", async () => {
+  it("never sends an image without a stored size or larger than it", async () => {
     const turn = [
       { id: "shot", role: "user" as const, content: "[image: older.png] [image: newer.png]" },
     ];
@@ -940,7 +962,7 @@ describe("recent turn images", () => {
       },
     ];
     const { deps, get } = sizedImages(
-      { "art-old": undefined, "art-new": undefined },
+      { "art-old": undefined, "art-new": 4 },
       { "art-old": 4, "art-new": 12 },
     );
 
@@ -948,8 +970,8 @@ describe("recent turn images", () => {
       maxBytes: 10,
     });
 
-    expect(hydrated[0]?.images?.map((image) => image.name)).toEqual(["older.png"]);
-    expect(get.mock.calls.map((call) => call[0])).toEqual(["art-new.png", "art-old.png"]);
+    expect(hydrated).toBe(turn);
+    expect(get.mock.calls.map((call) => call[0])).toEqual(["art-new.png"]);
   });
 
   it("stops fetching once the image count is spent, newest first", async () => {
@@ -970,6 +992,141 @@ describe("recent turn images", () => {
 
     expect(hydrated[0]?.images?.map((image) => image.name)).toEqual(["newer.png"]);
     expect(get).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("image window", () => {
+  const context = {
+    operationId: "run-1",
+    traceId: "run-1",
+    spaceId: "space-1",
+    userId: "user-1",
+    botId: "bot-1",
+    runId: "run-1",
+    signal: new AbortController().signal,
+  };
+  const sizes = new Map<string, number>();
+  const deps = {
+    artifacts: {
+      get: vi.fn(async (storageKey: string) => new Uint8Array(sizes.get(storageKey) ?? 0)),
+    },
+    prisma: {
+      artifact: {
+        findMany: vi.fn(async ({ where }: { where: { id: { in: string[] } } }) =>
+          where.id.in.map((id) => ({ id, storageKey: id, size: sizes.get(id) })),
+        ),
+      },
+    },
+  } as never;
+
+  /** A thread of photo turns, each followed by a reply; `photos[i]` lists turn i's image sizes. */
+  const thread = (photos: number[][]) => {
+    const history: Array<{ id: string; role: "user" | "assistant"; content: string }> = [];
+    const messages: Array<{ id: string; blocks: MessageBlock[] }> = [];
+    photos.forEach((turnSizes, turn) => {
+      const blocks = turnSizes.map((size, index): MessageBlock => {
+        const id = `photo-${turn}-${index}`;
+        sizes.set(id, size);
+        return { kind: "image", artifactId: id, mimeType: "image/jpeg", name: `${id}.jpg` };
+      });
+      const content = blocks.map((block) => `[image: ${(block as { name: string }).name}]`);
+      history.push({ id: `turn-${turn}`, role: "user", content: content.join("\n") });
+      history.push({ id: `reply-${turn}`, role: "assistant", content: "Nice." });
+      messages.push({ id: `turn-${turn}`, blocks });
+    });
+    return { history, messages };
+  };
+
+  /**
+   * Each turn's request: the history before the newest photo turn, which is the current one.
+   * Returns, per turn, the names of the images each earlier user message carries.
+   */
+  const replay = async (
+    photos: number[][],
+    options: { maxImages?: number; maxBytes?: number } = {},
+  ) => {
+    const { history, messages } = thread(photos);
+    const requests: string[][][] = [];
+    for (let turn = 0; turn < photos.length; turn += 1) {
+      const hydrated = await withRecentTurnImages(
+        deps,
+        history.slice(0, turn * 2 + 1),
+        messages,
+        context,
+        { skipMessageId: `turn-${turn}`, ...options },
+      );
+      requests.push(
+        hydrated
+          .filter((entry) => entry.role === "user" && entry.id !== `turn-${turn}`)
+          .map((entry) => entry.images?.map((image) => image.name) ?? []),
+      );
+    }
+    return requests;
+  };
+
+  /** Turns whose request rewrote an earlier message relative to the turn before. */
+  const rewrites = (requests: string[][][]) =>
+    requests.flatMap((request, turn) => {
+      const previous = requests[turn - 1];
+      if (!previous) return [];
+      return previous.every(
+        (images, index) => JSON.stringify(images) === JSON.stringify(request[index]),
+      )
+        ? []
+        : [turn];
+    });
+
+  it("moves its start in batches of half the turn limit", () => {
+    const starts = Array.from({ length: 12 }, (_, count) =>
+      imageWindowStart(
+        Array.from({ length: count + 1 }, (_, turn) => ({ turn, bytes: 1 })),
+        { turns: 5, images: Number.POSITIVE_INFINITY, bytes: 100 },
+      ),
+    );
+    expect(starts).toEqual([0, 0, 0, 0, 0, 3, 3, 3, 6, 6, 6, 9]);
+  });
+
+  it("keeps earlier messages byte-identical until the window jumps", async () => {
+    const requests = await replay(Array.from({ length: 12 }, () => [1]));
+
+    // Every image turn joins the window, and earlier ones only drop when it jumps.
+    expect(rewrites(requests)).toEqual([5, 8, 11]);
+    expect(requests[7]).toEqual([
+      [],
+      [],
+      [],
+      ["photo-3-0.jpg"],
+      ["photo-4-0.jpg"],
+      ["photo-5-0.jpg"],
+      ["photo-6-0.jpg"],
+    ]);
+    // A text follow-up after the last photo sees the same window as the last photo turn.
+    const { history, messages } = thread(Array.from({ length: 12 }, () => [1]));
+    const followUp = await withRecentTurnImages(deps, history, messages, context);
+    expect(
+      followUp.filter((entry) => entry.role === "user").map((entry) => entry.images?.length ?? 0),
+    ).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1]);
+  });
+
+  it("keeps the prompt within the image and byte limits", async () => {
+    const photos = [[3], [2, 2], [1], [4], [1, 1, 1], [2], [5], [1], [1, 2], [3], [1], [2]];
+    const limits = { maxImages: 4, maxBytes: 8 };
+    const requests = await replay(photos, limits);
+
+    requests.forEach((request, turn) => {
+      const current = photos[turn]!;
+      const images = request.flat().length + current.length;
+      const bytes =
+        request
+          .flat()
+          .reduce((total, name) => total + (sizes.get(name.replace(/\.jpg$/, "")) ?? 0), 0) +
+        current.reduce((total, size) => total + size, 0);
+      expect(images).toBeLessThanOrEqual(limits.maxImages);
+      expect(bytes).toBeLessThanOrEqual(limits.maxBytes);
+    });
+    // Tight limits jump more often than the turn count would, yet earlier
+    // messages still change on fewer than half the turns.
+    expect(rewrites(requests).length).toBeLessThan(photos.length / 2);
   });
 });
 
