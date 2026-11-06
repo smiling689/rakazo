@@ -29,6 +29,7 @@ import {
   promptInvokesSkill,
   redactSecrets,
   renderBotDirectory,
+  runReadsThreadHistory,
   userRunError,
   userTurnMessageForRun,
 } from "@rakazo/core";
@@ -109,6 +110,7 @@ import {
   historySpeaker,
   loadThreadSpeakers,
   neutralizeSpeakerLabels,
+  speakerText,
   USER_SPEAKER,
 } from "./history-speakers.js";
 import { createMediaGenerationProvider } from "./media-generation-factory.js";
@@ -243,6 +245,13 @@ import { loadAgentTicketContext } from "./ticket-context.js";
 import { appendToolCompletionAudit } from "./tool-completion-audit.js";
 import { toolResultFingerprint } from "./tool-loop.js";
 import { restoreTurnCheckpoint } from "./turn-checkpoint.js";
+import {
+  loadPinnedContextState,
+  planPinnedContext,
+  recordTurnReplay,
+  replayPrefixKey,
+  withSentTurns,
+} from "./turn-replay.js";
 import { createWebProvider } from "./web-provider-factory.js";
 
 /** Same reach as the MCP connector: usable servers assigned to the bot or shared with every bot. */
@@ -1745,12 +1754,22 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           ownerShapedPrompt
             ? `Another bot started this turn, not the owner: do not set your own follow-ups${unavailableToolNames.length ? `, and ${unavailableToolNames.join(", ")} cannot be used` : ""} in this turn.`
             : undefined,
-          memoryContext ? redactSecrets(memoryContext, runSecrets) : undefined,
-          scratchpadContext ? redactSecrets(scratchpadContext, runSecrets) : undefined,
-          ticketContext ? redactSecrets(ticketContext, runSecrets) : undefined,
         ]
           .filter(Boolean)
           .join("\n\n");
+        const turnContext = [memoryContext, scratchpadContext, ticketContext]
+          .filter((part): part is string => Boolean(part))
+          .map((part) => redactSecrets(part, runSecrets))
+          .join("\n\n");
+        // Fork (turn replay): a conversation turn is stored as sent and replayed by later turns;
+        // its context is pinned in the system prompt (see turn-replay.ts). Other runs, and a
+        // resumed turn whose transcript is restored, keep the context in their prompt.
+        const replaysTurn =
+          !nonOwnerChatRun &&
+          !turnCheckpoint &&
+          !isMemoryFlushRun(run) &&
+          !isStrategicInitiativeRun(run) &&
+          runReadsThreadHistory(run.trigger);
         const historicalContext: AgentRunRequest["history"] = [];
         if (compactedHistory.usedLocalSummary && compactedHistory.summary) {
           historicalContext.push({
@@ -1870,6 +1889,91 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           return true;
         };
 
+        const promptSpeaker =
+          speakers &&
+          (run.trigger === "user" ||
+            (run.trigger === "follow_up" && sourceMessage?.role === "user"))
+            ? USER_SPEAKER
+            : undefined;
+        const instructionsFor = (pinnedContext: string | undefined) =>
+          userTurnInstructions({
+            botInstructions: runIdentityInstruction(bot, run.trigger),
+            groupContext,
+            messagingContext,
+            // Fork (turn replay): the pinned memory, scratchpad and tickets, when the turn is replayed.
+            redactedMemoryContext: pinnedContext,
+            redactedScratchpadContext: undefined,
+            redactedTicketContext: undefined,
+            hasHistoricalContext: historicalContext.length > 0,
+            historyRetrievalEnabled: contextStrategy !== "current",
+            computerInstruction,
+            pageBrowserAllowed,
+            taskCatalogInstruction,
+            workspaceInstruction,
+            agentEnvironmentInstruction,
+            botDirectory,
+            pluginLine,
+            agentSkillsLine,
+            taughtSkillsLine,
+            replyGuidance: runReplyGuidance(run.trigger),
+            disabledBuiltinTools:
+              isStrategicInitiativeRun(run) || isMemoryFlushRun(run)
+                ? new Set(
+                    builtinAgentTools
+                      .map((tool) => tool.name)
+                      .filter((name) => !strategicBuiltins.some((tool) => tool.name === name)),
+                  )
+                : guidanceDisabled,
+            offeredFleetTools: offeredFleetTools(promptBuiltins),
+            followUpsOffered: followUpsOffered(
+              promptBuiltins,
+              ownerStartedRun || ownerShapedPrompt,
+            ),
+            userComputer,
+          })
+            .filter((instruction): instruction is string => Boolean(instruction))
+            .join("\n\n");
+        let instructions = instructionsFor(undefined);
+        let runPrompt = [prompt, turnContext].filter(Boolean).join("\n\n");
+        let replayedHistory = runtimeHistory;
+        if (replaysTurn) {
+          try {
+            const [sent, state] = await Promise.all([
+              withSentTurns(deps.prisma, thread.id, bot.id, runtimeHistory),
+              loadPinnedContextState(deps.prisma, { threadId: thread.id, botId: bot.id, runId }),
+            ]);
+            const plan = planPinnedContext(
+              turnContext,
+              state,
+              replayPrefixKey(instructions, sent.history),
+              new Date(),
+            );
+            instructions = instructionsFor(plan.pinned);
+            runPrompt = [prompt, plan.note].filter(Boolean).join("\n\n");
+            replayedHistory = sent.history;
+            // A lost record only costs the next turn its cache hit.
+            await recordTurnReplay(deps.prisma, {
+              spaceId: run.spaceId,
+              threadId: thread.id,
+              botId: bot.id,
+              runId,
+              messageId: run.sourceMessageId ?? null,
+              text: promptSpeaker ? speakerText(promptSpeaker, runPrompt) : runPrompt,
+              ...plan.record,
+            }).catch((error) => getLogger().warn("turn replay was not recorded", { runId, error }));
+            getLogger().info("turn.replay", {
+              "run.id": runId,
+              replayed: sent.replayed,
+              missing: sent.missing,
+              pinned: plan.record.pinned,
+              noteBytes: plan.record.noteBytes,
+            });
+          } catch (error) {
+            // Replay only serves the prompt cache; the turn runs as before without it.
+            getLogger().warn("turn replay unavailable", { runId, error });
+          }
+        }
+
         try {
           if (checkpointLoadError) throw checkpointLoadError;
           const runtimeEvents = deps.runtime.run(
@@ -1890,53 +1994,13 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
                   operationId: runId,
                 });
               },
-              prompt,
-              ...(speakers &&
-              (run.trigger === "user" ||
-                (run.trigger === "follow_up" && sourceMessage?.role === "user"))
-                ? { promptSpeaker: USER_SPEAKER }
-                : {}),
+              prompt: runPrompt,
+              ...(promptSpeaker ? { promptSpeaker } : {}),
               // Keep an explicit executor override, but let the runtime select
               // cache-aware context for connections declaring a cache window.
               contextStrategy: deps.contextStrategy,
-              instructions: userTurnInstructions({
-                botInstructions: runIdentityInstruction(bot, run.trigger),
-                groupContext,
-                messagingContext,
-                // Fork (stable prefix): memory, scratchpad and tickets go in the prompt instead.
-                redactedMemoryContext: undefined,
-                redactedScratchpadContext: undefined,
-                redactedTicketContext: undefined,
-                hasHistoricalContext: historicalContext.length > 0,
-                historyRetrievalEnabled: contextStrategy !== "current",
-                computerInstruction,
-                pageBrowserAllowed,
-                taskCatalogInstruction,
-                workspaceInstruction,
-                agentEnvironmentInstruction,
-                botDirectory,
-                pluginLine,
-                agentSkillsLine,
-                taughtSkillsLine,
-                replyGuidance: runReplyGuidance(run.trigger),
-                disabledBuiltinTools:
-                  isStrategicInitiativeRun(run) || isMemoryFlushRun(run)
-                    ? new Set(
-                        builtinAgentTools
-                          .map((tool) => tool.name)
-                          .filter((name) => !strategicBuiltins.some((tool) => tool.name === name)),
-                      )
-                    : guidanceDisabled,
-                offeredFleetTools: offeredFleetTools(promptBuiltins),
-                followUpsOffered: followUpsOffered(
-                  promptBuiltins,
-                  ownerStartedRun || ownerShapedPrompt,
-                ),
-                userComputer,
-              })
-                .filter((instruction): instruction is string => Boolean(instruction))
-                .join("\n\n"),
-              history: runtimeHistory,
+              instructions,
+              history: replayedHistory,
               currentTurnImages,
               currentRunRequiresImageInput,
               currentTurnImageFileFallback: Boolean(

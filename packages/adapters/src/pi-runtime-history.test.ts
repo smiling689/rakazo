@@ -164,6 +164,28 @@ describe("Pi history replay", () => {
     expect(JSON.stringify(messages)).not.toContain("Assistant:");
   });
 
+  it("replays a turn as it was sent, in place of its content and label", async () => {
+    const sent = "[User]: Name our project.\n\nCurrent time: 09:00.";
+    const messages = await replay({
+      history: [
+        { id: "m1", role: "user", speaker: "User", content: "Name our project.", sentText: sent },
+        {
+          id: "m2",
+          role: "assistant",
+          speaker: "Anya",
+          content: "Bluebird.",
+          sentText: "Bluebird?",
+        },
+        { id: "m3", role: "assistant", content: "Noted." },
+      ],
+    });
+    expect(view(messages)).toEqual([
+      { role: "user", content: sent },
+      { role: "user", content: "Bluebird?" },
+      { role: "assistant", content: "Noted." },
+    ]);
+  });
+
   it("leaves the current prompt bare in a direct chat", async () => {
     await replay({ prompt: "Plain prompt." });
     expect(captured.prompt).toBe("Plain prompt.");

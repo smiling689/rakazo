@@ -74,6 +74,13 @@ export const ENCRYPTED_MODELS: Record<string, ModelSpec> = {
     space: { parent: "memory_documents" },
     ownerRelation: "document",
   },
+  /** What a run sent the model: the user's turn and the bot's memory, replayed by later turns. */
+  TurnReplay: {
+    table: "turn_replays",
+    fields: { text: {}, context: {} },
+    space: { column: "spaceId" },
+    ownerRelation: "thread",
+  },
   /** The compacted summary of older history is derived message content. */
   Thread: {
     table: "threads",

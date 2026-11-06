@@ -13,7 +13,7 @@ export type ContentMigrationMode = "encrypt" | "reencrypt" | "decrypt";
 
 interface TableSpec {
   model: keyof typeof ENCRYPTED_MODELS;
-  delegate: "message" | "event" | "memoryDocument" | "memoryRevision" | "thread";
+  delegate: "message" | "event" | "memoryDocument" | "memoryRevision" | "thread" | "turnReplay";
   column: string;
   json: boolean;
   /** Preserve @updatedAt so a migration does not reorder recently edited documents. */
@@ -79,6 +79,19 @@ const TABLES: TableSpec[] = [
     writePlaintext: (id, value) =>
       Prisma.sql`UPDATE memory_revisions SET content = ${value as string} WHERE id = ${id}`,
   },
+  ...(["text", "context"] as const).map(
+    (column): TableSpec => ({
+      model: "TurnReplay",
+      delegate: "turnReplay",
+      column,
+      json: false,
+      scan: (cursor, limit) => Prisma.sql`
+        SELECT id, ${Prisma.raw(`"${column}"`)} AS value, "spaceId", "threadId" AS owner FROM turn_replays
+        WHERE id > ${cursor} AND ${Prisma.raw(`"${column}"`)} IS NOT NULL ORDER BY id LIMIT ${limit}`,
+      writePlaintext: (id, value) =>
+        Prisma.sql`UPDATE turn_replays SET ${Prisma.raw(`"${column}"`)} = ${value as string} WHERE id = ${id}`,
+    }),
+  ),
   {
     model: "Thread",
     delegate: "thread",
@@ -308,6 +321,9 @@ export async function contentEncryptionStatus(
     UNION ALL
     SELECT 'threads', count(*) FILTER (WHERE "historyCompactionSummary" IS NOT NULL),
       count(*) FILTER (WHERE "historyCompactionSummary" NOT LIKE 'rkz1:%') FROM threads
+    UNION ALL
+    SELECT 'turn_replays', count(*), count(*) FILTER (WHERE text NOT LIKE 'rkz1:%'
+      OR context NOT LIKE 'rkz1:%') FROM turn_replays
   `;
   const keys = await prisma.spaceKey.groupBy({ by: ["masterKeyId"], _count: { _all: true } });
   return {
