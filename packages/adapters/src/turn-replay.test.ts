@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   contextChangeNote,
   planPinnedContext,
+  recordTurnReplay,
+  recordTurnTranscript,
   replayPrefixKey,
   withSentTurns,
 } from "./turn-replay.js";
@@ -134,5 +136,85 @@ describe("withSentTurns", () => {
     expect(queries[0]).toMatchObject({
       where: { threadId: "t", botId: "bot", messageId: { in: ["u1", "b1", "u2"] } },
     });
+  });
+
+  it("replays a run's transcript once, at its first reply, without the steering it carries", async () => {
+    const transcript = {
+      messages: [{ role: "assistant", content: [] }],
+      steeringMessageIds: ["u2"],
+    };
+    const db = {
+      turnReplay: {
+        findMany: async (query: { where: { runId?: unknown } }) =>
+          query.where.runId
+            ? [{ runId: "r1", transcript: JSON.stringify(transcript) }]
+            : [{ messageId: "u1", text: "sent u1" }],
+      },
+    };
+    const result = await withSentTurns(
+      db as never,
+      "t",
+      "bot",
+      [
+        { id: "u1", role: "user", content: "check the files" },
+        { id: "a1", role: "assistant", content: "On it." },
+        { id: "u2", role: "user", content: "only markdown" },
+        { id: "a2", role: "assistant", content: "Two files." },
+        { id: "u3", role: "user", content: "thanks" },
+        { id: "a3", role: "assistant", content: "Welcome." },
+      ],
+      new Map([
+        ["a1", "r1"],
+        ["a2", "r1"],
+        ["a3", "r2"],
+      ]),
+    );
+    expect(result.history.map((message) => [message.id, message.sentReply])).toEqual([
+      ["u1", undefined],
+      ["a1", transcript.messages],
+      ["u3", undefined],
+      ["a3", undefined],
+    ]);
+    expect(result.history[0]?.sentText).toBe("sent u1");
+    expect(result.transcripts).toBe(1);
+  });
+});
+
+describe("turn transcripts", () => {
+  it("stores a transcript on the run's row, and a new send of the run clears it", async () => {
+    const updates: unknown[] = [];
+    const db = {
+      turnReplay: {
+        findUnique: async () => ({ id: "row-1" }),
+        update: async (args: unknown) => {
+          updates.push(args);
+          return { id: "row-1" };
+        },
+      },
+    };
+    await recordTurnTranscript(db as never, "run-1", {
+      messages: [{ role: "assistant" }],
+      steeringMessageIds: [],
+    });
+    await recordTurnReplay(db as never, {
+      spaceId: "s",
+      threadId: "t",
+      botId: "bot",
+      runId: "run-1",
+      messageId: "u1",
+      text: "again",
+      context: null,
+      pinned: false,
+      noteBytes: 0,
+      prefixKey: "k",
+    });
+    expect(updates).toEqual([
+      {
+        where: { id: "row-1" },
+        data: { transcript: '{"messages":[{"role":"assistant"}],"steeringMessageIds":[]}' },
+        select: { id: true },
+      },
+      expect.objectContaining({ data: expect.objectContaining({ transcript: null }) }),
+    ]);
   });
 });

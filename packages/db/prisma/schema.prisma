@@ -950,6 +950,9 @@ model TurnReplay {
   text      String   @db.Text
   /// The bot's memory, scratchpad and tickets as the model last saw them; null when unchanged.
   context   String?  @db.Text
+  /// What the finished run added after its user turn (tool calls, results, replies), replayed in
+  /// place of its reply; null until it finishes, and for runs that paused or failed.
+  transcript String? @db.Text
   /// This run put `context` in the system prompt; later runs keep it there and send changes as notes.
   pinned    Boolean  @default(false)
   /// Size of the change notes sent since the last pinned context.

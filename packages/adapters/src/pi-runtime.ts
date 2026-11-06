@@ -78,6 +78,12 @@ import {
   toolCallBudgetExceededMessage,
   toolCallBudgetFor,
 } from "./pi-runtime-tools.js";
+import {
+  HISTORY_ASSISTANT,
+  NO_USAGE,
+  recordedTranscript,
+  replayTranscripts,
+} from "./pi-runtime-transcript.js";
 import type { PiSessionHandle, PiSessionRecorder } from "./pi-session.js";
 import { PiJsonlSessionRecorder } from "./pi-session.js";
 import { withPiTelemetry } from "./pi-telemetry.js";
@@ -304,6 +310,8 @@ export class PiAgentRuntime implements AgentRuntime {
         const allTools = toAgentTools(toolDefs, host, request.advertisedToolNames);
         let tools = allTools;
         const seenSteeringIds: string[] = [];
+        // Messages handed to the model mid-turn, which this turn's transcript carries.
+        const steeredMessageIds: string[] = [];
         const initialSteering = request.claimSteering ? await request.claimSteering([]) : [];
         let hasCurrentImages = Boolean(
           request.currentRunRequiresImageInput ||
@@ -643,6 +651,7 @@ export class PiAgentRuntime implements AgentRuntime {
             const steering = await request.claimSteering([...seenSteeringIds]);
             if (steering.length === 0) return update;
             seenSteeringIds.push(...steering.map((item) => item.id));
+            steeredMessageIds.push(...steering.map((item) => item.messageId));
             for (const item of steering) representedHistoryIds.add(item.messageId);
             if (steering.some((item) => item.images?.length && !item.imageFileFallback))
               hasCurrentImages = true;
@@ -953,6 +962,8 @@ export class PiAgentRuntime implements AgentRuntime {
           ...(request.currentTurnImages ?? []),
           ...initialSteering.flatMap((item) => item.images ?? []),
         ]);
+        // Where a fresh turn's opening user message lands; what follows it is this turn's work.
+        let openingIndex: number | undefined;
         try {
           if (restored) {
             // Complete unresolved calls before another model choice. The executor
@@ -1053,9 +1064,11 @@ export class PiAgentRuntime implements AgentRuntime {
             }
             restoringCalls = false;
             if (!host.pausePending && !replayTerminated) {
-              const addedHistory = withoutSteeringMessages(request.history, initialSteering).filter(
-                (message) => message.id && !representedHistoryIds.has(message.id),
-              );
+              // Earlier replies come back as text: a replayed transcript could end on a tool
+              // result, and the restored turn must not continue another run's work.
+              const addedHistory = withoutSteeringMessages(request.history, initialSteering)
+                .filter((message) => message.id && !representedHistoryIds.has(message.id))
+                .map(({ sentReply: _, ...message }) => message);
               agent.state.messages.push(...toHistory(addedHistory, ""));
               for (const message of addedHistory)
                 if (message.id) representedHistoryIds.add(message.id);
@@ -1080,6 +1093,7 @@ export class PiAgentRuntime implements AgentRuntime {
               await agent.continue();
             }
           } else {
+            openingIndex = agent.state.messages.length;
             // Only the person's messages go under their label; anyone else's is framed by origin.
             await agent.prompt(
               promptWithSteering(
@@ -1212,6 +1226,17 @@ export class PiAgentRuntime implements AgentRuntime {
             queue.push({ type: "text", text: streamed });
           }
         }
+        if (
+          request.onTranscript &&
+          openingIndex !== undefined &&
+          !host.pausePending &&
+          !signal.aborted &&
+          agent.state.messages[openingIndex]?.role === "user"
+        )
+          request.onTranscript({
+            messages: recordedTranscript(agent.state.messages.slice(openingIndex + 1)),
+            steeringMessageIds: steeredMessageIds,
+          });
         queue.push(streamed.trim() ? { type: "done", text: streamed } : { type: "done" });
       } catch (error) {
         span?.setStatus({ status: "error" });
@@ -1257,19 +1282,6 @@ function toPiImages(images: AgentRunRequest["currentTurnImages"]) {
   }));
 }
 
-/**
- * Provider, api and model stamped on replayed own replies. None matches a real model, so Pi
- * replays them as plain text from another model: no signatures or reasoning, same on every provider.
- */
-const HISTORY_ASSISTANT = { api: "rakazo-history", provider: "rakazo-history", model: "history" };
-const NO_USAGE = {
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalTokens: 0,
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
 /** Stands in for the opening turn when the window starts on a bot message (Bedrock needs a user first). */
 const CONVERSATION_START = "[Conversation start]";
 
@@ -1307,6 +1319,14 @@ function toHistory(
     duplicatePromptIndex < 0
       ? history
       : history.filter((_, index) => index !== duplicatePromptIndex);
+  // This bot's replies whose runs recorded a transcript, replayed together (see replayTranscripts).
+  const ownReplies = prior.filter((m) => m.role === "assistant" && !m.speaker && m.sentReply);
+  const replays = new Map(
+    replayTranscripts(ownReplies.map((m) => m.sentReply!)).map((messages, index) => [
+      ownReplies[index],
+      messages,
+    ]),
+  );
   return prior
     .filter((m) => m.role === "user" || m.role === "assistant")
     .flatMap((m): HistoryMessage[] => {
@@ -1317,6 +1337,10 @@ function toHistory(
         rakazoMessageId: m.id,
         rakazoCreatedAt: m.createdAt,
       };
+      // The run's own transcript, tool work included, in place of its final text.
+      const replay = replays.get(m);
+      if (replay?.length)
+        return replay.map((message) => ({ ...message, ...common, timestamp: message.timestamp }));
       if (m.role === "assistant" && !m.speaker) {
         // A reply that holds only tool work has no text to replay.
         if (!m.content.trim()) return [];

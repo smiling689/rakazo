@@ -75,10 +75,10 @@ export const ENCRYPTED_MODELS: Record<string, ModelSpec> = {
     space: { parent: "memory_documents" },
     ownerRelation: "document",
   },
-  /** What a run sent the model: the user's turn and the bot's memory, replayed by later turns. */
+  /** What a run sent the model: the user's turn, the bot's memory and its tool work, replayed by later turns. */
   TurnReplay: {
     table: "turn_replays",
-    fields: { text: {}, context: {} },
+    fields: { text: {}, context: {}, transcript: {} },
     space: { column: "spaceId" },
     ownerRelation: "thread",
   },

@@ -611,6 +611,45 @@ describe("runtime context policy", () => {
     expect(prepared.messages.at(-1)).toEqual(context.messages.at(-1));
     expect(policy.getDecision()!.estimatedInputTokens).toBeLessThan(32768);
   });
+  it("keeps a replayed tool call with its results when snapshots cut recent history", () => {
+    const { request, context } = fixture(60);
+    // The reply to message-50 is replayed as its run's transcript: one call, seven results.
+    request.history[51] = { ...request.history[51]!, role: "assistant" };
+    const replayed = { rakazoHistory: true, rakazoMessageId: "message-51", timestamp: 0 };
+    const transcript = [
+      {
+        role: "assistant",
+        content: Array.from({ length: 7 }, (_, index) => ({
+          type: "toolCall",
+          id: `call-${index}`,
+          name: "read_file",
+          arguments: {},
+        })),
+        ...replayed,
+      },
+      ...Array.from({ length: 7 }, (_, index) => ({
+        role: "toolResult",
+        toolCallId: `call-${index}`,
+        toolName: "read_file",
+        content: [{ type: "text", text: `File ${index}.` }],
+        isError: false,
+        ...replayed,
+      })),
+      { role: "assistant", content: [{ type: "text", text: "Read them all." }], ...replayed },
+    ] as unknown as Message[];
+    // The last eight messages before the prompt start on its first result.
+    context.messages.splice(51, 9, ...transcript);
+    const prepared = createRuntimeContextPolicy({
+      ...request,
+      contextStrategy: "snapshots",
+    }).prepareContext(context, model);
+    const first = prepared.messages.findIndex((message) => message.role === "toolResult");
+    expect(prepared.messages[first - 1]).toMatchObject({ role: "assistant" });
+    const catalog = String(prepared.messages[0]!.content);
+    expect(catalog).toContain("Historical navigation snapshots");
+    expect(catalog).not.toContain("message message-51 ");
+  });
+
   it("shows who spoke in navigation snapshots of a group thread", () => {
     const { request, context } = fixture();
     // Replayed as the new history shapes: another bot as a labelled user turn, own reply as assistant.

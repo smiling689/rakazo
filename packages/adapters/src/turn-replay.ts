@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { AgentRunRequest } from "@rakazo/adapter-kit";
+import type { AgentRunRequest, AgentTurnTranscript } from "@rakazo/adapter-kit";
 import type { PrismaClient } from "@rakazo/db";
 import { byteLength } from "./utf8.js";
 
@@ -140,31 +140,97 @@ export function contextChangeNote(before: string, after: string): string {
     .join("\n");
 }
 
-/** Sets `sentText` on history messages this bot answered before, from the latest run of each. */
+/**
+ * Sets `sentText` on history messages this bot answered before, from the latest run of each.
+ * `replyRuns` maps this bot's own replies to the runs that wrote them: the first reply of a run
+ * with a stored transcript carries it as `sentReply`, and the run's other replies and the
+ * messages it took in mid-turn leave the history, since the transcript holds them.
+ */
 export async function withSentTurns(
   db: ReplayDb,
   threadId: string,
   botId: string,
   history: History,
-): Promise<{ history: History; replayed: number; missing: number }> {
+  replyRuns: ReadonlyMap<string, string> = new Map(),
+): Promise<{ history: History; replayed: number; missing: number; transcripts: number }> {
   const ids = history.flatMap((message) =>
     message.id && (message.role === "user" || message.speaker) ? [message.id] : [],
   );
-  if (ids.length === 0) return { history, replayed: 0, missing: 0 };
-  const rows = await db.turnReplay.findMany({
-    where: { threadId, botId, messageId: { in: ids } },
-    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-    select: { messageId: true, text: true },
-  });
+  const runIds = [
+    ...new Set(
+      history.flatMap((message) => {
+        const runId = message.id && !message.speaker ? replyRuns.get(message.id) : undefined;
+        return runId ? [runId] : [];
+      }),
+    ),
+  ];
+  const [rows, transcripts] = await Promise.all([
+    ids.length
+      ? db.turnReplay.findMany({
+          where: { threadId, botId, messageId: { in: ids } },
+          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+          select: { messageId: true, text: true },
+        })
+      : [],
+    loadTurnTranscripts(db, threadId, botId, runIds),
+  ]);
   const sent = new Map(rows.map((row) => [row.messageId, row.text]));
   let replayed = 0;
-  const replayedHistory = history.map((message) => {
+  const anchored = new Set<string>();
+  const carried = new Set<string>();
+  const replayedHistory = history.flatMap((message) => {
+    const runId = message.id && !message.speaker ? replyRuns.get(message.id) : undefined;
+    const transcript = runId ? transcripts.get(runId) : undefined;
+    if (runId && transcript) {
+      if (anchored.has(runId)) return [];
+      anchored.add(runId);
+      for (const id of transcript.steeringMessageIds) carried.add(id);
+      return [{ ...message, sentReply: transcript.messages }];
+    }
     const text = message.id ? sent.get(message.id) : undefined;
-    if (text === undefined) return message;
+    if (text === undefined) return [message];
     replayed += 1;
-    return { ...message, sentText: text };
+    return [{ ...message, sentText: text }];
   });
-  return { history: replayedHistory, replayed, missing: ids.length - replayed };
+  return {
+    history: replayedHistory.filter(
+      (message) => message.role !== "user" || !message.id || !carried.has(message.id),
+    ),
+    replayed,
+    missing: ids.length - replayed,
+    transcripts: anchored.size,
+  };
+}
+
+/** The stored transcripts of these runs of this bot, by run. */
+export async function loadTurnTranscripts(
+  db: ReplayDb,
+  threadId: string,
+  botId: string,
+  runIds: readonly string[],
+): Promise<Map<string, AgentTurnTranscript>> {
+  if (runIds.length === 0) return new Map();
+  const rows = await db.turnReplay.findMany({
+    where: { threadId, botId, runId: { in: [...runIds] }, transcript: { not: null } },
+    select: { runId: true, transcript: true },
+  });
+  return new Map(
+    rows.flatMap((row) => {
+      const transcript = parseTranscript(row.transcript);
+      return transcript ? [[row.runId, transcript] as const] : [];
+    }),
+  );
+}
+
+function parseTranscript(value: string | null): AgentTurnTranscript | undefined {
+  try {
+    const parsed = JSON.parse(value ?? "") as Partial<AgentTurnTranscript>;
+    return Array.isArray(parsed.messages) && Array.isArray(parsed.steeringMessageIds)
+      ? { messages: parsed.messages, steeringMessageIds: parsed.steeringMessageIds }
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function recordTurnReplay(
@@ -179,10 +245,31 @@ export async function recordTurnReplay(
   } & ContextPlan["record"],
 ): Promise<void> {
   const { runId, ...data } = input;
-  // A retried attempt of the same run sends again; the latest send is the one to replay.
+  // A retried attempt of the same run sends again; the latest send is the one to replay, and
+  // the transcript of an attempt that did not finish is not its reply's.
   // Sealed content cannot be upserted, so look the row up first.
   const existing = await db.turnReplay.findUnique({ where: { runId }, select: { id: true } });
   if (existing)
-    await db.turnReplay.update({ where: { id: existing.id }, data, select: { id: true } });
+    await db.turnReplay.update({
+      where: { id: existing.id },
+      data: { ...data, transcript: null },
+      select: { id: true },
+    });
   else await db.turnReplay.create({ data: { runId, ...data }, select: { id: true } });
+}
+
+/** Stores what a finished run added after its user turn, for later turns to replay. */
+export async function recordTurnTranscript(
+  db: ReplayDb,
+  runId: string,
+  transcript: AgentTurnTranscript,
+): Promise<void> {
+  // Sealed content is updated by id.
+  const row = await db.turnReplay.findUnique({ where: { runId }, select: { id: true } });
+  if (!row) return;
+  await db.turnReplay.update({
+    where: { id: row.id },
+    data: { transcript: JSON.stringify(transcript) },
+    select: { id: true },
+  });
 }

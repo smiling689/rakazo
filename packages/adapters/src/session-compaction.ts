@@ -10,6 +10,7 @@ import {
   summarizeConversation,
   transcriptLines,
 } from "./history-compaction.js";
+import { replayedTranscriptTokens } from "./pi-runtime-transcript.js";
 import { isUniqueViolation } from "./run-messages.js";
 import type { CompactionReason } from "./session-context.js";
 import {
@@ -20,6 +21,7 @@ import {
   planSessionCompaction,
   sessionContextSettings,
 } from "./session-context.js";
+import { loadTurnTranscripts } from "./turn-replay.js";
 
 /** Summarizer input per pass (OpenClaw caps it at 160,000 characters, about 40k tokens). */
 export const SESSION_TRANSCRIPT_CHARS = 160_000;
@@ -105,14 +107,17 @@ export async function compactSessionHistory(
   const messages = await deps.prisma.message.findMany({
     where: { threadId: thread.id, seq: { gt: cursor } },
     orderBy: { seq: "asc" },
-    select: { seq: true, role: true, blocks: true, createdAt: true },
+    select: { seq: true, role: true, botId: true, runId: true, blocks: true, createdAt: true },
   });
+  const transcriptTokens = await replayedTranscriptTokensBySeq(deps, owner, messages);
   const foldThrough = planSessionCompaction(
     messages.map((message) => ({
       seq: message.seq,
       role: message.role,
       createdAt: message.createdAt,
-      tokens: estimateTextTokens(blocksToAgentHistoryText(message.blocks as MessageBlock[])),
+      tokens:
+        estimateTextTokens(blocksToAgentHistoryText(message.blocks as MessageBlock[])) +
+        (transcriptTokens.get(message.seq) ?? 0),
     })),
     sessionContextSettings(),
     input.reason ?? "check",
@@ -121,6 +126,34 @@ export async function compactSessionHistory(
   if (foldThrough === null) return;
   const runId = await queueMemoryFlushRun(deps, owner, foldThrough);
   if (runId) await deps.jobs.enqueue(runContinueJob(runId));
+}
+
+/**
+ * What the bot's earlier tool work adds to the history when it is replayed (see
+ * pi-runtime-transcript.ts), counted on the first reply of each run, where it is replayed.
+ */
+async function replayedTranscriptTokensBySeq(
+  deps: Pick<CompactHistoryDeps, "prisma">,
+  thread: SessionThread,
+  messages: ReadonlyArray<{
+    seq: number;
+    role: string;
+    botId: string | null;
+    runId: string | null;
+  }>,
+): Promise<Map<number, number>> {
+  const firstReplies = new Map<string, number>();
+  for (const message of messages)
+    if (message.role === "bot" && message.botId === thread.botId && message.runId)
+      if (!firstReplies.has(message.runId)) firstReplies.set(message.runId, message.seq);
+  const transcripts = await loadTurnTranscripts(deps.prisma, thread.id, thread.botId, [
+    ...firstReplies.keys(),
+  ]);
+  const replayed = [...firstReplies].filter(([runId]) => transcripts.has(runId));
+  const tokens = replayedTranscriptTokens(
+    replayed.map(([runId]) => transcripts.get(runId)!.messages),
+  );
+  return new Map(replayed.map(([, seq], index) => [seq, tokens[index]!]));
 }
 
 /** A routine-trigger run with no visible message; returns null when one already exists. */
