@@ -274,6 +274,8 @@ x-app-environment: &app-environment
   PHOTON_PROJECT_ID:
   PHOTON_PROJECT_SECRET:
   PHOTON_WEBHOOK_SECRET:
+  WECHAT_BOT_TOKEN:
+  WECHAT_BASE_URL:
   # Optional egress proxy (Mainland / corporate). Empty = unset; either case works.
   HTTP_PROXY: ${HTTP_PROXY:-${http_proxy:-}}
   HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}

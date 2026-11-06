@@ -25,6 +25,7 @@ import { Domain } from "./lark/thread-id.js";
 import { lazyChatAdapter } from "./lazy-chat-adapter.js";
 import { LazyPhotonAdapter } from "./photon/lazy-adapter.js";
 import { isVitestRuntime } from "./test-runtime.js";
+import { WechatAdapter } from "./wechat/wechat-adapter.js";
 
 /**
  * Parsed platform credentials, filled from process.env at the composition
@@ -57,6 +58,12 @@ export interface MessagingEnvironmentValues {
   photonWebhookSecret?: string | undefined;
   /** Extra named Photon projects (PHOTON_PROJECT_ID_<NAME>), each with its own number. */
   photonProjects?: PhotonProjectCredentials[] | undefined;
+  /** Bot token from the iLink QR-code login (`wechat-login` CLI). */
+  wechatBotToken?: string | undefined;
+  /** iLink API host the login returned, when it is not the default. */
+  wechatBaseUrl?: string | undefined;
+  /** Shared data directory; WeChat keeps its poll cursor and reply contexts here. */
+  dataDir?: string | undefined;
 }
 
 export function messagingEnvFromProcess(
@@ -89,6 +96,9 @@ export function messagingEnvFromProcess(
     photonProjectSecret: clean(env.PHOTON_PROJECT_SECRET),
     photonWebhookSecret: clean(env.PHOTON_WEBHOOK_SECRET),
     photonProjects: photonProjectsFromEnv(env),
+    wechatBotToken: clean(env.WECHAT_BOT_TOKEN),
+    wechatBaseUrl: clean(env.WECHAT_BASE_URL),
+    dataDir: clean(env.DATA_DIR),
   };
 }
 
@@ -394,6 +404,21 @@ export function messagingPlatformsFromEnv(
     });
   }
 
+  // Personal WeChat through Tencent's iLink bot API. Inbound is long-polled by
+  // the API process only (one consumer per login); every process can send.
+  if (env.wechatBotToken) {
+    platforms.push({
+      provider: "wechat",
+      capabilities: { direct: true, groups: false, receipt: "typing" },
+      adapter: new WechatAdapter({
+        token: env.wechatBotToken,
+        baseUrl: env.wechatBaseUrl,
+        dataDir: env.dataDir ?? "./data",
+        pollInboundMessages: options.pollInboundMessages ?? false,
+      }),
+    });
+  }
+
   return platforms;
 }
 
@@ -471,6 +496,7 @@ function withTelegramRedelivery(adapter: TelegramAdapter) {
 /** Split before enqueueing so retries only resend the parts that failed. */
 export function splitOutboundBody(provider: string, body: string): string[] {
   if (provider === "whatsapp") return splitWhatsAppPart(body);
+  if (provider === "wechat") return splitWechatPart(body);
   if (provider !== "telegram" && !provider.startsWith("telegram-")) return [body];
 
   return splitTelegramPart(body);
@@ -539,6 +565,25 @@ function splitWhatsAppPart(body: string): string[] {
 
   const parts = splitKeepingPairs(body);
   return (parts.length > 1 ? parts : halve(body)).flatMap(splitWhatsAppPart);
+}
+
+/** WeChat truncates very long texts; keep each part well under its limit. */
+const WECHAT_PART_LIMIT = 3000;
+
+/** Split at a paragraph or line break when one falls in the second half of the window. */
+function splitWechatPart(body: string): string[] {
+  const parts: string[] = [];
+  let rest = body;
+  while (rest.length > WECHAT_PART_LIMIT) {
+    const window = rest.slice(0, WECHAT_PART_LIMIT);
+    let cut = window.lastIndexOf("\n\n");
+    if (cut < WECHAT_PART_LIMIT / 2) cut = window.lastIndexOf("\n");
+    if (cut < WECHAT_PART_LIMIT / 2) cut = WECHAT_PART_LIMIT;
+    if (/[\uD800-\uDBFF]/.test(rest[cut - 1]!)) cut--;
+    parts.push(rest.slice(0, cut));
+    rest = rest.slice(cut).trimStart();
+  }
+  return [...parts, rest];
 }
 
 /** Refines chunks that only grow beyond the limit during rendering. */
