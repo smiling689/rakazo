@@ -58,6 +58,8 @@ import {
 } from "./thinking-signatures.js";
 
 const MODEL_PROVIDER_RETRY_DELAYS_MS = [2_000, 8_000, 20_000] as const;
+/** Same-model repeats of a call that ended normally with nothing to show, before a backup. */
+const EMPTY_REPLY_RETRIES = 2;
 
 /** Why a reply ended before the model finished it. */
 export type CutReplyReason = "connection" | "limit";
@@ -81,6 +83,12 @@ export interface FallbackStreamState {
   cutReplies?: WeakMap<AssistantMessage["content"], CutReplyReason>;
   /** The next call continues a cut reply, so a dropped connection there is not continued again. */
   continuingCutReply?: boolean;
+  /**
+   * Whether an empty reply now would leave the user with nothing at all. Such a reply is repeated
+   * and then tried on the backups. Once the run has shown text or run tools, the runtime handles
+   * an empty reply itself, so it passes through. Absent where nothing repeats one (subagents).
+   */
+  retriesEmptyReply?(): boolean;
   onSwitch(target: RuntimeModelTarget): Promise<void>;
   onContextLimit(contextWindow: number): void;
   isProviderFailure(message: AssistantMessage): boolean;
@@ -113,15 +121,17 @@ function assistantHasVisibleOutput(message: AssistantMessage): boolean {
   );
 }
 
-function eventHasVisibleOutput(event: AssistantMessageEvent): boolean {
-  if (event.type === "toolcall_start" || event.type === "toolcall_end") return true;
-  if (event.type === "text_delta" || event.type === "toolcall_delta") {
-    if (event.delta.length > 0) return true;
-  }
-  if (event.type === "text_end" && event.content.length > 0) return true;
-  if (event.type === "done") return assistantHasVisibleOutput(event.message);
-  if (event.type === "error") return assistantHasVisibleOutput(event.error);
-  return assistantHasVisibleOutput(event.partial);
+/**
+ * Reply text the user is shown as it streams. Thinking and tool calls are held back until the
+ * call ends: no tool runs before then and nothing renders a tool call's arguments, so a call that
+ * fails before any text can be retried from scratch with its partial tool calls discarded.
+ */
+function eventHasVisibleText(
+  event: Exclude<AssistantMessageEvent, { type: "done" } | { type: "error" }>,
+): boolean {
+  if (event.type === "text_delta") return event.delta.length > 0;
+  if (event.type === "text_end") return event.content.length > 0;
+  return assistantText(event.partial).length > 0;
 }
 
 export const MAX_SELF_RECOVERIES_PER_RUN = 3;
@@ -414,6 +424,14 @@ export function fallbackAwareModelStream(
     }
     return undefined;
   };
+  /** Moves the run to the next usable backup; false when none is left. */
+  const switchToNext = async (current: RuntimeModelTarget): Promise<boolean> => {
+    const next = await resolveNext(current);
+    if (!next || signalAborted()) return false;
+    state.messagesBeforeSwitch = context.messages.length;
+    await state.onSwitch(next);
+    return true;
+  };
   const run = async () => {
     let buffered: AssistantMessageEvent[] = [];
     let retries = 0;
@@ -426,6 +444,7 @@ export function fallbackAwareModelStream(
     let firstRetryableError: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
     // Set once this call has been repeated after spending its output budget on nothing visible.
     let lengthRecovered = false;
+    let emptyRetries = 0;
     let outputBudget = state.nextCallRecovery?.maxTokens;
     let thinkingOverride = state.nextCallRecovery?.thinkingLevel;
     state.nextCallRecovery = undefined;
@@ -500,7 +519,8 @@ export function fallbackAwareModelStream(
             recordFailure(target, event.error.errorMessage ?? "Model request failed.");
             let terminalEvent = event;
             let requestLimitTooSmall = false;
-            const hasTerminalVisibleOutput = assistantHasVisibleOutput(event.error);
+            // A failed call runs none of its tool calls, so only text counts as shown.
+            const hasTerminalVisibleOutput = assistantText(event.error).length > 0;
             if (
               !sawVisibleOutput &&
               !hasTerminalVisibleOutput &&
@@ -619,12 +639,9 @@ export function fallbackAwareModelStream(
                 target.config.provider,
                 terminalEvent.error.errorMessage ?? "Model request failed.",
               );
-              const next = await resolveNext(target);
+              const switched = await switchToNext(target);
               if (failIfAborted(target)) return;
-              if (next) {
-                state.messagesBeforeSwitch = context.messages.length;
-                await state.onSwitch(next);
-                if (failIfAborted(target)) return;
+              if (switched) {
                 // A raised budget or lower thinking level fitted the failed model, not this one.
                 outputBudget = undefined;
                 thinkingOverride = undefined;
@@ -797,6 +814,45 @@ export function fallbackAwareModelStream(
               restart = true;
               break;
             }
+            if (
+              event.message.stopReason === "stop" &&
+              !sawVisibleOutput &&
+              !assistantHasVisibleOutput(event.message) &&
+              state.retriesEmptyReply?.() &&
+              !signalAborted()
+            ) {
+              // An empty or thinking-only reply is a provider glitch, not an answer. Repeat the
+              // call from the same context with backoff, then try the backups; only when every
+              // attempt is empty does the reply pass through. Its thinking is discarded with
+              // `buffered`, so nothing of a repeated call reaches the transcript.
+              getLogger().info("model.empty_reply", {
+                runId: state.request.runId,
+                provider: target.config.provider,
+                model: target.config.id,
+                retries: emptyRetries,
+              });
+              if (emptyRetries < EMPTY_REPLY_RETRIES) {
+                await abortableDelay(MODEL_PROVIDER_RETRY_DELAYS_MS[emptyRetries] ?? 0, signal);
+                if (failIfAborted(target)) return;
+                emptyRetries += 1;
+                // The empty call finished, so the next one gets its own request window.
+                startedAt = Date.now();
+                buffered = [];
+                restart = true;
+                break;
+              }
+              const switched = await switchToNext(target);
+              if (failIfAborted(target)) return;
+              if (switched) {
+                outputBudget = undefined;
+                thinkingOverride = undefined;
+                emptyRetries = 0;
+                startedAt = Date.now();
+                buffered = [];
+                restart = true;
+                break;
+              }
+            }
             for (const pending of buffered) output.push(pending);
             buffered = [];
             output.push(event);
@@ -807,7 +863,7 @@ export function fallbackAwareModelStream(
             ...event.partial,
             content: event.partial.content.map((part) => ({ ...part })),
           };
-          if (eventHasVisibleOutput(event)) {
+          if (eventHasVisibleText(event)) {
             sawVisibleOutput = true;
             for (const pending of buffered) output.push(pending);
             buffered = [];

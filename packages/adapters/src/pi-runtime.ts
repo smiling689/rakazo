@@ -437,6 +437,8 @@ export class PiAgentRuntime implements AgentRuntime {
           backupOutcomes: new Map(),
           selfRecoveries: 0,
           cutReplies: new WeakMap(),
+          // The same condition that ends the run with the empty-response text below.
+          retriesEmptyReply: () => !request.allowSilentEmpty && toolCalls === 0 && !streamed.trim(),
           stream: (target, ctx, options) => {
             if (hasCurrentImages && !target.model.input.includes("image")) {
               throw new Error(MODEL_IMAGE_INPUT_ERROR);
