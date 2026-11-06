@@ -139,17 +139,39 @@ export class IlinkClient {
     };
   }
 
-  /** Sends one text message; returns the client id the message was sent under. */
-  async sendText(toUserId: string, text: string, contextToken?: string): Promise<string> {
-    return this.sendItem(toUserId, { type: ILINK_ITEM.text, text_item: { text } }, contextToken);
+  /**
+   * Sends one text message; returns the client id the message was sent under. Pass a
+   * `clientId` from ilinkClientId to send a retry under the id of its first try.
+   */
+  async sendText(
+    toUserId: string,
+    text: string,
+    contextToken?: string,
+    clientId?: string,
+  ): Promise<string> {
+    return this.sendItem(
+      toUserId,
+      { type: ILINK_ITEM.text, text_item: { text } },
+      contextToken,
+      clientId,
+    );
   }
 
   /** Sends an uploaded image (a photo, a chart, a sticker). */
-  async sendImage(toUserId: string, uploaded: IlinkUploaded, contextToken?: string): Promise<string> {
+  async sendImage(
+    toUserId: string,
+    uploaded: IlinkUploaded,
+    contextToken?: string,
+    clientId?: string,
+  ): Promise<string> {
     return this.sendItem(
       toUserId,
-      { type: ILINK_ITEM.image, image_item: { media: uploaded.media, mid_size: uploaded.cipherSize } },
+      {
+        type: ILINK_ITEM.image,
+        image_item: { media: uploaded.media, mid_size: uploaded.cipherSize },
+      },
       contextToken,
+      clientId,
     );
   }
 
@@ -159,6 +181,7 @@ export class IlinkClient {
     fileName: string,
     uploaded: IlinkUploaded,
     contextToken?: string,
+    clientId?: string,
   ): Promise<string> {
     return this.sendItem(
       toUserId,
@@ -167,6 +190,7 @@ export class IlinkClient {
         file_item: { media: uploaded.media, file_name: fileName, len: String(uploaded.size) },
       },
       contextToken,
+      clientId,
     );
   }
 
@@ -175,8 +199,8 @@ export class IlinkClient {
     toUserId: string,
     item: IlinkMessageItem,
     contextToken?: string,
+    clientId = `rakazo-${randomUUID()}`,
   ): Promise<string> {
-    const clientId = `rakazo-${randomUUID()}`;
     const body = await this.post(
       "ilink/bot/sendmessage",
       {
@@ -379,6 +403,19 @@ function requestFailure(path: string, body: Record<string, unknown>): IlinkError
 
 function stringOf(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/**
+ * The client id for a send identified by a stable key, so every retry of it goes out under
+ * the same id. Shaped like the random ones (a UUID behind the prefix).
+ */
+export function ilinkClientId(key: string): string {
+  const hash = createHash("sha256").update(key).digest();
+  // Version 5 and RFC 4122 variant bits, as a name-based UUID has them.
+  hash[6] = (hash[6]! & 0x0f) | 0x50;
+  hash[8] = (hash[8]! & 0x3f) | 0x80;
+  const hex = hash.subarray(0, 16).toString("hex");
+  return `rakazo-${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 /** Media keys arrive as 32 hex characters, or base64 of either 16 raw bytes or that hex string. */

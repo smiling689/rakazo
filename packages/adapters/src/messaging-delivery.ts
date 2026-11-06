@@ -528,7 +528,7 @@ async function deliverRow(
         return true;
       }
       const sent = await deps.messaging.sendToThread(
-        { threadId: row.threadId, body: row.body },
+        { threadId: row.threadId, body: row.body, idempotencyKey: row.idempotencyKey },
         context,
       );
       accepted = true;
@@ -605,7 +605,12 @@ async function deliverRow(
       attachment = { name: artifact.name, mimeType: artifact.mimeType, data };
     }
     const sent = await deps.messaging.sendToThread(
-      { threadId, body: row.body, ...(attachment ? { attachment } : {}) },
+      {
+        threadId,
+        body: row.body,
+        idempotencyKey: row.idempotencyKey,
+        ...(attachment ? { attachment } : {}),
+      },
       context,
     );
     accepted = true;

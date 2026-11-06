@@ -18,6 +18,7 @@ import {
   text,
   toPlainText,
 } from "chat";
+import { currentOutboundSendKey } from "../chat-sdk-surface.js";
 import type { IlinkMessage, IlinkMessageItem } from "./ilink-client.js";
 import {
   ILINK_ITEM,
@@ -26,6 +27,7 @@ import {
   ILINK_UPLOAD,
   IlinkClient,
   IlinkError,
+  ilinkClientId,
 } from "./ilink-client.js";
 import { WechatActivity } from "./activity.js";
 import { WechatStateStore } from "./state.js";
@@ -352,23 +354,28 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     const label = collect[0];
     if (label) await this.collectLastImage(userId, label);
     if (remove) await this.removeLastSticker(userId);
+    // A retry of an outbox row sends each bubble under the client id of its first try.
+    const sendKey = currentOutboundSendKey();
+    let bubble = 0;
+    const nextClientId = () => (sendKey ? ilinkClientId(`${sendKey}:${bubble++}`) : undefined);
     let id = "";
     if (body) {
+      const clientId = nextClientId();
       id = await this.sendWithContext(userId, (context) =>
-        this.client.sendText(userId, body, context),
+        this.client.sendText(userId, body, context, clientId),
       );
     }
-    for (const file of files) id = await this.sendUpload(userId, file);
+    for (const file of files) id = await this.sendUpload(userId, file, nextClientId());
     const query = queries[0];
     if (query) {
       try {
         const sticker = await this.stickers.pick(query);
         if (sticker) {
-          id = await this.sendUpload(userId, {
-            data: Buffer.from(sticker.data),
-            filename: sticker.name,
-            mimeType: sticker.mimeType,
-          });
+          id = await this.sendUpload(
+            userId,
+            { data: Buffer.from(sticker.data), filename: sticker.name, mimeType: sticker.mimeType },
+            nextClientId(),
+          );
           await this.activity.rememberSticker(userId, sticker.ref);
         }
       } catch (error) {
@@ -403,7 +410,7 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     }
   }
 
-  private async sendUpload(userId: string, file: FileUpload) {
+  private async sendUpload(userId: string, file: FileUpload, clientId: string | undefined) {
     const data = await uploadBytes(file.data);
     const image = WECHAT_IMAGE_TYPES.has(file.mimeType ?? "");
     const uploaded = await this.client.uploadMedia(
@@ -413,8 +420,8 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     );
     return this.sendWithContext(userId, (context) =>
       image
-        ? this.client.sendImage(userId, uploaded, context)
-        : this.client.sendFile(userId, file.filename, uploaded, context),
+        ? this.client.sendImage(userId, uploaded, context, clientId)
+        : this.client.sendFile(userId, file.filename, uploaded, context, clientId),
     );
   }
 

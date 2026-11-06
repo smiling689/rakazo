@@ -31,6 +31,16 @@ const webhookDrain = new AsyncLocalStorage<{
 }>();
 
 /**
+ * The outbox key of the send in progress. The Chat SDK's post() has no field for it, and an
+ * adapter that can dedupe on the platform derives its message ids from it so a retry reuses them.
+ */
+const outboundSendKey = new AsyncLocalStorage<string>();
+
+export function currentOutboundSendKey(): string | undefined {
+  return outboundSendKey.getStore();
+}
+
+/**
  * Markdown parsing is superlinear on hostile text (unmatched emphasis, deep
  * quotes), so past this many characters in one webhook the text stays literal.
  */
@@ -281,9 +291,11 @@ export class ChatSdkMessagingSurface implements MessagingSurface {
         ? { markdown: request.body }
         : request.body;
     try {
-      const sent = await mounted.chat
-        .thread(toAdapterThreadId(mounted, request.threadId))
-        .post(message);
+      const post = () =>
+        mounted.chat.thread(toAdapterThreadId(mounted, request.threadId)).post(message);
+      const sent = await (request.idempotencyKey
+        ? outboundSendKey.run(request.idempotencyKey, post)
+        : post());
       const handle = "id" in sent && typeof sent.id === "string" ? sent.id : "";
       return { handle };
     } catch (error) {

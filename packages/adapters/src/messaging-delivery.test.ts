@@ -1,4 +1,4 @@
-import type { AdapterContext, MessagingSurface } from "@rakazo/adapter-kit";
+import type { AdapterContext, MessagingSendRequest, MessagingSurface } from "@rakazo/adapter-kit";
 import type { PrismaClient } from "@rakazo/db";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatSdkMessagingSurface, MessagingSendError } from "./chat-sdk-surface.js";
@@ -70,8 +70,12 @@ function findOutboundRow(rows: Array<Record<string, unknown>>, where: OutboundRo
 }
 
 function createFakeSurface(sendError?: Error) {
-  const sendToThread = vi.fn(async () => ({ handle: "handle-out-1" }));
+  const sendToThread = vi.fn(async (_request: MessagingSendRequest, _context: AdapterContext) => ({
+    handle: "handle-out-1",
+  }));
   if (sendError) sendToThread.mockRejectedValue(sendError);
+  // Outbox keys go here, so assertions on sendToThread stay about the message itself.
+  const sendKeys: Array<string | undefined> = [];
   const openDirectThread = vi.fn(
     async (_provider: string, address: string) => `sendblue:opened:${address}`,
   );
@@ -91,11 +95,14 @@ function createFakeSurface(sendError?: Error) {
     ],
     handleWebhook: () => null,
     onInbound: () => undefined,
-    sendToThread,
+    sendToThread: ({ idempotencyKey, ...request }, sendContext) => {
+      sendKeys.push(idempotencyKey);
+      return sendToThread(request, sendContext);
+    },
     openDirectThread,
     acknowledge: vi.fn(async () => undefined),
   };
-  return { messaging, sendToThread, openDirectThread };
+  return { messaging, sendToThread, openDirectThread, sendKeys };
 }
 
 function createDeps(overrides: {
@@ -111,7 +118,9 @@ function createDeps(overrides: {
   botThreadId?: string;
 }) {
   const rows = [...(overrides.outboundRows ?? [])] as Array<Record<string, unknown>>;
-  const { messaging, sendToThread, openDirectThread } = createFakeSurface(overrides.sendError);
+  const { messaging, sendToThread, openDirectThread, sendKeys } = createFakeSurface(
+    overrides.sendError,
+  );
   // Stateful identity row so a cached dmThreadId is visible to later reads.
   const identityRow =
     overrides.identity === null ? null : { ...identity, ...(overrides.identity ?? {}) };
@@ -251,6 +260,7 @@ function createDeps(overrides: {
     jobs: { enqueue: vi.fn(async () => undefined) },
     artifacts: { get: vi.fn(async (storageKey: string) => new TextEncoder().encode(storageKey)) },
     sendToThread,
+    sendKeys,
     openDirectThread,
     rows,
   };
@@ -1303,6 +1313,8 @@ describe("deliverMessagingOutbound conversation order", () => {
       })),
     );
     expect(deps.rows.map((row) => row.status)).toEqual(["sent", "sent", "sent"]);
+    // Each send carries its row's key, so a platform that dedupes sees the retry as the same message.
+    expect(deps.sendKeys).toEqual(["msg:m-1", "msg:m-1:2", "msg:m-1:2", "msg:m-1:3"]);
   });
 
   it.each([

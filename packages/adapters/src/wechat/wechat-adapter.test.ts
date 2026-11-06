@@ -6,6 +6,7 @@ import { createMemoryState } from "@chat-adapter/state-memory";
 import type { Message, Thread } from "chat";
 import { Chat } from "chat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ChatSdkMessagingSurface, MessagingSendError } from "../chat-sdk-surface.js";
 import { messagingPlatformsFromEnv, splitOutboundBody } from "../messaging-platforms.js";
 import type { IlinkError, IlinkMessage } from "./ilink-client.js";
 import { ILINK_RATE_LIMIT_RETRY_SECONDS } from "./ilink-client.js";
@@ -247,6 +248,44 @@ describe("WechatAdapter", () => {
     const other = await failure({ ret: -1, errmsg: "system error" });
     expect(other.failure).toBeUndefined();
     expect(platform!.isPermanentSendError!(other)).toBe(false);
+  });
+
+  it("sends a retried outbox row under the client ids of its first try", async () => {
+    const server = fakeIlink();
+    const adapter = adapterFor(server, false);
+    const [platform] = messagingPlatformsFromEnv({ wechatBotToken: "t", dataDir });
+    const surface = new ChatSdkMessagingSurface([{ ...platform!, adapter }]);
+    const context = {
+      operationId: "op",
+      traceId: "trace",
+      spaceId: "space",
+      userId: "owner",
+      signal: new AbortController().signal,
+    };
+    const send = (idempotencyKey: string) =>
+      surface.sendToThread(
+        { threadId: encodeWechatThreadId(user), body: "Your 3pm reminder.", idempotencyKey },
+        context,
+      );
+    server.sendReplies.push({ ret: -2, errmsg: "freq limit" });
+    const limited = await send("msg:m-1").catch((error: unknown) => error);
+    expect(limited).toBeInstanceOf(MessagingSendError);
+    expect((limited as MessagingSendError).permanent).toBe(false);
+    expect((limited as MessagingSendError).retryAfterMs).toBe(
+      ILINK_RATE_LIMIT_RETRY_SECONDS * 1000,
+    );
+    await send("msg:m-1");
+    await send("msg:m-2");
+
+    const ids = server.requests
+      .filter((request) => request.path === "ilink/bot/sendmessage")
+      .map((request) => (request.body.msg as Record<string, unknown>).client_id as string);
+    expect(ids[1]).toBe(ids[0]);
+    expect(ids[2]).not.toBe(ids[0]);
+    for (const id of ids)
+      expect(id).toMatch(
+        /^rakazo-[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
   });
 
   it("decrypts inbound images on demand", async () => {
