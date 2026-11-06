@@ -233,15 +233,11 @@ function createDeps(
     },
     messagingOutbound: {
       count: vi.fn(
-        async ({
-          where,
-        }: {
-          where: { sourceMessageId: { in: string[] }; status: { not: string } };
-        }) =>
+        async ({ where }: { where: { sourceMessageId: { in: string[] }; status: string } }) =>
           outboundRows.filter(
             (row) =>
               where.sourceMessageId.in.includes(row.sourceMessageId as string) &&
-              (row.status ?? "pending") !== where.status.not,
+              (row.status ?? "pending") === where.status,
           ).length,
       ),
       findFirst: vi.fn(
@@ -1305,6 +1301,9 @@ describe("inbound receipt", () => {
     await expect(handled()).resolves.toBe(false);
 
     deps.outboundRows[0]!.status = "sent";
+    await expect(handled()).resolves.toBe(true);
+    // A row that failed for good is not coming either.
+    deps.outboundRows[0]!.status = "failed";
     await expect(handled()).resolves.toBe(true);
   });
 

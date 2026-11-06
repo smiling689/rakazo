@@ -63,6 +63,13 @@ const THREAD_PREFIX = "wechat:";
 export const WECHAT_UNSUPPORTED_REPLY =
   "这条消息我收不到内容：微信的 bot 接口只转发文字、语音、图片、文件和视频，合并转发的聊天记录、链接卡片和小程序都过不来。可以把文字复制过来，或者截图发我。";
 
+/**
+ * Sent back for a voice note WeChat did not transcribe. Its audio is SILK, which no voice
+ * provider here reads, so the words never reach the bot.
+ */
+export const WECHAT_VOICE_UNREADABLE_REPLY =
+  "这条语音微信没转出文字，我听不了原声。麻烦打字发我，或者重录一条试试。";
+
 export const WECHAT_RETRY_DELAYS_MS = [5_000, 30_000, 120_000];
 /** After this many failed polls in a row, wait before polling again. */
 const POLL_FAILURES_BEFORE_BACKOFF = 3;
@@ -70,10 +77,11 @@ export const WECHAT_POLL_BACKOFF_MS = 30_000;
 /** An expired login stays expired until someone scans a new QR code; check back rarely. */
 export const WECHAT_EXPIRED_PAUSE_MS = 10 * 60_000;
 const TYPING_TICKET_TTL_MS = 10 * 60_000;
-/** WeChat's typing indicator fades after a few seconds; the reference client re-sends it every 5. */
+/**
+ * WeChat's typing indicator fades after a few seconds; the reference client re-sends it every 5.
+ * The messaging receipts re-send it at this pace until the run's reply is out.
+ */
 export const WECHAT_TYPING_REFRESH_MS = 5_000;
-/** Stop showing "typing" when no reply came for this long (the bot may have chosen not to answer). */
-export const WECHAT_TYPING_MAX_MS = 5 * 60_000;
 /** `[收藏表情:...]` keeps the picture the owner sent within this long. */
 const COLLECT_MAX_AGE_MS = 30 * 60_000;
 /** `[删除表情]` removes the sticker sent within this long. */
@@ -108,7 +116,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
   private readonly typingTickets = new Map<string, { ticket: string; expires: number }>();
   private readonly stickers: Pick<StickerLibrary, "pick" | "collect" | "remove">;
   private readonly activity: WechatActivity;
-  private readonly watchers = new Map<string, () => void>();
   /** Context tokens iLink called stale, per contact; a newer one arrives with their next message. */
   private readonly staleContexts = new Map<string, string>();
   /** The last inbound message each contact has in processing; their next one waits for it. */
@@ -139,7 +146,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     this.polling = undefined;
     for (const timer of this.retries) clearTimeout(timer);
     this.retries.clear();
-    for (const stop of [...this.watchers.values()]) stop();
   }
 
   async disconnect() {
@@ -199,7 +205,11 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
       getLogger().info("wechat message without readable content", {
         itemTypes: (raw.item_list ?? []).map((item) => item.type),
       });
-      void this.replyUnsupported(raw.from_user_id);
+      const voice = (raw.item_list ?? []).some((item) => item.type === ILINK_ITEM.voice);
+      void this.replyUnsupported(
+        raw.from_user_id,
+        voice ? WECHAT_VOICE_UNREADABLE_REPLY : WECHAT_UNSUPPORTED_REPLY,
+      );
       return;
     }
     if (attempt === 0) {
@@ -214,7 +224,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
           })
           .catch(() => undefined);
       }
-      this.watchReply(raw.from_user_id);
     }
     const userId = raw.from_user_id;
     const options: WebhookOptions = { waitUntil: (task) => void task.catch(() => undefined) };
@@ -252,43 +261,9 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
     });
   }
 
-  /**
-   * Until a reply to `userId` goes out (from any process), keep "typing" showing: a run's reply
-   * only goes out when it ends. The bot's own first line (message_user) stops it like a reply.
-   */
-  private watchReply(userId: string) {
-    this.watchers.get(userId)?.();
-    const since = Date.now();
-    let busy = false;
-    const timer = setInterval(() => {
-      if (busy) return;
-      busy = true;
-      (async () => {
-        const elapsed = Date.now() - since;
-        if (elapsed >= WECHAT_TYPING_MAX_MS || (await this.activity.repliedSince(userId, since))) {
-          stop();
-          return;
-        }
-        await this.startTyping(encodeWechatThreadId(userId));
-      })()
-        .catch(() => undefined)
-        .finally(() => {
-          busy = false;
-        });
-    }, WECHAT_TYPING_REFRESH_MS);
-    timer.unref?.();
-    const stop = () => {
-      clearInterval(timer);
-      if (this.watchers.get(userId) === stop) this.watchers.delete(userId);
-    };
-    this.watchers.set(userId, stop);
-  }
-
-  private async replyUnsupported(userId: string) {
+  private async replyUnsupported(userId: string, reply: string) {
     try {
-      await this.sendWithContext(userId, (context) =>
-        this.client.sendText(userId, WECHAT_UNSUPPORTED_REPLY, context),
-      );
+      await this.sendWithContext(userId, (context) => this.client.sendText(userId, reply, context));
     } catch (error) {
       getLogger().warn("wechat unsupported-message reply failed", { error: String(error) });
     }
@@ -309,7 +284,11 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
       formatted: root([paragraph([text(body)])]),
       raw,
       author: { userId, userName: userId, fullName: "", isBot: false, isMe: false },
-      attachments: items.flatMap((item) => this.attachment(item)),
+      // A quoted picture or file comes along, so "what is this?" on a quoted image can be answered.
+      attachments: items.flatMap((item) => [
+        ...this.attachment(item),
+        ...(item.ref_msg?.message_item ? this.attachment(item.ref_msg.message_item) : []),
+      ]),
       isMention: true,
       metadata: {
         dateSent: new Date(raw.create_time_ms ?? Date.now()),
@@ -406,7 +385,6 @@ export class WechatAdapter implements Adapter<string, IlinkMessage> {
         getLogger().warn("wechat sticker failed", { error: String(error) });
       }
     }
-    if (id) await this.activity.markReplied(userId).catch(() => undefined);
     return { id, threadId, raw: { client_id: id } as IlinkMessage };
   }
 

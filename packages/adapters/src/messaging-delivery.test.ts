@@ -9,6 +9,7 @@ import {
   MESSAGING_DM_OUTBOUND_CAP,
   MESSAGING_OUTBOUND_MAX_ATTEMPTS,
   mirrorMessagingProgress,
+  WECHAT_REPLY_BUDGET,
 } from "./messaging-delivery.js";
 import { messagingPlatformsFromEnv } from "./messaging-platforms.js";
 
@@ -150,6 +151,12 @@ function createDeps(overrides: {
         if (identityRow && typeof data.dmThreadId === "string") {
           identityRow.dmThreadId = data.dmThreadId;
         }
+        const increment = (data.outboundSinceInbound as { increment?: number } | undefined)
+          ?.increment;
+        if (identityRow && increment) {
+          identityRow.outboundSinceInbound =
+            (identityRow.outboundSinceInbound as number) + increment;
+        }
         return identityRow;
       }),
     },
@@ -188,22 +195,42 @@ function createDeps(overrides: {
         if (where?.id) return rows.find((row) => row.id === where.id) ?? null;
         return null;
       }),
-      findMany: vi.fn(async ({ where }: { where?: { status?: string; OR?: unknown[] } } = {}) => {
-        const now = Date.now();
-        const found = rows.filter((row) => {
-          if (where?.status && row.status !== where.status) return false;
-          if (!where?.OR) return row.status === "pending";
-          const next = row.nextAttemptAt;
-          if (next == null) return true;
-          const nextMs = next instanceof Date ? next.getTime() : new Date(String(next)).getTime();
-          return nextMs <= now;
-        });
-        // The drain reads in send order (orderBy createdAt).
-        const ordered = found.every((row) => row.createdAt instanceof Date)
-          ? found.sort((a, b) => (a.createdAt as Date).getTime() - (b.createdAt as Date).getTime())
-          : found;
-        return ordered;
-      }),
+      findMany: vi.fn(
+        async ({
+          where,
+        }: {
+          where?: {
+            status?: string;
+            OR?: unknown[];
+            identityId?: string;
+            createdAt?: { gt: Date };
+          };
+        } = {}) => {
+          const now = Date.now();
+          const found = rows.filter((row) => {
+            if (where?.status && row.status !== where.status) return false;
+            if (where?.identityId && row.identityId !== where.identityId) return false;
+            if (where?.createdAt && !((row.createdAt as Date) > where.createdAt.gt)) return false;
+            if (!where?.OR) return row.status === "pending";
+            const next = row.nextAttemptAt;
+            if (next == null) return true;
+            const nextMs = next instanceof Date ? next.getTime() : new Date(String(next)).getTime();
+            return nextMs <= now;
+          });
+          // The drain reads in send order (orderBy createdAt).
+          const ordered = found.every((row) => row.createdAt instanceof Date)
+            ? found.sort(
+                (a, b) => (a.createdAt as Date).getTime() - (b.createdAt as Date).getTime(),
+              )
+            : found;
+          return ordered;
+        },
+      ),
+      count: vi.fn(
+        async ({ where }: { where: { identityId: string; status: string } }) =>
+          rows.filter((row) => row.identityId === where.identityId && row.status === where.status)
+            .length,
+      ),
       findFirst: vi.fn(async ({ where }: { where: OutboundRowFilter }) =>
         findOutboundRow(rows, where),
       ),
@@ -556,6 +583,66 @@ describe("deliverMessagingOutbound", () => {
     expect(deps.rows).toEqual([
       expect.objectContaining({ kind: "dm", status: "sent", providerHandle: "handle-out-1" }),
     ]);
+  });
+
+  it("joins replies queued behind WeChat's last allowed send into it", async () => {
+    const at = Date.now();
+    const queued = (id: string, idempotencyKey: string, body: string, offset: number) => ({
+      id,
+      idempotencyKey,
+      kind: "dm",
+      identityId: "mi-1",
+      body,
+      status: "pending",
+      sourceMessageId: "m-1",
+      createdAt: new Date(at + offset),
+    });
+    const deps = createDeps({
+      run: null,
+      identity: {
+        provider: "wechat",
+        dmThreadId: "wechat:dm-1",
+        outboundSinceInbound: WECHAT_REPLY_BUDGET - 1,
+      },
+      artifacts: [{ id: "art-1", spaceId: "ws-1", name: "report.pdf" }],
+      outboundRows: [
+        queued("out-1", "msg:m-1", "查好了", 0),
+        queued("out-2", "msg:m-1:2", "价格在涨", 1),
+        queued("out-3", "msg:m-1:file:art-1", "", 2),
+        queued("out-4", "msg:m-2", "明天再看", 3),
+      ],
+    });
+    await deliverMessagingOutbound(deps, {}, context);
+
+    expect(deps.sendToThread).toHaveBeenCalledTimes(1);
+    expect(deps.sendToThread.mock.calls[0]![0]).toEqual({
+      threadId: "wechat:dm-1",
+      body: '查好了\n\n价格在涨\n\n明天再看\n\nMessage limit reached, so these were not sent: "report.pdf".',
+    });
+    expect(deps.rows.map((row) => [row.id, row.status])).toEqual([
+      ["out-1", "sent"],
+      ["out-2", "sent"],
+      ["out-3", "failed"],
+      ["out-4", "sent"],
+    ]);
+
+    // A later reply waits for the owner's next message instead of failing at iLink.
+    deps.rows.push(queued("out-5", "msg:m-3", "还有一件事", 4));
+    await deliverMessagingOutbound(deps, {}, context);
+    expect(deps.sendToThread).toHaveBeenCalledTimes(1);
+    expect(deps.rows.at(-1)).toEqual(expect.objectContaining({ status: "pending" }));
+  });
+
+  it("holds a WeChat interim line that would leave the reply no room", async () => {
+    const deps = createDeps({
+      identity: {
+        provider: "wechat",
+        dmThreadId: "wechat:dm-1",
+        outboundSinceInbound: WECHAT_REPLY_BUDGET - 3,
+      },
+    });
+    await mirrorMessagingProgress(deps, "run-1");
+    expect(deps.rows).toEqual([]);
   });
 
   it("returns a transient send failure to pending and schedules a delayed retry", async () => {

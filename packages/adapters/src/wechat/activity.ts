@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { IlinkMedia } from "./ilink-client.js";
-import type { StickerRef } from "./stickers.js";
 import { loginKey } from "./state.js";
+import type { StickerRef } from "./stickers.js";
 
 /** The picture a contact sent last, kept so a later reply can add it to the sticker collection. */
 export interface WechatImageRef {
@@ -14,24 +14,15 @@ export interface WechatImageRef {
 
 /**
  * Per-contact facts the two processes share through the data directory: the API process polls
- * and records the last picture a contact sent; whichever process delivers a reply records when
- * it did (and which sticker it sent), so the poller can stop its typing indicator and skip its "on it" note. One small file
- * per contact and fact, written whole, so the processes never overwrite each other's data.
+ * and records the last picture a contact sent; whichever process delivers a reply records which
+ * sticker it sent. One small file per contact and fact, written whole, so the processes never
+ * overwrite each other's data.
  */
 export class WechatActivity {
   private readonly dir: string;
 
   constructor(dataDir: string, token: string) {
     this.dir = join(dataDir, "messaging", `wechat-${loginKey(token)}-activity`);
-  }
-
-  async markReplied(userId: string): Promise<void> {
-    await this.write("replied", userId, { at: Date.now() });
-  }
-
-  async repliedSince(userId: string, since: number): Promise<boolean> {
-    const replied = await this.read<{ at?: number }>("replied", userId);
-    return (replied?.at ?? 0) >= since;
   }
 
   async rememberImage(userId: string, image: Omit<WechatImageRef, "at">): Promise<void> {

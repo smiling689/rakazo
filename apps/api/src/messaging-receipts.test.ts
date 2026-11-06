@@ -1,7 +1,7 @@
 import type { AdapterContext, MessagingPlatformDescriptor } from "@rakazo/adapter-kit";
 import { getLogger } from "@rakazo/logging";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createMessagingReceipts } from "./messaging-receipts.js";
+import { createMessagingReceipts, TYPING_REFRESH_MAX_MS } from "./messaging-receipts.js";
 
 const SLACK_THREAD = "slack:C1:1700000000.000100";
 const SLACK_HANDLE = "1700000000.000100";
@@ -11,6 +11,10 @@ function fakeMessaging() {
     { provider: "slack", capabilities: { direct: true, groups: true, receipt: "reaction" } },
     { provider: "sendblue", capabilities: { direct: true, groups: true, receipt: "typing" } },
     { provider: "telegram", capabilities: { direct: true, groups: true, receipt: null } },
+    {
+      provider: "wechat",
+      capabilities: { direct: true, groups: false, receipt: "typing", typingRefreshMs: 5_000 },
+    },
   ];
   return {
     platforms: () => platforms,
@@ -38,6 +42,36 @@ describe("createMessagingReceipts", () => {
     expect(
       messaging.acknowledge.mock.calls.map(([threadId, handle]) => [threadId, handle]),
     ).toEqual([["sendblue:dm-1", "h-1"]]);
+  });
+
+  it("keeps a fading typing indicator up until the run's reply is out", async () => {
+    const messaging = fakeMessaging();
+    let replied = false;
+    const receipts = createMessagingReceipts(messaging);
+    receipts.acknowledge("wechat:dm-1", "h-1", async () => replied);
+    // A platform whose typing does not fade gets the one bubble only.
+    receipts.acknowledge("sendblue:dm-1", "h-2", unhandled);
+    const sends = (threadId: string) =>
+      messaging.acknowledge.mock.calls.filter(([sent]) => sent === threadId).length;
+
+    // An interim message in between clears the bubble; the next refresh puts it back.
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(sends("wechat:dm-1")).toBe(1 + (10 * 60_000) / 5_000);
+    expect(sends("sendblue:dm-1")).toBe(1);
+
+    replied = true;
+    await vi.advanceTimersByTimeAsync(5_000);
+    const atReply = sends("wechat:dm-1");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sends("wechat:dm-1")).toBe(atReply);
+
+    // A run that never reports back stops refreshing after the safety bound.
+    receipts.acknowledge("wechat:dm-2", "h-3", unhandled);
+    await vi.advanceTimersByTimeAsync(TYPING_REFRESH_MAX_MS);
+    const atBound = sends("wechat:dm-2");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sends("wechat:dm-2")).toBe(atBound);
+    receipts.stop();
   });
 
   it("reacts only once the reply is a minute late", async () => {
