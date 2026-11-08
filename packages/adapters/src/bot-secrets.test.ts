@@ -197,9 +197,32 @@ describe("authenticated secret requests", () => {
     });
   });
 
+  it("returns where the next page is, redacted", async () => {
+    const { input, fetch } = await fixture();
+    const page = (n: number) => `${destination.origin}/api/v1/courses?page=${n}&per_page=10`;
+    fetch.mockResolvedValueOnce(
+      new Response("[]", {
+        headers: {
+          Link: `<${page(1)}>; rel="current",<${page(2)}>; rel="next",<${page(1)}>; rel="first", <${page(5)}&k=${secret}>; rel=last`,
+          "X-Total-Count": "42",
+          "X-Echo": secret,
+        },
+      }),
+    );
+    const result = await requestWithBotSecret(input);
+    expect(result).toMatchObject({
+      status: 200,
+      links: { current: page(1), next: page(2), first: page(1) },
+      headers: { "x-total-count": "42" },
+      truncated: false,
+    });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain("x-echo");
+  });
+
   it("redacts before truncating and bounds the response body", async () => {
     const { input, fetch } = await fixture();
-    fetch.mockResolvedValueOnce(new Response("x".repeat(19_990) + secret));
+    fetch.mockResolvedValueOnce(new Response("x".repeat(199_990) + secret));
     const result = await requestWithBotSecret(input);
     expect(result).toMatchObject({ truncated: true });
     expect(JSON.stringify(result)).not.toContain("fake-key");
