@@ -982,6 +982,49 @@ export async function forgetBotSecret(prisma: PrismaClient, scope: BotSecretScop
   return { removed: true };
 }
 
+/**
+ * A longer response body is cut here. The run saves a result too long for the model to a file
+ * the bot can read in parts, so this only bounds what one call returns: a page of 100 records
+ * with descriptions fits.
+ */
+const MAX_SECRET_RESPONSE_CHARS = 200_000;
+/** Response headers APIs page and rate-limit with. Other headers can echo request values. */
+const PAGING_HEADERS = [
+  "content-range",
+  "retry-after",
+  "x-next-page",
+  "x-page",
+  "x-per-page",
+  "x-total",
+  "x-total-count",
+  "x-total-pages",
+] as const;
+
+/**
+ * Where a paged API says the rest is: `links` from the `Link` header by relation (Canvas and
+ * GitHub put the next page there), and `headers` for the other paging headers present.
+ */
+export function responsePaging(headers: Headers): {
+  links?: Record<string, string>;
+  headers?: Record<string, string>;
+} {
+  const links: Record<string, string> = {};
+  for (const [, url, params] of (headers.get("link") ?? "").matchAll(/<([^>]*)>([^,]*)/g)) {
+    const rel = /;\s*rel\s*=\s*"?([^";]+)"?/i.exec(params ?? "")?.[1];
+    for (const name of rel?.trim().toLowerCase().split(/\s+/) ?? [])
+      if (url && !(name in links)) links[name] = url;
+  }
+  const found: Record<string, string> = {};
+  for (const name of PAGING_HEADERS) {
+    const value = headers.get(name);
+    if (value !== null) found[name] = value;
+  }
+  return {
+    ...(Object.keys(links).length ? { links } : {}),
+    ...(Object.keys(found).length ? { headers: found } : {}),
+  };
+}
+
 /** Credentials are resolved only inside this destination-bound HTTP boundary. */
 export async function requestWithBotSecret(input: {
   prisma: PrismaClient;
@@ -1063,10 +1106,18 @@ export async function requestWithBotSecret(input: {
     }
     // Redact before truncating, so an output boundary cannot expose part of a value.
     const safe = JSON.stringify(redactConnectorPayload(body, redactions));
+    const paging = redactConnectorPayload(responsePaging(response.headers), redactions) as Record<
+      string,
+      unknown
+    >;
     return {
       status: response.status,
-      body: safe.length > 20_000 ? safe.slice(0, 20_000) : JSON.parse(safe),
-      truncated: safe.length > 20_000,
+      ...paging,
+      body:
+        safe.length > MAX_SECRET_RESPONSE_CHARS
+          ? safe.slice(0, MAX_SECRET_RESPONSE_CHARS)
+          : JSON.parse(safe),
+      truncated: safe.length > MAX_SECRET_RESPONSE_CHARS,
     };
   } catch {
     return { error: "Authenticated request failed. Check the destination and credential." };
