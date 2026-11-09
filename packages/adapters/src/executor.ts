@@ -257,6 +257,7 @@ import {
   recordTurnReplay,
   recordTurnTranscript,
   replayPrefixKey,
+  replayWindowBefore,
   withSentTurns,
 } from "./turn-replay.js";
 import { createWebProvider } from "./web-provider-factory.js";
@@ -1953,6 +1954,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
         let instructions = instructionsFor(undefined);
         let runPrompt = [prompt, turnContext].filter(Boolean).join("\n\n");
         let replayedHistory = runtimeHistory;
+        let replayWindowStart: Date | undefined;
         if (replaysTurn) {
           try {
             // This bot's own replies and the runs that wrote them, whose tool work is replayed.
@@ -1974,6 +1976,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
               new Date(),
             );
             instructions = instructionsFor(plan.pinned);
+            replayWindowStart = replayWindowBefore(plan, state);
             runPrompt = [prompt, plan.note].filter(Boolean).join("\n\n");
             replayedHistory = sent.history;
             // A lost record only costs the next turn its cache hit.
@@ -2028,6 +2031,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
               contextStrategy: deps.contextStrategy,
               instructions,
               history: replayedHistory,
+              ...(replayWindowStart ? { replayWindowBefore: replayWindowStart.toISOString() } : {}),
               currentTurnImages,
               currentRunRequiresImageInput,
               currentTurnImageFileFallback: Boolean(

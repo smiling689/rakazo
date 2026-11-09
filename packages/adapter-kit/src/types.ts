@@ -570,6 +570,11 @@ export interface AgentRunRequest {
     /** Images attached to this message, hydrated only for recent user turns. */
     images?: AgentInputImage[];
   }>;
+  /**
+   * This bot's replies written at or after this time replay their tool results whole; only older
+   * ones share the stub window (see replayTranscripts). Unset: every reply shares it.
+   */
+  replayWindowBefore?: string;
   currentTurnImages?: AgentInputImage[];
   /** A confirmed image belongs to this run, including a resumed waiting-input reply. */
   currentRunRequiresImageInput?: boolean;

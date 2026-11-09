@@ -332,6 +332,7 @@ export class PiAgentRuntime implements AgentRuntime {
             withoutSteeringMessages(request.history, initialSteering),
             request.prompt,
             request.sourceMessageId,
+            request.replayWindowBefore,
           );
         const representedHistoryIds = new Set(
           restored
@@ -1303,6 +1304,7 @@ function toHistory(
   history: AgentRunRequest["history"],
   prompt: string,
   sourceMessageId?: string | null,
+  replayWindowBefore?: string,
 ): HistoryMessage[] {
   let duplicatePromptIndex = -1;
   for (let index = history.length - 1; index >= 0; index -= 1) {
@@ -1321,11 +1323,15 @@ function toHistory(
       : history.filter((_, index) => index !== duplicatePromptIndex);
   // This bot's replies whose runs recorded a transcript, replayed together (see replayTranscripts).
   const ownReplies = prior.filter((m) => m.role === "assistant" && !m.speaker && m.sentReply);
+  const before = replayWindowBefore ? Date.parse(replayWindowBefore) : Number.NaN;
+  const wholeFrom = Number.isNaN(before)
+    ? ownReplies.length
+    : ownReplies.findIndex((m) => !(Date.parse(m.createdAt ?? "") < before));
   const replays = new Map(
-    replayTranscripts(ownReplies.map((m) => m.sentReply!)).map((messages, index) => [
-      ownReplies[index],
-      messages,
-    ]),
+    replayTranscripts(
+      ownReplies.map((m) => m.sentReply!),
+      wholeFrom < 0 ? ownReplies.length : wholeFrom,
+    ).map((messages, index) => [ownReplies[index], messages]),
   );
   return prior
     .filter((m) => m.role === "user" || m.role === "assistant")
