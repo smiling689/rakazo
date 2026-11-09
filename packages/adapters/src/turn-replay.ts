@@ -25,6 +25,8 @@ export interface PinnedContextState {
   last?: { prefixKey: string; noteBytes: number; createdAt: Date };
   /** The context in the system prompt since the last pin. */
   pinned?: string;
+  /** When the last pin was sent: the prompt cache has been warm since. */
+  pinnedAt?: Date;
   /** The context the model last saw: the pinned one plus every note since. */
   seen?: string;
 }
@@ -68,7 +70,7 @@ export async function loadPinnedContextState(
     db.turnReplay.findFirst({
       where: { ...where, pinned: true },
       orderBy,
-      select: { context: true },
+      select: { context: true, createdAt: true },
     }),
     db.turnReplay.findFirst({
       where: { ...where, context: { not: null } },
@@ -78,7 +80,7 @@ export async function loadPinnedContextState(
   ]);
   return {
     ...(last ? { last } : {}),
-    ...(pinned ? { pinned: pinned.context ?? "" } : {}),
+    ...(pinned ? { pinned: pinned.context ?? "", pinnedAt: pinned.createdAt } : {}),
     ...(seen?.context != null ? { seen: seen.context } : {}),
   };
 }
@@ -117,6 +119,16 @@ export function planPinnedContext(
     note,
     record: { context: current, pinned: false, noteBytes, prefixKey },
   };
+}
+
+/**
+ * Earlier tool results are stubbed only when the cache is lost anyway, like the pinned context:
+ * a turn that pins again moves the stub window over every earlier reply, and the turns after it
+ * keep that window and replay the replies written since whole. Session compaction bounds what
+ * they add up to.
+ */
+export function replayWindowBefore(plan: ContextPlan, state: PinnedContextState): Date | undefined {
+  return plan.record.pinned ? undefined : state.pinnedAt;
 }
 
 /** The lines that left and joined the context, each line counted as often as it appears. */

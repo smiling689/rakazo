@@ -5,6 +5,7 @@ import {
   recordTurnReplay,
   recordTurnTranscript,
   replayPrefixKey,
+  replayWindowBefore,
   withSentTurns,
 } from "./turn-replay.js";
 
@@ -81,6 +82,23 @@ describe("planPinnedContext", () => {
         .record.pinned,
     ).toBe(true);
     expect(planPinnedContext("new", state, "k", now).record.pinned).toBe(false);
+  });
+});
+
+describe("replayWindowBefore", () => {
+  it("keeps the stub window of the last pin while warm, and moves it on a new pin", () => {
+    const pinnedAt = new Date("2026-01-02T09:00:00Z");
+    const state = {
+      last: { prefixKey: "k", noteBytes: 0, createdAt: recently },
+      pinned: "memory A",
+      pinnedAt,
+    };
+    expect(replayWindowBefore(planPinnedContext("memory A", state, "k", now), state)).toBe(
+      pinnedAt,
+    );
+    expect(replayWindowBefore(planPinnedContext("memory A", state, "other", now), state)).toBe(
+      undefined,
+    );
   });
 });
 

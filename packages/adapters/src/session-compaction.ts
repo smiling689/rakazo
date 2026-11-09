@@ -130,7 +130,8 @@ export async function compactSessionHistory(
 
 /**
  * What the bot's earlier tool work adds to the history when it is replayed (see
- * pi-runtime-transcript.ts), counted on the first reply of each run, where it is replayed.
+ * pi-runtime-transcript.ts), counted on the first reply of each run, where it is replayed. Replies
+ * written since the last pin replay whole while the cache stays warm, and are counted so.
  */
 async function replayedTranscriptTokensBySeq(
   deps: Pick<CompactHistoryDeps, "prisma">,
@@ -140,20 +141,31 @@ async function replayedTranscriptTokensBySeq(
     role: string;
     botId: string | null;
     runId: string | null;
+    createdAt: Date;
   }>,
 ): Promise<Map<number, number>> {
-  const firstReplies = new Map<string, number>();
+  const firstReplies = new Map<string, { seq: number; createdAt: Date }>();
   for (const message of messages)
     if (message.role === "bot" && message.botId === thread.botId && message.runId)
-      if (!firstReplies.has(message.runId)) firstReplies.set(message.runId, message.seq);
-  const transcripts = await loadTurnTranscripts(deps.prisma, thread.id, thread.botId, [
-    ...firstReplies.keys(),
+      if (!firstReplies.has(message.runId))
+        firstReplies.set(message.runId, { seq: message.seq, createdAt: message.createdAt });
+  const [transcripts, lastPin] = await Promise.all([
+    loadTurnTranscripts(deps.prisma, thread.id, thread.botId, [...firstReplies.keys()]),
+    deps.prisma.turnReplay.findFirst({
+      where: { threadId: thread.id, botId: thread.botId, pinned: true },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      select: { createdAt: true },
+    }),
   ]);
   const replayed = [...firstReplies].filter(([runId]) => transcripts.has(runId));
+  const wholeFrom = lastPin
+    ? replayed.findIndex(([, reply]) => reply.createdAt >= lastPin.createdAt)
+    : -1;
   const tokens = replayedTranscriptTokens(
     replayed.map(([runId]) => transcripts.get(runId)!.messages),
+    wholeFrom < 0 ? replayed.length : wholeFrom,
   );
-  return new Map(replayed.map(([, seq], index) => [seq, tokens[index]!]));
+  return new Map(replayed.map(([, reply], index) => [reply.seq, tokens[index]!]));
 }
 
 /** A routine-trigger run with no visible message; returns null when one already exists. */

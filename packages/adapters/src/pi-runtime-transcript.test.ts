@@ -215,6 +215,48 @@ describe("turn transcripts", () => {
     expect(JSON.stringify(second!.slice(0, -1))).toBe(JSON.stringify(first!.slice(0, -1)));
   });
 
+  it("replays replies written since replayWindowBefore whole", async () => {
+    providerState.stream.mockImplementation(() =>
+      stream(assistant([{ type: "text", text: "Done." }], "stop")),
+    );
+    // Ten earlier turns that each read about 5k tokens: together past the 32k window.
+    const history: AgentRunRequest["history"] = Array.from({ length: 10 }, (_, index) => [
+      { id: `u-${index}`, role: "user" as const, content: `Read ${index}.` },
+      {
+        id: `a-${index}`,
+        role: "assistant" as const,
+        content: `Answer ${index}.`,
+        createdAt: new Date(Date.UTC(2026, 0, 2, 9, index)).toISOString(),
+        sentReply: [
+          assistant(
+            [{ type: "toolCall", id: `call-${index}`, name: "read_file", arguments: { index } }],
+            "toolUse",
+          ),
+          {
+            role: "toolResult",
+            toolCallId: `call-${index}`,
+            toolName: "read_file",
+            content: [{ type: "text", text: "字".repeat(4_000) }],
+            isError: false,
+            timestamp: index,
+          },
+          assistant([{ type: "text", text: `Answer ${index}.` }], "stop"),
+        ],
+      },
+    ]).flat();
+    await run({ runId: "run-cold", prompt: "Next.", history });
+    // Pinned before the fifth reply: the four before it fit the window, the rest replay whole.
+    await run({
+      runId: "run-warm",
+      prompt: "Next.",
+      history,
+      replayWindowBefore: new Date(Date.UTC(2026, 0, 2, 9, 4)).toISOString(),
+    });
+    const [cold, warm] = sentMessages();
+    expect(JSON.stringify(cold)).toContain("[tool result omitted");
+    expect(JSON.stringify(warm)).not.toContain("[tool result omitted");
+  });
+
   it("does not record a turn resumed from a checkpoint", async () => {
     const onTranscript = vi.fn();
     providerState.stream.mockImplementation(() =>
@@ -339,6 +381,19 @@ describe("replayTranscripts", () => {
     expect(
       results.map((message) => JSON.stringify(message).includes("[tool result omitted")),
     ).toEqual([true, true, false, false, false, false, false, false]);
+  });
+
+  it("replays turns from wholeFrom on whole, leaving the window of earlier turns as it was", () => {
+    const turns = Array.from({ length: 12 }, (_, index) => turn(index));
+    // A pin after turn 3: every later turn replays the first four as that pin did.
+    const pinned = replayTranscripts(turns.slice(0, 4));
+    for (let count = 5; count <= turns.length; count += 1) {
+      const replay = replayTranscripts(turns.slice(0, count), 4);
+      expect(JSON.stringify(replay.slice(0, 4))).toBe(JSON.stringify(pinned));
+      expect(stubbed(replay.slice(4))).toEqual([]);
+    }
+    // The next pin moves the window over all of them.
+    expect(stubbed(replayTranscripts(turns))).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
   });
 
   it("keeps earlier turns byte-identical until the frontier jumps", () => {

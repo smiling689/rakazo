@@ -171,16 +171,26 @@ export function recordedTranscript(messages: readonly unknown[]): Message[] {
 /**
  * Earlier turns' transcripts, oldest first, as they are replayed: tool results before the
  * window's start become a stub that names the tool and the size left out.
+ *
+ * Only the transcripts before `wholeFrom` count toward the window; later ones replay whole. A
+ * stub rewrites the history in the middle, and the provider then reuses its cache only up to the
+ * system prompt, so a caller passes the turns written since the cache was last lost: the window
+ * moves only when the cache is cold anyway (see replayWindowBefore in turn-replay.ts).
  */
-export function replayTranscripts(transcripts: readonly (readonly unknown[])[]): Message[][] {
+export function replayTranscripts(
+  transcripts: readonly (readonly unknown[])[],
+  wholeFrom = transcripts.length,
+): Message[][] {
   const turns = transcripts.map(turnTranscript);
-  const slots = turns.flatMap((messages, turn) =>
-    messages.flatMap((message, index) =>
-      message.role === "toolResult"
-        ? [{ turn, index, size: estimateTextTokens(resultText(message)) }]
-        : [],
-    ),
-  );
+  const slots = turns
+    .slice(0, wholeFrom)
+    .flatMap((messages, turn) =>
+      messages.flatMap((message, index) =>
+        message.role === "toolResult"
+          ? [{ turn, index, size: estimateTextTokens(resultText(message)) }]
+          : [],
+      ),
+    );
   for (const slot of slots.slice(0, batchedWindowStart(slots, REPLAYED_RESULTS_WINDOW))) {
     const message = turns[slot.turn]![slot.index]!;
     if (message.role === "toolResult") turns[slot.turn]![slot.index] = stubbed(message);
@@ -189,8 +199,11 @@ export function replayTranscripts(transcripts: readonly (readonly unknown[])[]):
 }
 
 /** Estimated tokens each transcript adds to the history when replayed, for compaction. */
-export function replayedTranscriptTokens(transcripts: readonly (readonly unknown[])[]): number[] {
-  return replayTranscripts(transcripts).map((messages) =>
+export function replayedTranscriptTokens(
+  transcripts: readonly (readonly unknown[])[],
+  wholeFrom = transcripts.length,
+): number[] {
+  return replayTranscripts(transcripts, wholeFrom).map((messages) =>
     estimateContextTokens(providerContextPrefix("", [], messages).messages),
   );
 }

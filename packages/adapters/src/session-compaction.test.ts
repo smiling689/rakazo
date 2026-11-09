@@ -22,6 +22,10 @@ function harness(options: {
   flush?: { seq: number; status: string; minutesAgo?: number } | null;
   /** Characters of reply text in the stored transcript of each bot message's run. */
   transcriptChars?: number;
+  /** Characters of one tool result in each stored transcript, instead of reply text. */
+  transcriptResultChars?: number;
+  /** When the thread's last pinned turn was sent. */
+  pinnedAt?: Date;
 }) {
   const thread = {
     id: "thread-1",
@@ -79,21 +83,46 @@ function harness(options: {
     },
     turnReplay: {
       findMany: vi.fn(async (args: { where: { runId: { in: string[] } } }) =>
-        options.transcriptChars
+        options.transcriptChars || options.transcriptResultChars
           ? args.where.runId.in.map((runId) => ({
               runId,
               transcript: JSON.stringify({
-                messages: [
-                  {
-                    role: "assistant",
-                    content: [{ type: "text", text: "字".repeat(options.transcriptChars!) }],
-                  },
-                ],
+                messages: options.transcriptResultChars
+                  ? [
+                      {
+                        role: "assistant",
+                        content: [
+                          {
+                            type: "toolCall",
+                            id: `call-${runId}`,
+                            name: "read_file",
+                            arguments: {},
+                          },
+                        ],
+                        stopReason: "toolUse",
+                      },
+                      {
+                        role: "toolResult",
+                        toolCallId: `call-${runId}`,
+                        toolName: "read_file",
+                        content: [
+                          { type: "text", text: "字".repeat(options.transcriptResultChars) },
+                        ],
+                        isError: false,
+                      },
+                    ]
+                  : [
+                      {
+                        role: "assistant",
+                        content: [{ type: "text", text: "字".repeat(options.transcriptChars!) }],
+                      },
+                    ],
                 steeringMessageIds: [],
               }),
             }))
           : [],
       ),
+      findFirst: vi.fn(async () => (options.pinnedAt ? { createdAt: options.pinnedAt } : null)),
     },
     $transaction: vi.fn(async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx)),
   };
@@ -138,6 +167,23 @@ describe("compactSessionHistory", () => {
       }),
     );
     expect(h.runCreate).toHaveBeenCalled();
+  });
+
+  it("counts results written since the last pin whole, as they are replayed while warm", async () => {
+    // 30k tokens of messages and 15 results of about 8k tokens: whole they pass the 131k
+    // threshold; stubbed outside the 32k window they do not.
+    const options = {
+      messages: 30,
+      charsEach: 1_000,
+      minutesSinceLast: 2,
+      transcriptResultChars: 8_000,
+    };
+    const stubbed = harness(options);
+    await compactSessionHistory(stubbed.deps as never, { threadId: "thread-1" }, now);
+    expect(stubbed.runCreate).not.toHaveBeenCalled();
+    const warm = harness({ ...options, pinnedAt: new Date(now.getTime() - 3 * 60 * 60_000) });
+    await compactSessionHistory(warm.deps as never, { threadId: "thread-1" }, now);
+    expect(warm.runCreate).toHaveBeenCalled();
   });
 
   it("queues a silent memory flush first when an idle history passes the floor", async () => {
