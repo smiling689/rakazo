@@ -37,6 +37,7 @@ import {
   HISTORY_WINDOW_SIZE,
   shouldEnqueueCompaction,
 } from "./history-compaction.js";
+import { tellRequesterRunWaits } from "./peer-wait-notice.js";
 import {
   backOffRoutineAfterAccountError,
   clearRoutineBackoff,
@@ -436,6 +437,7 @@ async function pauseForAnswer(ctx: RunContext, event: RuntimeEvent<"ask">) {
     botId: bot.id,
     threadId: thread.id,
   });
+  await tellRequesterRunWaits(ctx, { kind: "answer", title: safeText });
 }
 
 async function pauseForTakeover(ctx: RunContext, event: RuntimeEvent<"takeover">) {
@@ -510,6 +512,7 @@ async function pauseForTakeover(ctx: RunContext, event: RuntimeEvent<"takeover">
     botId: bot.id,
     threadId: thread.id,
   });
+  await tellRequesterRunWaits(ctx, { kind: "takeover", reason: safeReason });
 }
 
 /** Show the tool step, stop a repeating loop, and run the tool for scripted runtimes. */

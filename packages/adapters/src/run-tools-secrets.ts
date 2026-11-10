@@ -1,6 +1,6 @@
 import { runContinueJob } from "@rakazo/adapter-kit";
 import { BotSecretName, botSecretSubmissionSchema } from "@rakazo/contracts";
-import { createStreamingRedactor, displayName } from "@rakazo/core";
+import { createStreamingRedactor, displayName, redactSecrets } from "@rakazo/core";
 import { runCodeKind, runLoginKind, runSecretKind } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import {
@@ -29,6 +29,7 @@ import {
   resolveRequestSecretDestination,
   sameSecretDestination,
 } from "./bot-secrets.js";
+import { tellRequesterRunWaits } from "./peer-wait-notice.js";
 import { addRunSecrets, pauseForSecret, persistTurnCheckpoint } from "./run-context.js";
 import { recordEffect } from "./run-effects.js";
 import { renewRunLease } from "./run-lifecycle.js";
@@ -383,6 +384,10 @@ export const secretTools: ToolHandlers = {
       ...secretAskNotification(displayName(bot.name, "Bot"), askText, ctx.secrets),
       botId: bot.id,
       threadId: thread.id,
+    });
+    await tellRequesterRunWaits(ctx, {
+      kind: "secret",
+      title: redactSecrets(askText, ctx.secrets),
     });
     return pauseForSecret(ctx);
   },

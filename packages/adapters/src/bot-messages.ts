@@ -82,7 +82,12 @@ export async function messageBot(
     intent?: BotMessageIntent;
     deliveryKey?: string;
   },
-  options?: { allowTerminalSource?: boolean; forceUnread?: boolean },
+  options?: {
+    allowTerminalSource?: boolean;
+    /** A paused run telling the bot that woke it what it waits for (see peer-wait-notice). */
+    waitingSource?: boolean;
+    forceUnread?: boolean;
+  },
 ) {
   const message = String(input.message ?? "").trim();
   if (!message) return { ok: false as const, error: "message is required" };
@@ -113,7 +118,7 @@ export async function messageBot(
   if (!target.thread)
     return { ok: false as const, error: `${target.name} has no chat to deliver to` };
   const returnsToSender =
-    options?.allowTerminalSource === true &&
+    (options?.allowTerminalSource === true || options?.waitingSource === true) &&
     (intent === "result" || intent === "status") &&
     (sourceContext?.intent === undefined ||
       sourceContext.intent === "request" ||
@@ -191,7 +196,9 @@ export async function messageBot(
             userId: run.userId,
             status: options?.allowTerminalSource
               ? { in: ["completed", "failed", "cancelled"] }
-              : "running",
+              : options?.waitingSource
+                ? { in: ["waiting_input", "waiting_takeover"] }
+                : "running",
           },
           select: { id: true },
         });

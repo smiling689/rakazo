@@ -53,6 +53,7 @@ import type { ExecutorDeps } from "./executor-deps.js";
 import { CATALOG_LOAD, CATALOG_SEARCH } from "./lazy-tool-catalog.js";
 import { findConnectedModelCredential } from "./model-selection.js";
 import { paidRequestEffect } from "./paid-request.js";
+import { tellRequesterRunWaits } from "./peer-wait-notice.js";
 import { PURCHASE_CHECKED_TOOLS, purchaseApprovalOf } from "./purchase-gate.js";
 import { autoReviewCheckerProvider } from "./run-auto-review.js";
 import type { RunContext, RunTrust } from "./run-context.js";
@@ -711,6 +712,13 @@ async function showApprovalCard(ctx: RunContext, call: ToolCall, card: ApprovalC
   await ctx.computer.checkpoint.flush();
   await persistTurnCheckpoint(ctx, executionId);
   await ctx.settleRunningHelpers();
+  const askBlock = buildApprovalAskBlock(
+    applied!.effect.id,
+    name,
+    name === "update_bot" && "previousInstructions" in args ? { ...args, botId: bot.id } : args,
+    ctx.secrets,
+    card,
+  );
   const paused = await deps.events.pauseRunForInput({
     spaceId: run.spaceId,
     threadId: run.threadId,
@@ -719,15 +727,7 @@ async function showApprovalCard(ctx: RunContext, call: ToolCall, card: ApprovalC
     attemptId: ctx.attempt.id,
     leaseOwner: ctx.workerId,
     leaseFence: ctx.fence,
-    blocks: [
-      buildApprovalAskBlock(
-        applied!.effect.id,
-        name,
-        name === "update_bot" && "previousInstructions" in args ? { ...args, botId: bot.id } : args,
-        ctx.secrets,
-        card,
-      ),
-    ],
+    blocks: [askBlock],
   });
   // pauseRunForInput returning false after a successful renew means the run row no
   // longer matches this worker. Exiting via pauseForApproval() would leave the run
@@ -746,6 +746,11 @@ async function showApprovalCard(ctx: RunContext, call: ToolCall, card: ApprovalC
     body: `Review before ${name}`,
     botId: bot.id,
     threadId: thread.id,
+  });
+  await tellRequesterRunWaits(ctx, {
+    kind: "approval",
+    title: askBlock.kind === "ask" ? (askBlock.text ?? name) : name,
+    detail: askBlock.kind === "ask" ? askBlock.detail : undefined,
   });
   return pauseForApproval(ctx);
 }
