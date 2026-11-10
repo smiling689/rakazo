@@ -30,6 +30,10 @@ function deps(
     /** Simulate a unique (threadId, clientNonce) race after both retries miss. */
     uniqueConflictOnCommit?: boolean;
     transactionConflictOnce?: boolean;
+    /** The target's active runs, for joining a run the sender already started. */
+    activeRuns?: unknown[];
+    lastStep?: unknown;
+    pendingBlocks?: unknown[];
   } = {},
 ) {
   const enqueue = vi.fn().mockResolvedValue(undefined);
@@ -48,8 +52,10 @@ function deps(
         .fn()
         .mockResolvedValue(options.senderRunning === false ? null : { id: "run-1" }),
       findUnique: vi.fn().mockResolvedValue({ status: "running" }),
+      findMany: vi.fn().mockResolvedValue(options.activeRuns ?? []),
       create: vi.fn().mockResolvedValue({ id: "run-2" }),
     },
+    steeringMessage: { create: vi.fn().mockResolvedValue({ id: "steer-1" }) },
     bot: {
       findFirst: vi.fn().mockResolvedValue(options.targetArchived ? null : { id: "bot-target" }),
     },
@@ -58,8 +64,14 @@ function deps(
       findUnique: messageFindUnique,
       create: vi.fn().mockResolvedValue({ id: "message-1", seq: 1 }),
       update: vi.fn().mockResolvedValue({}),
+      findMany: vi
+        .fn()
+        .mockResolvedValue(options.pendingBlocks ? [{ blocks: options.pendingBlocks }] : []),
     },
-    event: { create: vi.fn().mockResolvedValue({ seq: 7 }) },
+    event: {
+      create: vi.fn().mockResolvedValue({ seq: 7 }),
+      findFirst: vi.fn().mockResolvedValue(options.lastStep ?? null),
+    },
     thread: { update: vi.fn().mockResolvedValue({}) },
   };
   let transactionAttempts = 0;
@@ -461,6 +473,114 @@ describe("messaging another bot", () => {
       { bot_id: "bot-target", message: "carry on" },
     );
     expect(sent.ok).toBe(true);
+  });
+});
+
+describe("joining a run the sender already started", () => {
+  const earlierRequest = (status: string, fromBotId = "bot-sender") => ({
+    id: "run-busy",
+    status,
+    createdAt: new Date(Date.now() - 20 * 60_000),
+    startedAt: new Date(Date.now() - 15 * 60_000),
+    sourceMessage: {
+      blocks: [
+        {
+          kind: "bot_message_received",
+          fromBotId,
+          fromBotName: "Researcher",
+          text: "find posts",
+          intent: "request",
+          hop: 1,
+        },
+      ],
+    },
+  });
+
+  it("adds a progress check to the running run instead of starting a second one", async () => {
+    const harness = deps({
+      activeRuns: [earlierRequest("running")],
+      lastStep: {
+        createdAt: new Date(Date.now() - 6 * 60_000),
+        payload: { name: "browser_snapshot" },
+      },
+    });
+    const sent = await messageBot(harness.deps, run, sender, {
+      bot_id: "bot-target",
+      message: "how is it going?",
+      intent: "question",
+    });
+
+    expect(sent).toMatchObject({ ok: true, joined: "running" });
+    expect(sent.ok && sent.note).toContain("no second run was started");
+    expect(sent.ok && sent.note).toContain("last step (browser_snapshot) was 6 min ago");
+    expect(harness.tx.task.create).not.toHaveBeenCalled();
+    expect(harness.tx.run.create).not.toHaveBeenCalled();
+    expect(harness.enqueue).not.toHaveBeenCalled();
+    expect(harness.tx.steeringMessage.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        botId: "bot-target",
+        runId: "run-busy",
+        originTrigger: "bot_message",
+      }),
+    });
+    expect(harness.tx.message.update).toHaveBeenCalledWith({
+      where: { id: "message-1" },
+      data: { runId: "run-busy" },
+    });
+    expect(harness.notify).toHaveBeenCalledWith("thread-target", 7);
+  });
+
+  it("tells the sender what a paused run waits for, without ending the wait", async () => {
+    const harness = deps({
+      activeRuns: [earlierRequest("waiting_takeover")],
+      pendingBlocks: [
+        { kind: "computer", state: "Needs you", text: "Cloudflare check on linux.do" },
+      ],
+    });
+    const sent = await messageBot(harness.deps, run, sender, {
+      bot_id: "bot-target",
+      message: "status?",
+      intent: "question",
+    });
+
+    expect(sent.ok && sent.note).toContain(
+      'waiting for the owner on Analyst\'s computer screen: "Cloudflare check on linux.do"',
+    );
+    expect(harness.tx.run.create).not.toHaveBeenCalled();
+  });
+
+  it("names the open card of a run waiting for an answer", async () => {
+    const harness = deps({
+      activeRuns: [earlierRequest("waiting_input")],
+      pendingBlocks: [{ kind: "ask", text: "Complete a payment on this page?", status: "pending" }],
+    });
+    const sent = await messageBot(harness.deps, run, sender, {
+      bot_id: "bot-target",
+      message: "also check the trade category",
+    });
+    expect(sent.ok && sent.note).toContain('"Complete a payment on this page?"');
+  });
+
+  it("starts a new run when the busy run was started by someone else", async () => {
+    const harness = deps({ activeRuns: [earlierRequest("running", "bot-other")] });
+    const sent = await messageBot(harness.deps, run, sender, {
+      bot_id: "bot-target",
+      message: "new task",
+    });
+    expect(sent).not.toHaveProperty("joined");
+    expect(harness.tx.run.create).toHaveBeenCalled();
+    expect(harness.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it("never folds a result into the run it answers", async () => {
+    const harness = deps({ activeRuns: [earlierRequest("running")] });
+    await messageBot(harness.deps, run, sender, {
+      bot_id: "bot-target",
+      message: "done",
+      intent: "result",
+    });
+    expect(harness.tx.run.findMany).not.toHaveBeenCalled();
+    expect(harness.tx.run.create).toHaveBeenCalled();
   });
 });
 

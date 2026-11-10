@@ -13,11 +13,14 @@ import type { PrismaClient } from "@rakazo/db";
 import {
   appendEventInTransaction,
   createThreadMessageInTransaction,
+  PEER_BOT_STEERING_ORIGIN,
   withTransactionRetry,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import type { ExecutorDeps } from "./executor-deps.js";
 import { sourceChainHop } from "./group-posts.js";
+import type { JoinedPeerRun } from "./peer-run-join.js";
+import { findPeerRunToJoin, joinedPeerRunNote } from "./peer-run-join.js";
 import { runLeaseFor } from "./run-messages.js";
 
 /**
@@ -162,6 +165,7 @@ export async function messageBot(
         runId: string;
         targetEventSeq: number;
         senderEventSeq: number;
+        joined?: JoinedPeerRun;
       }
     | {
         ok: false;
@@ -251,6 +255,54 @@ export async function messageBot(
           clientNonce: deliveryKey,
           markUnread: options?.forceUnread === true,
         });
+        // A request, question or note to a bot already working on (or waiting in) this sender's
+        // request joins that run: a second run would fight it for the same computer, and a new
+        // message would end its takeover wait. The sender learns the run's real state at once.
+        const joined =
+          intent === "request" || intent === "question" || intent === "fyi"
+            ? await findPeerRunToJoin(tx, {
+                threadId: targetThreadId,
+                botId: target.id,
+                fromBotId: sender.id,
+              })
+            : undefined;
+        if (joined) {
+          await tx.message.update({ where: { id: inbound.id }, data: { runId: joined.runId } });
+          await tx.steeringMessage.create({
+            data: {
+              messageId: inbound.id,
+              botId: target.id,
+              userId: run.userId,
+              runId: joined.runId,
+              originTrigger: PEER_BOT_STEERING_ORIGIN,
+            },
+          });
+          const joinedEvent = await appendEventInTransaction(tx, {
+            spaceId: run.spaceId,
+            threadId: targetThreadId,
+            botId: target.id,
+            type: "thread.message.created",
+            runId: joined.runId,
+            payload: { messageId: inbound.id, role: "user", blocks: [inboundBlock] },
+          });
+          const echoEvent = await appendEventInTransaction(tx, {
+            spaceId: run.spaceId,
+            threadId: run.threadId,
+            botId: run.botId,
+            type: "thread.message.created",
+            runId: run.id,
+            allowCancelledRun: options?.allowTerminalSource === true,
+            lease: runLeaseFor(deps, run.id),
+            payload: { messageId: outbound.id, role: "bot", blocks: [outboundBlock] },
+          });
+          return {
+            ok: true as const,
+            runId: joined.runId,
+            targetEventSeq: joinedEvent.seq,
+            senderEventSeq: echoEvent.seq,
+            joined,
+          };
+        }
         const task = await tx.task.create({
           data: {
             spaceId: run.spaceId,
@@ -322,6 +374,16 @@ export async function messageBot(
   await deps.events.notify(run.threadId, committed.senderEventSeq).catch((error) => {
     getLogger().error("bot message sender echo notification", error);
   });
+  if (committed.joined) {
+    return {
+      ok: true as const,
+      botId: target.id,
+      name: target.name,
+      delivered: message,
+      joined: committed.joined.status,
+      note: joinedPeerRunNote(target.name, committed.joined),
+    };
+  }
   await deps.jobs.enqueue(runContinueJob(committed.runId)).catch((error) => {
     // The queued run is durable; the job reconciler repairs a missed wake.
     getLogger().error("bot message enqueue", error);

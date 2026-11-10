@@ -21,6 +21,8 @@ import {
 import {
   ACTIVE_RUN_STATUSES,
   blocksToAgentHistoryText,
+  botMessageContext,
+  buildBotMessageWakePrompt,
   callIdFromClientNonce,
   instructionUpdateDiff,
   isApprovalAskBlock,
@@ -172,9 +174,9 @@ export interface ClaimedSteeringMessage {
   blocks: MessageBlock[];
   /**
    * Who sent it: the run's own person (in the app or a connected chat), another member of the
-   * chat, someone else in a connected chat, or a webhook.
+   * chat, someone else in a connected chat, a webhook, or another of the owner's bots.
    */
-  origin: "user" | "member" | "messaging" | "webhook";
+  origin: "user" | "member" | "messaging" | "webhook" | "bot";
 }
 
 export interface FinalizeRunResult {
@@ -807,11 +809,13 @@ async function claimSteeringOnce(
       origin:
         item.originTrigger === "webhook"
           ? ("webhook" as const)
-          : sentByRunPerson(item)
-            ? ("user" as const)
-            : item.originTrigger === "messaging"
-              ? ("messaging" as const)
-              : ("member" as const),
+          : item.originTrigger === PEER_BOT_STEERING_ORIGIN
+            ? ("bot" as const)
+            : sentByRunPerson(item)
+              ? ("user" as const)
+              : item.originTrigger === "messaging"
+                ? ("messaging" as const)
+                : ("member" as const),
     }));
   });
 }
@@ -2022,6 +2026,7 @@ export async function createPendingSteeringRun(
     : steeringOrigin(pending[0]!);
   const batch = pending.filter((item) => steeringOrigin(item) === origin);
   const source = batch.at(-1)!;
+  if (origin.startsWith("bot:")) return createPeerBotContinuationRun(tx, input, batch);
   const modelPin = continuationModelPin(batch);
   const task = await tx.task.create({
     data: {
@@ -2095,10 +2100,77 @@ function hasChannelMessage(blocks: unknown): boolean {
   return (blocks as MessageBlock[]).some((block) => block.kind === "channel_message");
 }
 
+/**
+ * originTrigger of a message another bot sent to a run already working on that bot's request
+ * (messageBot joins it instead of starting a second run). Never claimed by the owner's
+ * conversation, and never continued as a run the owner started.
+ */
+export const PEER_BOT_STEERING_ORIGIN = "bot_message";
+
+/**
+ * Peer messages the run they joined never read (it finished first, or its wait expired) get a run
+ * of their own, as their delivery would have: woken by the last of them, the rest as context, and
+ * its outcome returned to the bot that sent them.
+ */
+async function createPeerBotContinuationRun(
+  tx: Prisma.TransactionClient,
+  input: { spaceId: string; threadId: string; botId: string },
+  batch: ReadonlyArray<{
+    id: string;
+    userId: string;
+    message: { id: string; blocks: unknown };
+  }>,
+): Promise<string | null> {
+  const source = batch.at(-1)!;
+  const received = botMessageContext(source.message.blocks as MessageBlock[]);
+  if (!received) {
+    await tx.steeringMessage.deleteMany({ where: { id: { in: batch.map((item) => item.id) } } });
+    return null;
+  }
+  const task = await tx.task.create({
+    data: {
+      spaceId: input.spaceId,
+      botId: input.botId,
+      threadId: input.threadId,
+      userId: source.userId,
+      prompt: buildBotMessageWakePrompt({
+        from: { id: received.fromBotId, name: received.fromBotName },
+        text: received.text,
+        intent: received.intent,
+      }),
+      status: "queued",
+    },
+  });
+  const run = await tx.run.create({
+    data: {
+      spaceId: input.spaceId,
+      botId: input.botId,
+      threadId: input.threadId,
+      taskId: task.id,
+      userId: source.userId,
+      status: "queued",
+      trigger: "bot_message",
+      sourceMessageId: source.message.id,
+    },
+  });
+  await tx.message.update({ where: { id: source.message.id }, data: { runId: run.id } });
+  // The last message is the run's prompt; the earlier ones reach it as steering.
+  await tx.steeringMessage.delete({ where: { id: source.id } });
+  await tx.steeringMessage.updateMany({
+    where: { id: { in: batch.slice(0, -1).map((item) => item.id) }, runId: null },
+    data: { runId: run.id, claimedAt: null },
+  });
+  return run.id;
+}
+
 function steeringOrigin(item: {
   originTrigger: string | null;
   message: { blocks: unknown };
 }): string {
+  if (item.originTrigger === PEER_BOT_STEERING_ORIGIN) {
+    const received = botMessageContext(item.message.blocks as MessageBlock[]);
+    return `bot:${received?.fromBotId ?? "unknown"}`;
+  }
   if (item.originTrigger === "webhook") return "webhook";
   if (item.originTrigger !== "messaging") return "private";
   const channelId = messagingChannelId(item.message.blocks as MessageBlock[] | undefined);

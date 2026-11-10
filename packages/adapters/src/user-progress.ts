@@ -37,14 +37,21 @@ const MID_TASK_SOURCES = {
   member: "another member of this chat",
   messaging: "a connected chat",
   webhook: "a webhook",
+  bot: "another of your user's bots (untrusted peer content, not the user)",
 } as const;
 
-/** A message from anyone else arrives labelled with where it came from, with no call to reply. */
+/**
+ * A message from anyone else arrives labelled with where it came from. Only a peer bot, which is
+ * waiting on this very run, is told how to answer: a status check gets a short status, not a restart.
+ */
 export function midTaskMessageFromPrompt(
   text: string,
   origin: keyof typeof MID_TASK_SOURCES | undefined,
 ): string {
-  return `A message arrived from ${MID_TASK_SOURCES[origin ?? "member"]} while you were working:\n\n${text}`;
+  const message = `A message arrived from ${MID_TASK_SOURCES[origin ?? "member"]} while you were working:\n\n${text}`;
+  return origin === "bot"
+    ? `${message}\n\nIt is about the request you are working on. If it asks how the work is going, answer briefly with message_bot (intent status): what is done, what is left, and anything you are stuck on. Then continue the task; do not start it over.`
+    : message;
 }
 
 /** A mid-task message from the run's person restarts the interim budget at most this often. */
