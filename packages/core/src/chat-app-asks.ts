@@ -1,5 +1,6 @@
 import { isApprovalAskBlock, isSecretAskBlock } from "./action-approval.js";
 import { resolveAskChoice } from "./answerable-ask.js";
+import { TAKEOVER_COMPUTER_PENDING_STATE } from "./thread-message-updates.js";
 
 /** The fields of a message's `ask` block that decide how a chat app shows and answers it. */
 export type ChatAppAskBlock = {
@@ -45,6 +46,24 @@ export function chatAppAskText(block: ChatAppAskBlock): string | undefined {
   }
   const note = zh ? "(需要你在 App 里处理)" : "(This waits for you in the app.)";
   return text ? `${text}\n${note}` : note;
+}
+
+/**
+ * A takeover request in a 1:1 chat app. The screen can only be used in the app, so the line says what is
+ * asked and where to do it; without it the owner in the chat app never learns the bot is waiting.
+ */
+export function chatAppTakeoverText(block: {
+  kind: string;
+  state?: string;
+  text?: string;
+}): string | undefined {
+  if (block.kind !== "computer" || block.state !== TAKEOVER_COMPUTER_PENDING_STATE)
+    return undefined;
+  const reason = (block.text ?? "").trim();
+  const note = CJK.test(reason)
+    ? "(需要你接管电脑屏幕：在 App 里打开这个 bot 的聊天，接管屏幕，完成后交还)"
+    : "(This needs you on the bot's computer screen: open its chat in the app, take over, and hand it back when done.)";
+  return reason ? `${reason}\n${note}` : note;
 }
 
 /** The option a chat-app reply picks for a pending choice: its number or its exact label, else nothing. */

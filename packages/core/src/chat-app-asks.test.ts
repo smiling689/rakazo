@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { chatAppAskChoice, chatAppAskText, isChoiceAskBlock } from "./chat-app-asks.js";
+import {
+  chatAppAskChoice,
+  chatAppAskText,
+  chatAppTakeoverText,
+  isChoiceAskBlock,
+} from "./chat-app-asks.js";
 
 const choice = {
   kind: "ask",
@@ -51,5 +56,27 @@ describe("chat app asks", () => {
     expect(chatAppAskChoice(choice, "the first one please")).toBeUndefined();
     expect(chatAppAskChoice(approval, "1")).toBeUndefined();
     expect(chatAppAskChoice(approval, "Allow")).toBeUndefined();
+  });
+});
+
+describe("chatAppTakeoverText", () => {
+  it("says a takeover waits on the screen in the app", () => {
+    expect(
+      chatAppTakeoverText({
+        kind: "computer",
+        state: "Needs you",
+        text: "Linux DO 出现 Cloudflare 验证",
+      }),
+    ).toBe(
+      "Linux DO 出现 Cloudflare 验证\n(需要你接管电脑屏幕：在 App 里打开这个 bot 的聊天，接管屏幕，完成后交还)",
+    );
+    expect(
+      chatAppTakeoverText({ kind: "computer", state: "Needs you", text: "Solve the check" }),
+    ).toContain("take over");
+  });
+
+  it("ignores other computer states and blocks", () => {
+    expect(chatAppTakeoverText({ kind: "computer", state: "Done", text: "x" })).toBeUndefined();
+    expect(chatAppTakeoverText({ kind: "text", text: "x" })).toBeUndefined();
   });
 });
