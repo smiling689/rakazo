@@ -11,6 +11,7 @@ import type { MessageBlock } from "@rakazo/contracts";
 import {
   botMessageHopExhausted,
   chatAppAskText,
+  chatAppTakeoverText,
   nextBotMessageHop,
   pageLinksAsTitles,
 } from "@rakazo/core";
@@ -927,6 +928,10 @@ function extractText(
         if (options.asks && block?.kind === "ask") {
           const ask = chatAppAskText(block as Parameters<typeof chatAppAskText>[0]);
           return ask ? [ask] : [];
+        }
+        if (options.asks && block?.kind === "computer") {
+          const takeover = chatAppTakeoverText(block as Parameters<typeof chatAppTakeoverText>[0]);
+          return takeover ? [takeover] : [];
         }
         if (
           block?.kind === "page" &&

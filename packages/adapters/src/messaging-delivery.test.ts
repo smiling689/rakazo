@@ -362,6 +362,22 @@ describe("deliverMessagingOutbound", () => {
     ]);
   });
 
+  it("tells a 1:1 chat app that the bot waits for a screen takeover", async () => {
+    const deps = createDeps({
+      messages: [
+        {
+          id: "m-1",
+          blocks: [{ kind: "computer", state: "Needs you", text: "Solve the Cloudflare check" }],
+        },
+      ],
+    });
+    await deliverMessagingOutbound(deps, { runId: "run-1" }, context);
+
+    expect(sentBodies(deps)).toEqual([
+      "Solve the Cloudflare check\n(This needs you on the bot's computer screen: open its chat in the app, take over, and hand it back when done.)",
+    ]);
+  });
+
   it("sends a page the bot named as its title, never as an app-only page link", async () => {
     const deps = createDeps({
       messages: [
