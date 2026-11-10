@@ -3652,6 +3652,70 @@ describe("queue admission beside pending cards", () => {
     });
   });
 
+  it("gives peer bot messages their own bot_message run, never one the owner started", async () => {
+    const peer = (id: string, seq: number, fromBotId: string, text: string) => ({
+      id,
+      userId: "user-1",
+      originTrigger: "bot_message",
+      message: {
+        id: `message-${id}`,
+        blocks: [
+          {
+            kind: "bot_message_received",
+            fromBotId,
+            fromBotName: "WeChat",
+            text,
+            intent: "request",
+            hop: 1,
+          },
+        ],
+        seq,
+      },
+    });
+    const tx = {
+      run: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockResolvedValue({ id: "continuation" }),
+      },
+      steeringMessage: {
+        findMany: vi
+          .fn()
+          .mockResolvedValue([
+            peer("first", 1, "bot-wechat", "check linux.do"),
+            peer("other", 2, "bot-chief", "unrelated"),
+            peer("second", 3, "bot-wechat", "also the trade category"),
+          ]),
+        updateMany: vi.fn(),
+        delete: vi.fn(),
+        deleteMany: vi.fn(),
+      },
+      message: { update: vi.fn() },
+      task: { create: vi.fn().mockResolvedValue({ id: "task-new" }) },
+    };
+    await expect(
+      createPendingSteeringRun(tx as never, {
+        spaceId: "space-1",
+        threadId: "thread-1",
+        botId: "bot-life",
+      }),
+    ).resolves.toBe("continuation");
+    expect(tx.run.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        trigger: "bot_message",
+        sourceMessageId: "message-second",
+      }),
+    });
+    expect(tx.task.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ prompt: expect.stringContaining("also the trade category") }),
+    });
+    // The last message is the prompt; the earlier one from the same bot rides along as steering.
+    expect(tx.steeringMessage.delete).toHaveBeenCalledWith({ where: { id: "second" } });
+    expect(tx.steeringMessage.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["first"] }, runId: null },
+      data: { runId: "continuation", claimedAt: null },
+    });
+  });
+
   it("creates a pending steering continuation without attaching it to a paused run", async () => {
     const tx = {
       run: {
@@ -4459,6 +4523,20 @@ describe("claimSteering", () => {
     ["someone else's connected chat", "messaging", "user-2", [], "messaging"],
     ["the run's person in a group", "messaging", "user-1", [group("+15550001")], "user"],
     ["someone else in a group", "messaging", "user-1", [group("+15550002")], "messaging"],
+    [
+      "another of the owner's bots",
+      "bot_message",
+      "user-1",
+      [
+        {
+          kind: "bot_message_received",
+          fromBotId: "bot-2",
+          fromBotName: "WeChat",
+          text: "status?",
+        },
+      ],
+      "bot",
+    ],
   ] as const)(
     "marks a message from %s by its sender",
     async (_, originTrigger, userId, blocks, origin) => {
