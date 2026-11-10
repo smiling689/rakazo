@@ -4,7 +4,11 @@ import type { Pool, PrismaClient, ThreadEvents } from "@rakazo/db";
 import { describe, expect, it, vi } from "vitest";
 import { returnBotMessageOutcome } from "./bot-messages.js";
 import type { ReconciliationLeadership } from "./job-reconciler.js";
-import { createJobReconciler, createPostgresReconciliationLeadership } from "./job-reconciler.js";
+import {
+  createJobReconciler,
+  createPostgresReconciliationLeadership,
+  STOPPED_PEER_RUN_TEXT,
+} from "./job-reconciler.js";
 import { loopGuardStopText } from "./tool-loop.js";
 
 vi.mock("./bot-messages.js", () => ({ returnBotMessageOutcome: vi.fn() }));
@@ -694,6 +698,7 @@ describe("createJobReconciler", () => {
           OR: [
             { status: { in: ["completed", "failed"] } },
             { status: "cancelled", error: { in: [...stuckWorkStatusMessages()] } },
+            { status: "cancelled", error: null, completedAt: { gte: expect.any(Date) } },
           ],
         },
       }),
@@ -955,6 +960,59 @@ describe("createJobReconciler", () => {
     );
     expect(prisma.message.findMany).not.toHaveBeenCalledWith(
       expect.objectContaining({ where: expect.objectContaining({ runId: expect.anything() }) }),
+    );
+  });
+});
+
+describe("stopped peer runs", () => {
+  it("tells the asking bot that a run stopped in the app is over", async () => {
+    const stoppedRun = {
+      id: "run-stopped",
+      spaceId: "workspace-1",
+      threadId: "thread-1",
+      botId: "bot-1",
+      userId: "user-1",
+      sourceMessageId: "message-1",
+      status: "cancelled",
+      error: null,
+      bot: { name: "Researcher" },
+    };
+    const runFindMany = vi.fn(async (args: { where?: Record<string, unknown> } = {}) => {
+      if (args.where?.messagingMirroredAt === null) return [];
+      if (args.where?.trigger === "bot_message") return [stoppedRun];
+      return [];
+    });
+    const prisma = {
+      run: { findMany: runFindMany, updateMany: vi.fn(async () => ({ count: 1 })) },
+      routine: { findMany: vi.fn(async () => []) },
+      computer: { findMany: vi.fn(async () => []) },
+      messagingOutbound: { findFirst: vi.fn(async () => null) },
+      message: { findMany: vi.fn(async () => []) },
+    } as unknown as PrismaClient;
+    const { jobs } = publisher();
+    const events = { notify: vi.fn() } as unknown as ThreadEvents;
+    vi.mocked(returnBotMessageOutcome).mockResolvedValue(true);
+
+    await createJobReconciler({ prisma, jobs, events }).reconcileOnce();
+
+    const query = runFindMany.mock.calls
+      .map(([args]) => args?.where)
+      .find((where) => where?.trigger === "bot_message") as { OR: Array<Record<string, unknown>> };
+    const stoppedWindow = query.OR.find((clause) => clause.error === null) as {
+      completedAt: { gte: Date };
+    };
+    // Only recent stops: an old one has nobody waiting for it.
+    expect(Date.now() - stoppedWindow.completedAt.gte.getTime()).toBeGreaterThanOrEqual(
+      29 * 60_000,
+    );
+    expect(Date.now() - stoppedWindow.completedAt.gte.getTime()).toBeLessThanOrEqual(31 * 60_000);
+    expect(returnBotMessageOutcome).toHaveBeenCalledWith(
+      { prisma, jobs, events },
+      stoppedRun,
+      { id: "bot-1", name: "Researcher" },
+      STOPPED_PEER_RUN_TEXT,
+      "status",
+      { forceUnread: true },
     );
   });
 });

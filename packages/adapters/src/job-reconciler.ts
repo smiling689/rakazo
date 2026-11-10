@@ -24,6 +24,14 @@ const CONTROL_LOOKAHEAD_MS = 60_000;
  * finishing a failed attempt holds it for seconds before Graphile unlocks it.
  */
 const ABANDONED_QUEUED_LOCK_MS = 5 * 60_000;
+/**
+ * A peer run stopped in the app (stop or clear) is returned to the bot that asked, so it does not
+ * keep waiting for a result that will never come. Only recent stops: an older one has nobody waiting.
+ */
+const STOPPED_PEER_RUN_RETURN_MS = 30 * 60_000;
+/** What the asking bot hears when the run it woke was stopped in the app. */
+export const STOPPED_PEER_RUN_TEXT =
+  "Stopped before finishing, with no result: the run was cancelled in the app (stopped or its chat cleared). Nothing more is coming from this request.";
 // Two keys give Rakazo's lock a namespace without relying on a hash that might collide
 // with an application using the one-key advisory-lock API.
 const RECONCILIATION_LOCK_NAMESPACE = 1_380_019_075;
@@ -244,6 +252,11 @@ export function createJobReconciler(
             OR: [
               { status: { in: ["completed", "failed"] } },
               { status: "cancelled", error: { in: [...stuckWorkStatusMessages()] } },
+              {
+                status: "cancelled",
+                error: null,
+                completedAt: { gte: new Date(now.getTime() - STOPPED_PEER_RUN_RETURN_MS) },
+              },
             ],
           },
           orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
@@ -268,7 +281,7 @@ export function createJobReconciler(
                 ? { text: "", progressOnly: false }
                 : await botRunOutcomeText(deps.prisma, run.id);
             const text = stuckCancel
-              ? (run.error ?? "")
+              ? (run.error ?? STOPPED_PEER_RUN_TEXT)
               : run.status === "failed"
                 ? `Could not complete the delegated request: ${run.error ?? "unknown error"}`
                 : transcript.text ||
