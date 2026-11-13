@@ -178,7 +178,7 @@ it("observes actual Pi post-selection JSON controls through twelve dependent com
       expect(
         record.results?.every((r) => r.jsonValid && r.controlsValidated && r.nextCursorPresent),
       ).toBe(true);
-      expect(record.results?.at(-1)?.bytes).toBeLessThanOrEqual(12000);
+      expect(record.results?.at(-1)?.bytes).toBeLessThanOrEqual(32000); // A 1M-token window gets the largest result cap.
       // Earlier results go out as first sent until a rebuild compresses them all at once.
       const earlier = record.results?.slice(0, -1) ?? [];
       const sentBefore = records[index]!.results ?? [];

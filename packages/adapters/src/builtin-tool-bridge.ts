@@ -28,6 +28,8 @@ export const CORE_BUILTIN_TOOL_NAMES: ReadonlySet<string> = new Set([
   "attach_file",
   "web_search",
   "web_fetch",
+  "service_search",
+  "service_call",
   // The runtime itself drives these (computer mode, nested helpers, resumed own-settings writes).
   "computer_observe",
   "computer_act",
@@ -45,8 +47,11 @@ export const CORE_BUILTIN_TOOL_NAMES: ReadonlySet<string> = new Set([
   "remember",
   "save_memory",
   "recall_memory",
+  "reflect_memory",
   "search_history",
   "read_history",
+  "read_email",
+  "send_email",
   "end_call",
 ]);
 
@@ -87,6 +92,7 @@ const AREAS: Array<[area: string, matches: (name: string) => boolean]> = [
   ],
   ["cloud agents", (name) => name.startsWith("cloud_agent_")],
   ["purchases", (name) => name.includes("purchase") || name === "paid_request"],
+  ["email", (name) => name.includes("email")],
 ];
 
 export function isDeferredTool(name: string): boolean {

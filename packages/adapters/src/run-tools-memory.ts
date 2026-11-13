@@ -5,7 +5,6 @@ import {
   MEMORY_INDEX_PATH,
 } from "@rakazo/contracts";
 import { readHistory, searchHistory } from "@rakazo/db";
-import type { z } from "zod";
 import { MAX_SHARED_MEMORY_CHARS, sharedMemorySaveError } from "./builtin-tools.js";
 import { redactConnectorPayload } from "./connector-safety.js";
 import { MAX_RECALLED_MEMORIES } from "./history-compaction.js";
@@ -13,7 +12,9 @@ import { readMemoryDocument } from "./memory-context.js";
 import type { MemoryEdit, MemoryLimit } from "./memory-tools.js";
 import { BOT_MEMORY_LIMIT, editMemory } from "./memory-tools.js";
 import type { RunContext } from "./run-context.js";
+import { markReadOutsideContent } from "./run-context.js";
 import type { ToolCall, ToolHandlers } from "./run-tool-gate.js";
+import { argsError } from "./tool-args.js";
 
 /** Cross-chat history requires a surviving direct human request in this app thread. */
 export function historyMyChatsAllowed(
@@ -30,9 +31,8 @@ export function historyMyChatsAllowed(
 }
 
 /**
- * GPT fills optional fields it does not use with "" or null (`botId: ""`,
- * `linkedRunId: ""`), and every such call failed validation (fork, 2026-11-06). No history
- * field means anything when blank, so blank fields count as not given.
+ * Models often fill optional fields they do not use with "" or null (botId: "", linkedRunId: "").
+ * No history field means anything when blank, so a blank field counts as not given.
  */
 export function withoutBlankFields(args: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(
@@ -54,7 +54,6 @@ async function readHistoryTool(ctx: RunContext, call: ToolCall) {
     crossChat && ctx.source.myChatsAllowed && !(await ctx.trust.receivedOutsideMessage());
   const scope = {
     spaceId: run.spaceId,
-    userId: run.userId,
     threadId: run.threadId,
     botId: run.botId,
     channelId: ctx.source.channelId,
@@ -62,23 +61,15 @@ async function readHistoryTool(ctx: RunContext, call: ToolCall) {
     allowMyChats,
     searchAt: run.createdAt,
   };
-  // A short field-by-field error instead of Zod's JSON dump (with regex patterns), so the
-  // model can fix the one field instead of guessing (fork).
-  const invalid = (error: z.ZodError) =>
-    call.finish({
-      error: `Invalid ${name} arguments: ${error.issues
-        .map((issue) => `${issue.path.join(".") || "arguments"}: ${issue.message}`)
-        .join("; ")}. Received fields: ${Object.keys(args).join(", ") || "none"}.`,
-    });
-  let response: Awaited<ReturnType<typeof searchHistory | typeof readHistory>>;
   const given = withoutBlankFields(args);
+  let response: Awaited<ReturnType<typeof searchHistory | typeof readHistory>>;
   if (name === "search_history") {
     const parsed = HistorySearchInputSchema.safeParse(given);
-    if (!parsed.success) return invalid(parsed.error);
+    if (!parsed.success) return call.finish({ error: argsError(parsed.error) });
     response = await searchHistory(deps.prisma, scope, parsed.data);
   } else {
     const parsed = HistoryReadInputSchema.safeParse(given);
-    if (!parsed.success) return invalid(parsed.error);
+    if (!parsed.success) return call.finish({ error: argsError(parsed.error) });
     response = await readHistory(deps.prisma, scope, parsed.data);
   }
   const redacted = redactConnectorPayload(response, ctx.secrets);
@@ -90,6 +81,18 @@ async function readHistoryTool(ctx: RunContext, call: ToolCall) {
         "Redacted history exceeds the response budget. Retry with limit 1 or a narrower linked run.",
     });
   }
+  // Files the bot can now see are copied before its next computer tool.
+  ctx.computer.copyEarlierFiles(
+    response.messages.flatMap((message) =>
+      (message.attachments ?? []).map((file) => ({
+        kind: "file" as const,
+        artifactId: file.artifactId,
+        name: file.name,
+        mimeType: file.mimeType,
+        size: file.size,
+      })),
+    ),
+  );
   return call.finish(redacted);
 }
 
@@ -167,7 +170,7 @@ export const memoryTools: ToolHandlers = {
   async recall_memory(ctx, call) {
     const { bot, thread, context } = ctx;
     const { args } = call;
-    return ctx.memory.semantic!.recall(
+    const response = await ctx.memory.semantic!.recall(
       {
         query: String(args.query ?? ""),
         scope: ctx.memory.scope!,
@@ -179,6 +182,27 @@ export const memoryTools: ToolHandlers = {
       },
       context,
     );
+    // All recalled knowledge is derived data; an omitted provider marker cannot certify it.
+    if (response.ok && response.value.length > 0) {
+      await markReadOutsideContent(ctx);
+    }
+    return response;
+  },
+  async reflect_memory(ctx, call) {
+    const { bot, context } = ctx;
+    const { args } = call;
+    if (!ctx.memory.semantic?.reflect) {
+      return { error: "This memory provider cannot answer questions from memory." };
+    }
+    const response = await ctx.memory.semantic.reflect(
+      { query: String(args.query ?? ""), botId: bot.id },
+      context,
+    );
+    if (!response.ok) return response;
+    const text = response.value.trim();
+    // Reflection is provider-generated prose; it cannot attest that its answer is clean.
+    if (text) await markReadOutsideContent(ctx);
+    return { ok: true, value: text || "No relevant memories." };
   },
   search_history: readHistoryTool,
   read_history: readHistoryTool,

@@ -7,6 +7,8 @@ import type {
   ConnectorTool,
   SecretStore,
 } from "@rakazo/adapter-kit";
+import type { McpSourcePreset } from "@rakazo/contracts";
+import { cancelResponseBody } from "@rakazo/core";
 import type { PrismaClient } from "@rakazo/db";
 import { availableInSpace, itemSecretIn } from "@rakazo/db";
 import { parse as parseYaml } from "yaml";
@@ -42,6 +44,7 @@ import {
   resolveCatalogCall,
   SELECTED_SCHEMA_MAX_BYTES,
 } from "./lazy-tool-catalog.js";
+import { readMcpApp } from "./mcp-app.js";
 import { localSchemaReference } from "./openai-tool-parameters.js";
 import type { RemoteTransportDependencies, RemoteUrlPolicy } from "./remote-mcp.js";
 import {
@@ -50,6 +53,7 @@ import {
   createSafeRemoteFetch,
   listRemoteMcpTools,
   RemoteMcpSessionCache,
+  readRemoteMcpResource,
 } from "./remote-mcp.js";
 
 const ModelHeaderName = HeaderName.refine(
@@ -63,8 +67,29 @@ const McpAuthSchema = z
   })
   .default({ type: "none" });
 
+/** MCP services offered as one-step sources. A preset with a URL always connects there. */
+export const MCP_SOURCE_PRESETS: McpSourcePreset[] = [
+  { id: "executor", name: "Executor", urlPlaceholder: "https://executor.example/mcp" },
+];
+
+/** Applies a preset named in an MCP install: its fixed URL and bearer auth, so clients send
+ * only the id. Stored configs keep only fixed-URL preset ids; the rest store as custom. */
+export function applyMcpSourcePreset(
+  source: string,
+  config: Record<string, unknown>,
+): { source: string; config: Record<string, unknown> } {
+  const preset = MCP_SOURCE_PRESETS.find((entry) => entry.id === config.preset);
+  if (!preset) return { source, config: { ...config, preset: "custom" } };
+  return {
+    source: preset.url ?? source,
+    config: { ...config, preset: preset.url ? preset.id : "custom", auth: { type: "bearer" } },
+  };
+}
+
 const McpConfigSchema = z.object({
-  preset: z.enum(["treg", "custom"]).default("custom"),
+  // Installs keep the preset id they were made with, even after it leaves MCP_SOURCE_PRESETS;
+  // nothing reads it back, so any stored id stays valid.
+  preset: z.string().min(1).max(64).default("custom"),
   auth: McpAuthSchema,
   headers: PublicHeadersSchema,
 });
@@ -81,6 +106,7 @@ const ApiOperationSchema = z.object({
   }),
   readOnly: z.boolean().default(false),
   queryParameters: z.array(z.string().min(1).max(120)).default([]),
+  commaSeparatedQueryParameters: z.array(z.string().min(1).max(120)).optional(),
   headerParameters: z.array(ModelHeaderName).default([]),
 });
 
@@ -226,6 +252,7 @@ export class InstalledConnectorProvider implements ConnectorProvider {
             resourceId: install.id,
             toolName: tool.name,
             catalogGroup,
+            appResourceUri: tool.appResourceUri,
           },
         }));
       }
@@ -307,14 +334,15 @@ export class InstalledConnectorProvider implements ConnectorProvider {
       const remote = await this.remoteFor(context);
       if (install.kind === "mcp") {
         const config = McpConfigSchema.parse(install.config);
+        const session = {
+          ...remote,
+          endpoint: install.source,
+          headers: connectorHeaders(config, credential),
+          signal: context.signal,
+          ...this.mcpSessionOptions(context, install),
+        };
         const result = await callRemoteMcpTool(
-          {
-            ...remote,
-            endpoint: install.source,
-            headers: connectorHeaders(config, credential),
-            signal: context.signal,
-            ...this.mcpSessionOptions(context, install),
-          },
+          session,
           call.route?.toolName ?? call.tool,
           call.args,
         );
@@ -322,6 +350,14 @@ export class InstalledConnectorProvider implements ConnectorProvider {
           type: "result",
           data: redactConnectorPayload(result, credential ? [credential] : []),
         };
+        const app = await readMcpApp(
+          install.name,
+          call.withApp ? call.route?.appResourceUri : undefined,
+          result,
+          (uri) => readRemoteMcpResource(session, uri),
+          credential ? [credential] : [],
+        );
+        if (app) yield { type: "app", app };
         return;
       }
       if (install.kind === "graphql") {
@@ -455,9 +491,15 @@ async function loadOpenApiDocument(
       headers,
       signal: combineSignals(signal, AbortSignal.timeout(15_000)),
     });
-    if (!response.ok) throw new Error(`OpenAPI document returned HTTP ${response.status}`);
+    if (!response.ok) {
+      cancelResponseBody(response);
+      throw new Error(`OpenAPI document returned HTTP ${response.status}`);
+    }
     const size = Number(response.headers.get("content-length") ?? 0);
-    if (size > 2_000_000) throw new Error("OpenAPI document is too large");
+    if (size > 2_000_000) {
+      cancelResponseBody(response);
+      throw new Error("OpenAPI document is too large");
+    }
     const { text, truncated } = await readBoundedText(response, 2_000_000);
     if (truncated) throw new Error("OpenAPI document is too large");
     return parseOpenApiText(text);
@@ -519,12 +561,18 @@ export function importOpenApiDocument(document: Record<string, unknown>): {
   baseUrl: string;
   operations: ApiOperation[];
 } {
-  const server = Array.isArray(document.servers) ? document.servers[0] : undefined;
-  const baseUrl =
-    server && typeof server === "object" && typeof (server as { url?: unknown }).url === "string"
-      ? String((server as { url: string }).url)
-      : "";
-  if (!baseUrl) throw new Error("OpenAPI document must define servers[0].url");
+  const server = asRecord(Array.isArray(document.servers) ? document.servers[0] : undefined);
+  if (typeof server?.url !== "string" || !server.url) {
+    throw new Error("OpenAPI document must define servers[0].url");
+  }
+  const variables = asRecord(server.variables);
+  const baseUrl = server.url.replace(/\{([^{}]+)\}/g, (_placeholder, name: string) => {
+    const variable = asRecord(variables?.[name]);
+    if (typeof variable?.default !== "string") {
+      throw new Error("OpenAPI server variable must define a string default");
+    }
+    return variable.default;
+  });
   assertNoSensitiveQuery(baseUrl);
   const paths = document.paths;
   if (!paths || typeof paths !== "object" || Array.isArray(paths)) {
@@ -544,18 +592,29 @@ export function importOpenApiDocument(document: Record<string, unknown>): {
       const properties: Record<string, unknown> = {};
       const required: string[] = [];
       const queryParameters: string[] = [];
+      const commaSeparatedQueryParameters: string[] = [];
       const headerParameters: string[] = [];
       for (const parameter of openApiParameters(
         document,
         (pathValue as Record<string, unknown>).parameters,
         operation.parameters,
       )) {
-        properties[parameter.name] = asRecord(
-          inlineOpenApiSchema(refs, parameter.schema, "string"),
-        ) ?? {
+        const schema = asRecord(inlineOpenApiSchema(refs, parameter.schema, "string")) ?? {
           type: "string",
         };
-        if (parameter.in === "query") queryParameters.push(parameter.name);
+        properties[parameter.name] =
+          typeof parameter.description === "string"
+            ? { ...schema, description: parameter.description }
+            : schema;
+        if (parameter.in === "query") {
+          queryParameters.push(parameter.name);
+          if (
+            (parameter.style === undefined || parameter.style === "form") &&
+            parameter.explode === false
+          ) {
+            commaSeparatedQueryParameters.push(parameter.name);
+          }
+        }
         if (parameter.in === "header") {
           if (isSensitiveHeader(parameter.name) || isTransportHeader(parameter.name)) {
             throw new Error(`OpenAPI operation ${id} contains unsafe header ${parameter.name}`);
@@ -590,6 +649,7 @@ export function importOpenApiDocument(document: Record<string, unknown>): {
         },
         readOnly: method === "get",
         queryParameters,
+        ...(commaSeparatedQueryParameters.length > 0 ? { commaSeparatedQueryParameters } : {}),
         headerParameters,
       });
       if (operations.length >= 100) break;
@@ -929,7 +989,11 @@ async function executeApiOperation(
     for (const [key, value] of Object.entries(args)) {
       if (consumed.has(key) || value == null) continue;
       if (Array.isArray(value)) {
-        for (const item of value) url.searchParams.append(key, String(item));
+        if (operation.commaSeparatedQueryParameters?.includes(key)) {
+          url.searchParams.set(key, value.map(String).join(","));
+        } else {
+          for (const item of value) url.searchParams.append(key, String(item));
+        }
       } else if (typeof value !== "object") {
         url.searchParams.set(key, String(value));
       }
@@ -940,7 +1004,11 @@ async function executeApiOperation(
       consumed.add(key);
       if (value == null) continue;
       if (Array.isArray(value)) {
-        for (const item of value) url.searchParams.append(key, String(item));
+        if (operation.commaSeparatedQueryParameters?.includes(key)) {
+          url.searchParams.set(key, value.map(String).join(","));
+        } else {
+          for (const item of value) url.searchParams.append(key, String(item));
+        }
       } else {
         url.searchParams.set(key, String(value));
       }

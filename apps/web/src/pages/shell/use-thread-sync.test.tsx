@@ -88,6 +88,7 @@ function syncInput({
     notifyBrowserForEvent: vi.fn(),
     markBotReadIfVisible: vi.fn(),
     markGroupReadOnReply: vi.fn(),
+    meId: "user-1",
   } as unknown as Parameters<typeof useThreadSync>[0];
 }
 
@@ -142,6 +143,41 @@ it.each([false, true])(
   },
 );
 
+it("refreshes a group's computer screen when control changes for that computer", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const snapshot = {
+    threadId: "thread-1",
+    cursor: 1,
+    messages: [],
+    run: null,
+  } as unknown as ThreadSnapshot;
+  const get = vi.fn(() => Promise.resolve(snapshot));
+  const commitSnapshot = vi.fn();
+  const input = syncInput({ inGroup: true, get, commitSnapshot });
+  input.computerState.computerBotIdRef.current = "bot-computer";
+  function Probe() {
+    useThreadSync(input);
+    return null;
+  }
+  const root = createRoot(document.createElement("div"));
+  await act(async () => root.render(createElement(Probe)));
+  const subscription = vi.mocked(runThreadSubscription).mock.calls[0]![0];
+  const released = (botId: string) =>
+    ({
+      type: "computer.takeover.released",
+      botId,
+      payload: { holder: "none" },
+    }) as unknown as ProductEvent;
+  subscription.onEvent(released("bot-computer"), snapshot);
+  await flush();
+  expect(input.computerState.refreshComputerScreen).toHaveBeenCalledTimes(1);
+  expect(input.computerState.refreshComputerScreen).toHaveBeenCalledWith("bot-computer");
+  subscription.onEvent(released("bot-other"), snapshot);
+  await flush();
+  expect(input.computerState.refreshComputerScreen).toHaveBeenCalledTimes(1);
+  act(() => root.unmount());
+});
+
 it.each([
   ["running", { status: "running" }, true],
   ["idle", null, true],
@@ -194,3 +230,241 @@ async function expectCachedPaint(
   expect(commitSnapshot.mock.calls.some(([next]) => next === cached)).toBe(painted);
   act(() => root.unmount());
 }
+
+it("anchors Load earlier on the first visible row, not the whole height delta", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  // A fake scroller whose height can grow while the older page loads, the way
+  // a streaming reply appends content at the bottom during the fetch.
+  const height = { now: 1000 };
+  const rowBelow = { offsetTop: 600, offsetHeight: 200, isConnected: true };
+  const scroller = {
+    scrollTop: 500,
+    get scrollHeight() {
+      return height.now;
+    },
+    querySelectorAll: (selector: string) => (selector === "[data-message-id]" ? [rowBelow] : []),
+  };
+  const page = { threadId: "thread-1", messages: [], olderCursor: null };
+  const messages = vi.fn(async () => {
+    // The reply grew 250px at the bottom while the older page was loading.
+    height.now += 250;
+    return page;
+  });
+  const snapshot = { botId: "bot-1", threadId: "thread-1", olderCursor: "cursor-1" };
+  const input = syncInput({
+    inGroup: false,
+    get: () => new Promise<ThreadSnapshot>(() => {}),
+    commitSnapshot: vi.fn(),
+  });
+  input.rpc = { threads: { get: input.rpc.threads.get, messages } } as never;
+  input.thread = {
+    ...input.thread,
+    snapshot: snapshot as never,
+    snapshotRef: ref(snapshot),
+    updateSnapshot: vi.fn(() => {
+      // Prepending the older page grows the content above the reader by 400px.
+      height.now += 400;
+      rowBelow.offsetTop += 400;
+    }),
+    messageScroll: ref(scroller),
+  } as never;
+  let controls!: ReturnType<typeof useThreadSync>;
+  function Probe() {
+    controls = useThreadSync(input);
+    return null;
+  }
+  const root = createRoot(document.createElement("div"));
+  await act(async () => root.render(createElement(Probe)));
+
+  await act(async () => void (await controls.loadOlder()));
+  await act(async () => {
+    await new Promise((resolve) => window.requestAnimationFrame(() => resolve(null)));
+  });
+
+  // Only the prepended page (400px) may move the reader; the 250px appended
+  // at the bottom during the fetch must not.
+  expect(scroller.scrollTop).toBe(900);
+  act(() => root.unmount());
+});
+
+it.each([false, true])("snaps a remounted transcript for group=%s", async (inGroup) => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  // The reader is at the end of bot A when the refresh starts; the bot switch
+  // to A remounts the transcript before the response arrives, detaching the
+  // element the snap was queued against.
+  const detached = {
+    scrollTop: 900,
+    scrollHeight: 1000,
+    clientHeight: 100,
+    isConnected: true,
+  };
+  const mounted = {
+    scrollTop: 0,
+    scrollHeight: 1200,
+    clientHeight: 100,
+    isConnected: true,
+  };
+  const held = ref<HTMLDivElement | null>(detached as unknown as HTMLDivElement);
+  const snapshot = {
+    botId: "bot-1",
+    threadId: "thread-1",
+    messages: [],
+  } as unknown as ThreadSnapshot;
+  const input = syncInput({
+    inGroup,
+    get: () => Promise.resolve(snapshot),
+    commitSnapshot: vi.fn(),
+  });
+  input.thread = { ...input.thread, messageScroll: held } as never;
+  let controls!: ReturnType<typeof useThreadSync>;
+  function Probe() {
+    controls = useThreadSync(input);
+    return null;
+  }
+  const root = createRoot(document.createElement("div"));
+  await act(async () => root.render(createElement(Probe)));
+
+  // The switch remounts the transcript while the request is in flight: start
+  // the refresh, swap the scroller before its continuation runs.
+  const pending = inGroup
+    ? controls.refreshGroupThread("group-1")
+    : controls.refreshThread("bot-1");
+  detached.isConnected = false;
+  held.current = mounted as unknown as HTMLDivElement;
+  await act(async () => void (await pending));
+  await act(async () => {
+    await new Promise((resolve) => window.requestAnimationFrame(() => resolve(null)));
+  });
+
+  expect(mounted.scrollTop).toBe(1200);
+  act(() => root.unmount());
+});
+
+it.each([false, true])(
+  "preserves reader intent and cleans up frames for group=%s",
+  async (inGroup) => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.set(++nextFrame, callback);
+      return nextFrame;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+      frames.delete(id);
+    });
+    const runFrames = () => {
+      const queued = [...frames.values()];
+      frames.clear();
+      for (const callback of queued) callback(0);
+    };
+    const scroller = () => {
+      const element = document.createElement("div");
+      Object.defineProperties(element, {
+        scrollHeight: { value: 1200 },
+        clientHeight: { value: 100 },
+      });
+      document.body.append(element);
+      return element;
+    };
+    const held = ref<HTMLDivElement | null>(scroller());
+    held.current!.scrollTop = 1100;
+    const snapshot = {
+      botId: "bot-1",
+      threadId: "thread-1",
+      messages: [],
+    } as unknown as ThreadSnapshot;
+    let read = deferred<ThreadSnapshot>();
+    const input = syncInput({ inGroup, get: () => read.promise, commitSnapshot: vi.fn() });
+    input.thread = { ...input.thread, messageScroll: held };
+    let controls!: ReturnType<typeof useThreadSync>;
+    function Probe() {
+      controls = useThreadSync(input);
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    await act(async () => root.render(createElement(Probe)));
+    const refresh = () =>
+      inGroup ? controls.refreshGroupThread("group-1") : controls.refreshThread("bot-1");
+    const replace = () => {
+      held.current?.remove();
+      held.current = scroller();
+    };
+    const finish = async () => {
+      await act(async () => {
+        read.resolve(snapshot);
+        await read.promise;
+      });
+      read = deferred<ThreadSnapshot>();
+    };
+
+    // A reader who scrolls the replacement while loading retains their position.
+    void refresh();
+    replace();
+    held.current!.scrollTop = 300;
+    held.current!.dispatchEvent(new Event("scroll"));
+    await finish();
+    runFrames();
+    expect(held.current?.scrollTop).toBe(300);
+
+    // Starting above the end never opts into sticking.
+    void refresh();
+    await finish();
+    runFrames();
+    expect(held.current?.scrollTop).toBe(300);
+
+    // Replacement after the response still snaps if the reader has not moved.
+    held.current!.scrollTop = 1100;
+    void refresh();
+    await finish();
+    replace();
+    runFrames();
+    expect(held.current?.scrollTop).toBe(1200);
+
+    // Scrolling a replacement before the frame cancels that snap too.
+    void refresh();
+    await finish();
+    replace();
+    held.current!.scrollTop = 200;
+    held.current!.dispatchEvent(new Event("scroll"));
+    runFrames();
+    expect(held.current?.scrollTop).toBe(200);
+
+    // A response for a chat left during the async load must not queue a snap.
+    held.current!.scrollTop = 1100;
+    void refresh();
+    input.activeBotId.current = "bot-2";
+    input.activeGroupId.current = "group-2";
+    replace();
+    await finish();
+    expect(frames.size).toBe(0);
+    expect(held.current?.scrollTop).toBe(0);
+    input.activeBotId.current = inGroup ? undefined : "bot-1";
+    input.activeGroupId.current = inGroup ? "group-1" : undefined;
+
+    // A queued frame cannot move a different chat.
+    held.current!.scrollTop = 1100;
+    void refresh();
+    await finish();
+    input.activeBotId.current = "bot-2";
+    input.activeGroupId.current = "group-2";
+    replace();
+    runFrames();
+    expect(held.current?.scrollTop).toBe(0);
+
+    input.activeBotId.current = inGroup ? undefined : "bot-1";
+    input.activeGroupId.current = inGroup ? "group-1" : undefined;
+    held.current!.scrollTop = 1100;
+    void refresh();
+    await finish();
+    expect(frames.size).toBe(1);
+    const lateRefresh = refresh();
+    act(() => root.unmount());
+    expect(frames.size).toBe(0);
+    await finish();
+    await lateRefresh;
+    expect(frames.size).toBe(0);
+    held.current?.remove();
+    vi.restoreAllMocks();
+  },
+);

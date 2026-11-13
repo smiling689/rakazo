@@ -52,13 +52,17 @@ describe("built-in tool bridge", () => {
       "web_search",
       "write_file",
     ]);
-    // request_secret carries the card and contact kinds; update_bot carries instructions paging.
+    // request_secret carries the card and contact kinds; update_bot carries instructions paging;
+    // the history tools point at files from earlier messages; a watch says it takes no other timing;
+    // read_file takes a line range; ask_user carries the content being decided about;
+    // search_history lists earlier tool work by kind without a keyword.
     // +1 byte over upstream: feat/memory-size makes remember say "Holds 16 KB" instead of "Holds 4 KB".
     // +15 bytes: the deferred catalog names post_to_group. +23: the catalog names update_default_models.
     // Fork (lean tools): schedule_create/schedule_list and update_preferences are deferred, 31,949 -> 18,601.
     // +317: update_bot names the fields a call changes, so a read cannot switch settings off.
     // +13: the catalog names read_memory, which reads memory the prompt had no room for.
-    expect(definitionBytes(listed)).toBeLessThanOrEqual(18_899);
+    // +661 after the 2026-11-13 sync: upstream's email, service and reflect_memory tools.
+    expect(definitionBytes(listed)).toBeLessThanOrEqual(19_560);
     expect(deferred.map((tool) => tool.name)).toEqual(
       expect.arrayContaining(["render_plot", "create_space", "generate_secret", "scratchpad_add"]),
     );

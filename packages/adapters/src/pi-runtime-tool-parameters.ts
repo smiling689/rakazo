@@ -1,7 +1,8 @@
-import { Type } from "@earendil-works/pi-ai";
 import type { ConnectorTool } from "@rakazo/adapter-kit";
 import { BOT_INSTRUCTIONS_MAX_LENGTH, ThinkingLevelSchema } from "@rakazo/contracts";
 import { getLogger } from "@rakazo/logging";
+import { Type } from "typebox";
+import { MAX_APPROVAL_DETAIL_LENGTH } from "./approval-ask.js";
 import {
   normalizeOpenAiToolParameters,
   openAiToolParametersNeedNormalization,
@@ -67,6 +68,7 @@ function builtinParameters(tool: ConnectorTool) {
   if (tool.name === "ask_user") {
     return Type.Object({
       question: Type.String({ maxLength: 240 }),
+      detail: Type.Optional(Type.String({ maxLength: MAX_APPROVAL_DETAIL_LENGTH })),
       options: Type.Array(Type.String({ minLength: 1, maxLength: 80 }), {
         minItems: 2,
         maxItems: 4,
@@ -90,6 +92,7 @@ function builtinParameters(tool: ConnectorTool) {
       instructions: Type.Optional(Type.String()),
       model_provider: Type.Optional(Type.String()),
       model_id: Type.Optional(Type.String()),
+      background: Type.Optional(Type.Boolean()),
     });
   }
   if (tool.name === "spawn_bot") {
@@ -411,6 +414,11 @@ function enumUnion(values: readonly unknown[], options: FieldOptions = {}) {
 export function jsonField(spec: unknown): ReturnType<typeof Type.String> {
   const definition = spec && typeof spec === "object" ? (spec as Record<string, unknown>) : {};
   const options = fieldOptions(definition);
+  // Nested intersections need the same preservation as root schemas; otherwise an
+  // allOf-only field falls back to string and loses its sibling constraints.
+  if (Array.isArray(definition.allOf)) {
+    return jsonSchemaParameters(definition, options) as never;
+  }
   if (Array.isArray(definition.enum) && definition.enum.length > 0) {
     if (definition.enum.every((value) => typeof value === "string")) {
       return stringEnum(definition.enum as string[], options) as never;

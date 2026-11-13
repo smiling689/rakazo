@@ -47,6 +47,7 @@ describe("desktop preload bridge", () => {
     expect(bridge.platform).toBe("linux");
     expect(Object.keys(bridge).sort()).toEqual([
       "badge",
+      "clipboard",
       "computer",
       "device",
       "locale",
@@ -56,6 +57,7 @@ describe("desktop preload bridge", () => {
       "oauth",
       "passkeys",
       "platform",
+      "server",
       "settings",
       "update",
       "window",
@@ -71,6 +73,10 @@ describe("desktop preload bridge", () => {
     expect(Object.keys(bridge.badge!)).toEqual(["set"]);
     await bridge.badge!.set(7);
     expect(invoke).toHaveBeenCalledWith("desktop.badge.set", 7);
+
+    expect(Object.keys(bridge.clipboard!)).toEqual(["writeText"]);
+    await bridge.clipboard!.writeText("example");
+    expect(invoke).toHaveBeenCalledWith("desktop.clipboard.write", "example");
 
     await bridge.device?.state();
     await bridge.device?.setAllowed(true);
@@ -89,8 +95,10 @@ describe("desktop preload bridge", () => {
     await bridge.update.check();
     await bridge.update.download();
     await bridge.update.install();
+    await bridge.server!.change();
     expect(invoke.mock.calls.map(([channel]) => channel)).toEqual([
       "desktop.badge.set",
+      "desktop.clipboard.write",
       "desktop.device.state",
       "desktop.device.setAllowed",
       "desktop.locale.set",
@@ -106,6 +114,7 @@ describe("desktop preload bridge", () => {
       "desktop.update.check",
       "desktop.update.download",
       "desktop.update.install",
+      "desktop.server.change",
     ]);
   });
 
@@ -228,7 +237,7 @@ describe("setup preload bridge", () => {
     await bridge.test("http://127.0.0.1:5173");
     await bridge.save({ mode: "new", serverUrl: "http://127.0.0.1:5173" });
     await bridge.quit();
-    await bridge.openLink("orbstack");
+    await bridge.openLink("docker-download");
     await bridge.stack.state();
     await bridge.stack.start();
     expect(invoke.mock.calls.map(([channel]) => channel)).toEqual([
@@ -240,7 +249,7 @@ describe("setup preload bridge", () => {
       "desktop.setup.stack.state",
       "desktop.setup.stack.start",
     ]);
-    expect(invoke).toHaveBeenCalledWith("desktop.setup.openLink", "orbstack");
+    expect(invoke).toHaveBeenCalledWith("desktop.setup.openLink", "docker-download");
 
     const listener = vi.fn();
     bridge.stack.onChange(listener);

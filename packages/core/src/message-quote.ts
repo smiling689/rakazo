@@ -7,6 +7,7 @@ import remarkParse from "remark-parse";
 import { unified } from "unified";
 import { blocksToAgentHistoryText } from "./attachments.js";
 import { replyAttachment } from "./message-replies.js";
+import { isDeliveryMessage } from "./message-visibility.js";
 
 const markdownParser = unified().use(remarkParse).use(remarkGfm);
 /** Past this much source text in one message, quote derivation refuses to run. */
@@ -91,6 +92,8 @@ export function deriveMessageQuote(
   quoteHint: string,
   format: "markdown" | "plain-text",
 ): string | undefined {
+  // A delivery's text is the bot's hidden prompt, never quoted.
+  if (isDeliveryMessage(blocks)) return undefined;
   const hint = normalizeWithOffsets(truncateReplyQuote(quoteHint.trim())).text;
   if (!hint) return undefined;
 
@@ -175,12 +178,16 @@ function replyBlockText(block: MessageBlock): string {
     case "mcp_approval":
     case "chart":
       return block.name;
+    case "app":
+      return block.server;
     case "import_setup":
       if (block.undone) return "";
       return block.items.map((item) => ("name" in item ? item.name : item.title)).join(", ");
     case "image":
     case "file":
       return block.name || blocksToAgentHistoryText([block]);
+    case "delivery":
+      return "";
   }
 }
 
@@ -194,7 +201,10 @@ export function messageReplyPreview(
   blocks: MessageBlock[],
   role: ReplyPreview["role"],
   botId?: string,
+  author?: ReplyPreview["author"],
 ): ReplyPreview {
+  // A delivery's prompt and files stay hidden, even from a reply to it.
+  if (isDeliveryMessage(blocks)) return { role, botId, ...(author ? { author } : {}), text: "" };
   const attachment = replyAttachment(blocks);
   const caption = messageReplyExcerpt(
     blocks.filter((block) => block.kind !== "image" && block.kind !== "file"),
@@ -202,5 +212,12 @@ export function messageReplyPreview(
   );
   const text = caption || (attachment?.kind === "file" ? attachment.name : "");
   const page = isPageCardMessage(blocks);
-  return { role, botId, text, ...(attachment ? { attachment } : {}), ...(page ? { page } : {}) };
+  return {
+    role,
+    botId,
+    ...(author ? { author } : {}),
+    text,
+    ...(attachment ? { attachment } : {}),
+    ...(page ? { page } : {}),
+  };
 }

@@ -3,6 +3,7 @@ import type {
   BackgroundJob,
   BackgroundJobHandlers,
   JobPublisher,
+  JobTransaction,
   JobWorkerHost,
   RealtimeFanout,
 } from "@rakazo/adapter-kit";
@@ -154,6 +155,14 @@ export class RunJobPublisher implements JobPublisher {
     this.starter.start(job.payload.runId, job.availableAt);
   }
 
+  async enqueueIn(tx: JobTransaction, job: BackgroundJob): Promise<void> {
+    await this.background.enqueueIn(tx, job);
+  }
+
+  async cancelIn(tx: JobTransaction, key: string): Promise<void> {
+    await this.background.cancelIn(tx, key);
+  }
+
   async cancel(key: string): Promise<void> {
     // The durable status is already cancelled. Legacy Graphile deliveries can
     // safely drain as no-ops; chat cancellation needs no scheduler connection.
@@ -256,7 +265,8 @@ export class RunWorkerHost implements JobWorkerHost {
    * in the handoff after that run releases the computer (release expires the lease and touches
    * `updatedAt`) until the next one takes it.
    * Any other run still unstarted thirty seconds after it was due means starting failed,
-   * which is an error reported with this process's database pool and event-loop health.
+   * which is an error reported with this process's database pool and event-loop health. A run
+   * is due from its last write, so one resumed after an approval or reply is not counted late.
    */
   private checkQueueAge(): void {
     const now = Date.now();
@@ -268,15 +278,15 @@ export class RunWorkerHost implements JobWorkerHost {
         { delayedRuns: number; oldestDueAt: Date | null; oldestRunId: string | null }[]
       >`
         SELECT COUNT(*)::int AS "delayedRuns",
-               MIN(GREATEST(runs."createdAt", COALESCE(runs."wakeAt", runs."createdAt")))
+               MIN(GREATEST(runs."updatedAt", COALESCE(runs."wakeAt", runs."updatedAt")))
                  AS "oldestDueAt",
                (ARRAY_AGG(runs.id ORDER BY
-                 GREATEST(runs."createdAt", COALESCE(runs."wakeAt", runs."createdAt"))))[1]
+                 GREATEST(runs."updatedAt", COALESCE(runs."wakeAt", runs."updatedAt"))))[1]
                  AS "oldestRunId"
         FROM runs
         JOIN bots bot ON bot.id = runs."botId"
         WHERE runs.status = 'queued' AND runs.trigger NOT IN ('routine', 'reaction')
-          AND runs."createdAt" <= ${cutoff}
+          AND runs."updatedAt" <= ${cutoff}
           AND (runs."wakeAt" IS NULL OR runs."wakeAt" <= ${cutoff})
           AND NOT EXISTS (
             SELECT 1 FROM computer_execution_leases lease
@@ -380,6 +390,7 @@ export class RunWorkerHost implements JobWorkerHost {
         createdAt: true,
         botId: true,
         status: true,
+        trigger: true,
         bot: { select: { computerId: true } },
       },
     });

@@ -12,9 +12,8 @@ type TaskCatalogInput = {
   spaceId: string;
   botId: string;
   userId: string;
-  threadId?: string;
-  /** Marks which routines post in this chat; the list still covers every chat. */
-  currentThreadId?: string;
+  /** In a group run, marks which routines post in the group. */
+  groupThreadId?: string;
   tools: readonly Pick<ConnectorTool, "name" | "description" | "readOnly">[];
 };
 
@@ -27,7 +26,6 @@ export const TASK_CATALOG_GUIDANCE = [
   "When a request refers to an existing task, routine, skill, or capability, call task_catalog first and use the exact returned id/name.",
   "For an open task, perform the work with the exposed tools, verify the result, then use scratchpad_update or scratchpad_complete. Never mark work done before verification.",
   "For a schedule, provide exactly one timing mode to schedule_create (cron, every+unit, runAt, delayMinutes, or delaySeconds), then call schedule_list and only report success when the routine is present. Change an existing routine with schedule_update, not cancel and recreate, and report the timing it returns.",
-  "routines lists all of this bot's routines in every chat (inThisChat marks the ones posting here); other bots' routines are not in it. An empty list proves only that this bot has none now: if memory or history says a task was set up, say it is missing from the list (cancelled, a finished one-time run, or another bot's), never that it never existed.",
   "If a tool returns an error, do not repeat the same tool call with the same arguments. Correct the specific field once as a separate attempt; if that attempt fails, stop and explain the blocker instead of narrating more retries. A different command is not a retry.",
 ].join("\n");
 
@@ -41,9 +39,7 @@ export async function taskCatalogFromTool(deps: TaskCatalogToolDeps, input: Task
     listSchedulesFromTool(deps, {
       spaceId: input.spaceId,
       botId: input.botId,
-      userId: input.userId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
-      ...(input.currentThreadId ? { currentThreadId: input.currentThreadId } : {}),
+      ...(input.groupThreadId ? { groupThreadId: input.groupThreadId } : {}),
     }),
     deps.prisma.taughtSkill.findMany({
       where: {
@@ -79,6 +75,7 @@ export async function taskCatalogFromTool(deps: TaskCatalogToolDeps, input: Task
       source: "scratchpad",
     })),
     routines: schedules.routines,
+    ...(schedules.note ? { routinesNote: schedules.note } : {}),
     taughtSkills: taughtSkills.map((skill) => ({
       id: skill.id,
       name: skill.name,

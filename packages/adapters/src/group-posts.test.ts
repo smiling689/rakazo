@@ -44,6 +44,8 @@ function harness(options: {
   });
   const tx = {
     $queryRaw: vi.fn(async (..._args: unknown[]) => [{ id: "group-1" }]),
+    // Marks the group unread for its Space members.
+    $executeRaw: vi.fn(async (..._args: unknown[]) => 1),
     chatGroup: {
       findFirst: vi.fn(async () => ({
         id: "group-1",

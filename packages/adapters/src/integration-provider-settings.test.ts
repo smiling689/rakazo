@@ -65,6 +65,16 @@ describe("integration provider settings", () => {
       apiKey: "fake-replacement-key",
     });
   });
+  it("lists connected plugin slugs for the user, or none before setup", async () => {
+    const f = fixture();
+    expect(await f.settings.listConnectedPluginSlugs("user-1")).toEqual([]);
+    await f.settings.save({ provider: "composio", apiKey: "fake-plugin-key" }, context);
+    vi.mocked(f.adapter.listConnectedExternalIds).mockResolvedValueOnce(["gmail"]);
+    expect(await f.settings.listConnectedPluginSlugs("user-1")).toEqual(["gmail"]);
+    expect(f.adapter.listConnectedExternalIds).toHaveBeenLastCalledWith(
+      expect.objectContaining({ userId: "user-1" }),
+    );
+  });
   it("preserves working settings and hides provider error details on failed verification", async () => {
     const f = fixture();
     await f.settings.save({ provider: "composio", apiKey: "fake-working-key" }, context);
@@ -136,6 +146,26 @@ describe("integration provider settings", () => {
     settings.warmDirectories();
     await vi.waitFor(() => expect(warm).toHaveBeenCalledOnce());
   });
+  it.each([false, true, undefined])(
+    "forwards the prepared provider's reconnect requirement %s",
+    async (reconnect) => {
+      const f = fixture();
+      const needsReconnect = vi.fn(async () => reconnect ?? false);
+      if (reconnect !== undefined) f.adapter.needsReconnect = needsReconnect;
+      await f.settings.save({ provider: "composio", apiKey: "fake-key" }, context);
+      const wrapper = f.settings
+        .providers()
+        .find((provider) => provider.describe().id === "composio")!;
+      const { provider } = await prepareManagedConnectorForTransaction(wrapper);
+
+      expect(await provider?.needsReconnect?.(context, "gmail")).toBe(reconnect ?? false);
+      if (reconnect !== undefined) {
+        expect(needsReconnect).toHaveBeenCalledExactlyOnceWith(context, "gmail");
+      } else {
+        expect(needsReconnect).not.toHaveBeenCalled();
+      }
+    },
+  );
   it("exposes the prepared provider's account resolution bound to that provider", async () => {
     const f = fixture();
     class AccountAdapter {

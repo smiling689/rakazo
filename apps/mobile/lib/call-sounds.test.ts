@@ -1,7 +1,14 @@
 import { createAudioPlayer, setAudioModeAsync } from "expo-audio";
-import { getItemAsync } from "expo-secure-store";
+import { deleteItemAsync, getItemAsync, setItemAsync } from "expo-secure-store";
 import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
-import { playCallCue, releaseWaitSound, startWaitSound } from "./call-sounds";
+import {
+  CALL_GREETING_KEY,
+  loadCallGreetingEnabled,
+  playCallCue,
+  releaseWaitSound,
+  saveCallGreetingEnabled,
+  startWaitSound,
+} from "./call-sounds";
 
 // Metro resolves bundled audio assets to numeric IDs.
 const assets = await vi.hoisted(async () => {
@@ -13,7 +20,16 @@ const assets = await vi.hoisted(async () => {
   };
   return { require, originalLoader };
 });
-vi.mock("expo-secure-store", () => ({ getItemAsync: vi.fn(async () => null) }));
+vi.mock("expo-secure-store", () => ({
+  getItemAsync: vi.fn(async () => null),
+  setItemAsync: vi.fn(async () => undefined),
+  deleteItemAsync: vi.fn(async () => undefined),
+}));
+const call = vi.hoisted(() => ({ active: false }));
+vi.mock("./voice", () => ({
+  activateVoiceAudio: vi.fn(async () => undefined),
+  callAudioActive: () => call.active,
+}));
 vi.mock("expo-audio", () => ({
   createAudioPlayer: vi.fn(),
   setAudioModeAsync: vi.fn(),
@@ -30,6 +46,7 @@ const player = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  call.active = false;
   vi.mocked(getItemAsync).mockResolvedValue(null);
   vi.useFakeTimers();
   vi.mocked(createAudioPlayer).mockReturnValue(
@@ -45,9 +62,20 @@ afterAll(() => {
   else delete assets.require.extensions[".m4a"];
 });
 
+it("greets on calls until the greeting is turned off on this device", async () => {
+  expect(await loadCallGreetingEnabled()).toBe(true);
+  await saveCallGreetingEnabled(false);
+  expect(setItemAsync).toHaveBeenCalledWith(CALL_GREETING_KEY, "0");
+  vi.mocked(getItemAsync).mockResolvedValue("0");
+  expect(await loadCallGreetingEnabled()).toBe(false);
+  await saveCallGreetingEnabled(true);
+  expect(deleteItemAsync).toHaveBeenCalledWith(CALL_GREETING_KEY);
+});
+
 it.each(["start", "end"] as const)(
-  "plays the %s cue without changing the audio mode",
+  "plays the %s cue during a call without changing the audio mode",
   async (cue) => {
+    call.active = true;
     const playing = playCallCue(cue);
     await vi.advanceTimersByTimeAsync(1600);
     await playing;
@@ -55,14 +83,30 @@ it.each(["start", "end"] as const)(
     expect(player.play).toHaveBeenCalledOnce();
     expect(player.remove).toHaveBeenCalledOnce();
     expect(setAudioModeAsync).not.toHaveBeenCalled();
+    expect(createAudioPlayer).toHaveBeenCalledWith(expect.anything(), {
+      keepAudioSessionActive: true,
+    });
   },
 );
+
+it("lets a cue played outside a call release the audio session", async () => {
+  const playing = playCallCue("start");
+  await vi.advanceTimersByTimeAsync(1600);
+  await playing;
+
+  expect(createAudioPlayer).toHaveBeenCalledWith(expect.anything(), {
+    keepAudioSessionActive: false,
+  });
+});
 
 it("plays waiting audio without changing the active recognition audio mode", async () => {
   const playing = startWaitSound();
   await vi.advanceTimersByTimeAsync(0);
   expect(player.play).toHaveBeenCalledOnce();
   expect(setAudioModeAsync).not.toHaveBeenCalled();
+  expect(createAudioPlayer).toHaveBeenCalledWith(expect.anything(), {
+    keepAudioSessionActive: true,
+  });
 
   releaseWaitSound();
   await playing;

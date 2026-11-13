@@ -12,6 +12,9 @@ function subscribe(channel) {
 contextBridge.exposeInMainWorld("rakazoDesktop", {
   platform: process.platform,
   nativeWindowFrame: process.platform === "win32",
+  clipboard: {
+    writeText: (text) => ipcRenderer.invoke("desktop.clipboard.write", text),
+  },
   badge: {
     set: (count) => ipcRenderer.invoke("desktop.badge.set", count),
   },
@@ -20,6 +23,9 @@ contextBridge.exposeInMainWorld("rakazoDesktop", {
     requestAccess: () => ipcRenderer.invoke("desktop.computer.requestAccess"),
     revokeAccess: () => ipcRenderer.invoke("desktop.computer.revokeAccess"),
     onConfigure: subscribe("desktop.computer.configure"),
+  },
+  server: {
+    change: () => ipcRenderer.invoke("desktop.server.change"),
   },
   settings: {
     onOpen: subscribe("desktop.settings.open"),

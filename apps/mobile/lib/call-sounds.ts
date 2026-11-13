@@ -1,10 +1,12 @@
 import type { AudioPlayer } from "expo-audio";
 import * as SecureStore from "expo-secure-store";
+import { activateVoiceAudio, callAudioActive } from "./voice";
 import type { WaitTone, WaitUnit } from "./wait-pattern";
 import { nextWaitUnit, WAIT_PATTERNS } from "./wait-pattern";
 
 export const CALL_SOUNDS_KEY = "rakazo.call-sounds";
 export const WAIT_SOUND_KEY = "rakazo.wait-sound";
+export const CALL_GREETING_KEY = "rakazo.call-greeting";
 
 export type CallCue = "start" | "end";
 
@@ -40,6 +42,8 @@ const WAIT_ASSETS = {
   ],
 } as const;
 
+const CALL_PLAYER = { keepAudioSessionActive: true };
+
 /** Bound playback when no completion event arrives. */
 const CUE_MAX_MS = 1600;
 const WAIT_FADE_MS = 150;
@@ -63,13 +67,26 @@ export async function saveWaitSoundEnabled(on: boolean): Promise<void> {
   else await SecureStore.setItemAsync(WAIT_SOUND_KEY, "0");
 }
 
+export async function loadCallGreetingEnabled(): Promise<boolean> {
+  return (await SecureStore.getItemAsync(CALL_GREETING_KEY)) !== "0";
+}
+
+export async function saveCallGreetingEnabled(on: boolean): Promise<void> {
+  if (on) await SecureStore.deleteItemAsync(CALL_GREETING_KEY);
+  else await SecureStore.setItemAsync(CALL_GREETING_KEY, "0");
+}
+
 export async function playCallCue(cue: CallCue): Promise<void> {
   const epoch = waitCallEpoch;
   if (!(await loadCallSoundsEnabled().catch(() => true))) return;
   if (epoch !== waitCallEpoch) return;
   const { createAudioPlayer } = await import("expo-audio");
   if (epoch !== waitCallEpoch) return;
-  const player = createAudioPlayer(CUE_ASSETS[cue]);
+  await activateVoiceAudio();
+  if (epoch !== waitCallEpoch) return;
+  const player = createAudioPlayer(CUE_ASSETS[cue], {
+    keepAudioSessionActive: callAudioActive(),
+  });
   let finish: () => void = () => undefined;
   cuePlayers.set(player, () => finish());
   try {
@@ -114,7 +131,7 @@ async function waitPlayer(unit: WaitUnit, epoch: number): Promise<AudioPlayer | 
   const key = `${unit.tone}-${unit.pattern}`;
   let player = waitPlayers.get(key);
   if (!player) {
-    player = createAudioPlayer(WAIT_ASSETS[unit.tone][unit.pattern - 1]);
+    player = createAudioPlayer(WAIT_ASSETS[unit.tone][unit.pattern - 1], CALL_PLAYER);
     waitPlayers.set(key, player);
   }
   return player;

@@ -1,7 +1,7 @@
 import type { Actor } from "@rakazo/contracts";
 import { canonicalPiProviderId } from "@rakazo/contracts";
 import type { BotModelChangeDeps } from "./model-selection.js";
-import { modelCredentialAuthKindsForSpace } from "./model-selection.js";
+import { modelCredentialAuthKindsForSpace, spaceCanRunCatalogModel } from "./model-selection.js";
 import { listAvailablePiCatalog } from "./pi-catalog-availability.js";
 import type { PiCatalogEntry } from "./pi-models.js";
 import { listPiCatalog, offeredCatalog } from "./pi-models.js";
@@ -30,21 +30,27 @@ export async function connectedModelChoices(
     deps.hostedProvider,
   );
   return offeredCatalog(listAvailablePiCatalog(auth.byProvider, auth.byModel)).filter((entry) => {
-    if (entry.placeholder) return false;
+    if (entry.placeholder || !spaceCanRunCatalogModel(auth, entry)) return false;
     const kind = auth.byModel[entry.provider]?.[entry.id] ?? auth.byProvider[entry.provider];
     return kind !== undefined && kind !== "disconnected";
   });
 }
 
 /**
- * Words and version numbers: "Gemini 3.8 Flash" is gemini, 3.8, flash. An id writes versions
- * with hyphens ("claude-sonnet-5-5"), so short number pairs there read as 5.5 as well.
+ * A version an id writes with a hyphen, as in "claude-sonnet-5-5" or "llama3-1-8b": its first
+ * number and one more short number, standing on their own. Sizes ("llama-3-8b"), build numbers
+ * ("gpt-4-0613") and later dates ("gpt-4o-2024-11-20", "gemini-2.5-pro-preview-11-20") stay apart.
  */
+const HYPHENATED_VERSION = /^(\D*)([1-9]?\d)[-_]([1-9]?\d)(?![\p{L}\d.]|[-_]\d{1,2}(?![\p{L}\d]))/u;
+
+/** Words and version numbers: "Gemini 3.8 Flash" and "gemini-3-8-flash" are gemini, 3.8, flash. */
 export function words(text: string): string[] {
-  const dotted = text.replace(/(?<=^|[-_\s])(\d{1,2})[-_](\d{1,2})(?=$|[-_\s])/g, "$1.$2");
-  const split = (value: string) => value.toLowerCase().match(/\p{L}+|\d+(?:\.\d+)*/gu) ?? [];
-  // The dotted reading comes first: the first version word is the one compared for newest.
-  return dotted === text ? split(text) : [...new Set([...split(dotted), ...split(text)])];
+  return (
+    text
+      .replace(HYPHENATED_VERSION, "$1$2.$3")
+      .toLowerCase()
+      .match(/\p{L}+|\d+(?:\.\d+)*/gu) ?? []
+  );
 }
 
 const isVersion = (word: string) => /^\d/.test(word);

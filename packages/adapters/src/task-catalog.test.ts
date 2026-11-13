@@ -102,26 +102,10 @@ describe("task catalog", () => {
     expect(result.guidance).toBe(TASK_CATALOG_GUIDANCE);
   });
 
-  it("lists a group run's routines from every chat and marks the ones posting here", async () => {
+  it("lists a group run's routines from every chat and marks the ones posting there", async () => {
     const findMany = vi.fn(async (_args: Record<string, unknown>) => [
-      {
-        id: "r-own",
-        name: "Daily check",
-        prompt: "p",
-        crons: ["0 8 * * *"],
-        active: true,
-        threadId: "own-thread",
-        nextRunAt: null,
-      },
-      {
-        id: "r-group",
-        name: "Group digest",
-        prompt: "p",
-        crons: ["0 9 * * *"],
-        active: true,
-        threadId: "group-thread",
-        nextRunAt: null,
-      },
+      { id: "r-dm", name: "Daily check", crons: ["0 8 * * *"], threadId: "dm-thread" },
+      { id: "r-group", name: "Digest", crons: ["0 9 * * *"], threadId: "group-thread" },
     ]);
     const prisma = {
       scratchpadItem: { findMany: vi.fn(async () => []) },
@@ -135,16 +119,16 @@ describe("task catalog", () => {
         spaceId: "space-1",
         botId: "bot-1",
         userId: "user-1",
-        currentThreadId: "group-thread",
+        groupThreadId: "group-thread",
         tools: [],
       },
     );
     expect(findMany.mock.calls[0]?.[0]).toMatchObject({
-      where: { spaceId: "space-1", botId: "bot-1", userId: "user-1" },
+      where: { spaceId: "space-1", botId: "bot-1" },
     });
     expect(findMany.mock.calls[0]?.[0]?.where).not.toHaveProperty("threadId");
     expect(result.routines).toEqual([
-      expect.objectContaining({ routineId: "r-own", inThisChat: false }),
+      expect.objectContaining({ routineId: "r-dm", inThisChat: false }),
       expect.objectContaining({ routineId: "r-group", inThisChat: true }),
     ]);
   });

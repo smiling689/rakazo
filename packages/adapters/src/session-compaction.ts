@@ -1,6 +1,7 @@
 import { runContinueJob } from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
 import { blocksToAgentHistoryText, escapePromptData } from "@rakazo/core";
+import { isUniqueViolation } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import { estimateTextTokens } from "./context-selection.js";
 import type { CompactHistoryDeps } from "./history-compaction.js";
@@ -11,7 +12,6 @@ import {
   transcriptLines,
 } from "./history-compaction.js";
 import { replayedTranscriptTokens } from "./pi-runtime-transcript.js";
-import { isUniqueViolation } from "./run-messages.js";
 import type { CompactionReason } from "./session-context.js";
 import {
   MEMORY_FLUSH_PROMPT,
@@ -235,7 +235,7 @@ async function foldIntoSummary(
     const batch = await deps.prisma.message.findMany({
       where: { threadId: thread.id, seq: { gt: cursor ?? -1, lte: target } },
       orderBy: { seq: "asc" },
-      select: { seq: true, role: true, botId: true, blocks: true },
+      select: { seq: true, role: true, botId: true, authorUserId: true, blocks: true },
     });
     if (batch.length === 0) return;
     const lines = (await transcriptLines(deps.prisma, thread, batch)).map(clipMessage);

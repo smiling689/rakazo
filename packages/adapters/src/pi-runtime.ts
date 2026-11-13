@@ -33,7 +33,7 @@ import {
 } from "./approval-effect.js";
 import { automated, withAutomatedLabels } from "./automated-messages.js";
 import { withCloudflareAuth } from "./cloudflare-ai-gateway.js";
-import { neutralizeSpeakerLabels, speakerText } from "./history-speakers.js";
+import { neutralizeSpeakerLabels } from "./history-speakers.js";
 import { estimatePiImageTokens } from "./pi-image-context.js";
 import {
   COMPUTER_MODE_TOOLS,
@@ -58,6 +58,14 @@ import {
   MAX_CONTINUATION_OVERLAP,
   MAX_SELF_RECOVERIES_PER_RUN,
 } from "./pi-runtime-fallback.js";
+import {
+  isHistoryReply,
+  speakerText,
+  toHistory,
+  toPiImages,
+  withLeadingUser,
+  withoutSteeringMessages,
+} from "./pi-runtime-history.js";
 import type { RuntimeModelTarget } from "./pi-runtime-models.js";
 import {
   cardOutputCeiling,
@@ -70,25 +78,26 @@ import {
 } from "./pi-runtime-models.js";
 import { conversationSessionId, reliableModelStream } from "./pi-runtime-stream.js";
 import { MAX_PARALLEL_SUBAGENTS } from "./pi-runtime-subagent.js";
-import type { EventQueue, ToolCallBudget, ToolHost } from "./pi-runtime-tools.js";
+import type { ToolCallBudget, ToolHost } from "./pi-runtime-tools.js";
 import {
+  agentToolDefinitions,
+  createGate,
+  createQueue,
   describeToolActivity,
+  redactAskUserDetailInMessage,
   releaseToolCallBudget,
   toAgentTools,
   toolCallBudgetExceededMessage,
   toolCallBudgetFor,
 } from "./pi-runtime-tools.js";
-import {
-  HISTORY_ASSISTANT,
-  NO_USAGE,
-  recordedTranscript,
-  replayTranscripts,
-} from "./pi-runtime-transcript.js";
+import { recordedTranscript } from "./pi-runtime-transcript.js";
 import type { PiSessionHandle, PiSessionRecorder } from "./pi-session.js";
 import { PiJsonlSessionRecorder } from "./pi-session.js";
 import { withPiTelemetry } from "./pi-telemetry.js";
 import { withPiThinkingActivity } from "./pi-thinking-activity.js";
 import { observedPiStream } from "./pi-usage.js";
+import type { RejectedProviderRequest } from "./provider-request-shape.js";
+import { attachRejectedRequests, rejectedRequestsOf } from "./provider-request-shape.js";
 import type { RuntimeContextDecision } from "./runtime-context.js";
 import { createRuntimeContextPolicy } from "./runtime-context.js";
 import { deliverFinishedShells } from "./shell-command-stream.js";
@@ -101,6 +110,7 @@ import {
 } from "./turn-checkpoint.js";
 import { midTaskMessageFromPrompt, midTaskMessagePrompt } from "./user-progress.js";
 
+const MAX_REJECTED_REQUESTS = 5;
 const running = new Map<string, { controller: AbortController; work: Promise<void> }>();
 // Some OpenAI-compatible models return EOS immediately after a tool result
 // instead of taking another assistant turn. A bounded internal follow-up keeps
@@ -308,6 +318,9 @@ export class PiAgentRuntime implements AgentRuntime {
         };
         resumeHost = host;
         const allTools = toAgentTools(toolDefs, host, request.advertisedToolNames);
+        const toolsByAgentName = agentToolDefinitions(toolDefs);
+        // Replayed calls to tools the model no longer has say so in their results.
+        const offeredToolNames = new Set(allTools.map((tool) => tool.name));
         let tools = allTools;
         const seenSteeringIds: string[] = [];
         // Messages handed to the model mid-turn, which this turn's transcript carries.
@@ -332,6 +345,7 @@ export class PiAgentRuntime implements AgentRuntime {
             withoutSteeringMessages(request.history, initialSteering),
             request.prompt,
             request.sourceMessageId,
+            offeredToolNames,
             request.replayWindowBefore,
           );
         const representedHistoryIds = new Set(
@@ -432,6 +446,7 @@ export class PiAgentRuntime implements AgentRuntime {
         };
         // The idle watchdog may clone a terminal message, preserving its content array.
         const providerFailures = new WeakSet<AssistantMessage["content"]>();
+        const rejectedRequests: RejectedProviderRequest[] = [];
         const hasBackups = Boolean(request.fallbackModels?.length);
         let agent: Agent;
         let activeStreamTarget = host.activeModel;
@@ -478,6 +493,19 @@ export class PiAgentRuntime implements AgentRuntime {
                       ...usageHooks,
                       prepareContext,
                       onProviderError: (message) => providerFailures.add(message.content),
+                      onRejectedRequest: (rejection, model) => {
+                        if (rejection) {
+                          if (rejectedRequests.push(rejection) > MAX_REJECTED_REQUESTS)
+                            rejectedRequests.shift();
+                          return;
+                        }
+                        // That model recovered; another model's rejection still explains a failure.
+                        for (let index = rejectedRequests.length - 1; index >= 0; index -= 1) {
+                          const entry = rejectedRequests[index];
+                          if (entry?.provider === model.provider && entry.model === model.id)
+                            rejectedRequests.splice(index, 1);
+                        }
+                      },
                     },
                   ),
                 target.config.cacheCapabilities?.retentionMode,
@@ -493,14 +521,25 @@ export class PiAgentRuntime implements AgentRuntime {
             agent.state.model = target.model;
             contextPolicy = contextPolicyFor(target);
           },
+          // A throwaway policy, so judging a backup leaves the active policy's sent transcript
+          // alone. Cache use is recorded only on usage, which a throwaway never sees. The opening
+          // turn is added as on each call, so the backup is judged on what it would be sent.
+          prepareForTarget: (target, ctx) => ({
+            ...ctx,
+            ...withLeadingUser(contextPolicyFor(target).prepareContext(ctx, target.model)),
+          }),
           onSwitch: async (target) => {
             await request.onModelChange?.(target.config.provider, target.config.id);
             activeStreamTarget = target;
             contextPolicy = contextPolicyFor(target);
             host.activeModel = target;
+            // A backup keeps its own effort.
             const nextThinkingLevel = thinkingLevelFor(
               target.model,
-              target.config.thinkingLevel ?? request.model.thinkingLevel,
+              target.config.thinkingLevel ??
+                (sameModelTarget(target.config, request.model)
+                  ? request.model.thinkingLevel
+                  : undefined),
             );
             agent.state.model = target.model;
             agent.state.thinkingLevel = nextThinkingLevel;
@@ -614,8 +653,10 @@ export class PiAgentRuntime implements AgentRuntime {
               : async () => apiKey,
           finishTurn: async (turn, turnSignal) => {
             await deliverFinishedShells(
+              // Steered, so the output reaches the next model request like a tool result. A
+              // follow-up waits until the model stops and then costs one model turn each.
               (text) => {
-                agent.followUp({
+                agent.steer({
                   role: "user",
                   content: text,
                   timestamp: Date.now(),
@@ -656,7 +697,7 @@ export class PiAgentRuntime implements AgentRuntime {
             for (const item of steering) representedHistoryIds.add(item.messageId);
             if (steering.some((item) => item.images?.length && !item.imageFileFallback))
               hasCurrentImages = true;
-            for (const item of steering) {
+            const messages = steering.map((item): Message => {
               const images = toPiImages(item.images);
               const text =
                 item.origin === "user"
@@ -665,18 +706,21 @@ export class PiAgentRuntime implements AgentRuntime {
                       toolDefs.some((tool) => tool.name === "message_user"),
                     )
                   : midTaskMessageFromPrompt(steeringText(item), item.origin);
-              agent.steer({
+              return {
                 role: "user",
                 content: images.length ? [{ type: "text", text }, ...images] : text,
                 timestamp: Date.now(),
-              });
-            }
+              };
+            });
             // Ordered with the turn's other events, so the run can treat it as a turn boundary.
             queue.push({
               type: "steered",
               fromRunUser: steering.some((item) => item.origin === "user"),
             });
-            return update;
+            // Returned rather than steered: Pi polls its steering queue once per turn before
+            // this hook runs, and skips the poll after it when that one found a message, such
+            // as a finished shell's output. Returned messages always go into the next request.
+            return { ...update, messages };
           },
           initialState: {
             systemPrompt,
@@ -804,6 +848,9 @@ export class PiAgentRuntime implements AgentRuntime {
           }
           if (event.type === "message_end") {
             stopThinking();
+            // Before any copy is kept: the recording below, and the checkpoint and provider
+            // payloads that reuse this same message object.
+            redactAskUserDetailInMessage(event.message, request.secrets);
             await piSession?.appendMessage(event.message);
           }
           if (event.type === "tool_execution_start") {
@@ -816,7 +863,9 @@ export class PiAgentRuntime implements AgentRuntime {
             toolActivityShowing = true;
             queue.push({
               type: "progress",
-              text: describeToolActivity(event.toolName, event.args),
+              text: describeToolActivity(event.toolName, event.args, (name) =>
+                toolsByAgentName.get(name),
+              ),
               activity: true,
             });
           }
@@ -1085,7 +1134,8 @@ export class PiAgentRuntime implements AgentRuntime {
                 });
               }
               // A run cannot continue from an assistant message. What trails here is this
-              // bot's own earlier text, which the restored transcript already carries.
+              // bot's own earlier reply, which the restored transcript already carries; a
+              // continue from its tool results would extend that old reply.
               for (let last = agent.state.messages.at(-1); isHistoryReply(last); ) {
                 agent.state.messages.pop();
                 last = agent.state.messages.at(-1);
@@ -1159,7 +1209,14 @@ export class PiAgentRuntime implements AgentRuntime {
               ...fallbackState.backupOutcomes.values(),
             ]);
           }
-          throw modelFailure(error, message);
+          const failure = modelFailure(error, message, {
+            provider: activeStreamTarget.config.provider,
+            primaryProvider: fallbackState.request.model.provider,
+          });
+          // Only a rejection nothing explains needs its request's shape to be reproduced.
+          throw failure.constructor === Error
+            ? attachRejectedRequests(failure, rejectedRequests)
+            : failure;
         }
         // Only an assistant message can hold the answer a provider left off the deltas;
         // a trailing tool result is tool output, not the model's reply.
@@ -1249,7 +1306,7 @@ export class PiAgentRuntime implements AgentRuntime {
               ? new ModelAccountError(message)
               : error instanceof ModelOutputError
                 ? new ModelOutputError(message)
-                : new Error(message),
+                : attachRejectedRequests(new Error(message), rejectedRequestsOf(error) ?? []),
         );
       } finally {
         stopThinking();
@@ -1273,206 +1330,4 @@ export class PiAgentRuntime implements AgentRuntime {
       if (running.get(request.runId) === active) running.delete(request.runId);
     }
   }
-}
-
-function toPiImages(images: AgentRunRequest["currentTurnImages"]) {
-  return (images ?? []).map((image) => ({
-    type: "image" as const,
-    data: Buffer.from(image.data).toString("base64"),
-    mimeType: image.mimeType,
-  }));
-}
-
-/** Stands in for the opening turn when the window starts on a bot message (Bedrock needs a user first). */
-const CONVERSATION_START = "[Conversation start]";
-
-type HistoryMessage = Message & {
-  rakazoHistory: true;
-  rakazoMessageId?: string;
-  rakazoCreatedAt?: string;
-};
-
-/** What the model reads for a message by someone other than this bot or the human of a direct chat. */
-/**
- * Replays stored messages with their real roles. This bot's own replies are assistant turns;
- * a message with a `speaker` (another bot, or the human in a group) is a user turn that starts
- * with "[speaker]: ". The label exists only here: it is never stored or shown in the app.
- * Content is a pure function of the message, or the exact text an earlier run sent for it, so
- * replayed history is stable for prompt caching.
- */
-function toHistory(
-  history: AgentRunRequest["history"],
-  prompt: string,
-  sourceMessageId?: string | null,
-  replayWindowBefore?: string,
-): HistoryMessage[] {
-  let duplicatePromptIndex = -1;
-  for (let index = history.length - 1; index >= 0; index -= 1) {
-    const message = history[index];
-    if (
-      message?.role === "user" &&
-      (sourceMessageId ? message.id === sourceMessageId : message.content === prompt)
-    ) {
-      duplicatePromptIndex = index;
-      break;
-    }
-  }
-  const prior =
-    duplicatePromptIndex < 0
-      ? history
-      : history.filter((_, index) => index !== duplicatePromptIndex);
-  // This bot's replies whose runs recorded a transcript, replayed together (see replayTranscripts).
-  const ownReplies = prior.filter((m) => m.role === "assistant" && !m.speaker && m.sentReply);
-  const before = replayWindowBefore ? Date.parse(replayWindowBefore) : Number.NaN;
-  const wholeFrom = Number.isNaN(before)
-    ? ownReplies.length
-    : ownReplies.findIndex((m) => !(Date.parse(m.createdAt ?? "") < before));
-  const replays = new Map(
-    replayTranscripts(
-      ownReplies.map((m) => m.sentReply!),
-      wholeFrom < 0 ? ownReplies.length : wholeFrom,
-    ).map((messages, index) => [ownReplies[index], messages]),
-  );
-  return prior
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .flatMap((m): HistoryMessage[] => {
-      const created = m.createdAt ? Date.parse(m.createdAt) : Number.NaN;
-      const common = {
-        timestamp: Number.isNaN(created) ? 0 : created,
-        rakazoHistory: true as const,
-        rakazoMessageId: m.id,
-        rakazoCreatedAt: m.createdAt,
-      };
-      // The run's own transcript, tool work included, in place of its final text.
-      const replay = replays.get(m);
-      if (replay?.length)
-        return replay.map((message) => ({ ...message, ...common, timestamp: message.timestamp }));
-      if (m.role === "assistant" && !m.speaker) {
-        // A reply that holds only tool work has no text to replay.
-        if (!m.content.trim()) return [];
-        return [
-          {
-            role: "assistant" as const,
-            content: [{ type: "text" as const, text: m.content }],
-            ...HISTORY_ASSISTANT,
-            usage: NO_USAGE,
-            stopReason: "stop" as const,
-            ...common,
-          },
-        ];
-      }
-      const text = m.sentText ?? (m.speaker ? speakerText(m.speaker, m.content) : m.content);
-      // Pictures ride on the human's turn only, never on a bot's.
-      const images = m.role === "assistant" ? [] : toPiImages(m.images);
-      return [
-        {
-          role: "user" as const,
-          content: images.length ? [{ type: "text" as const, text }, ...images] : text,
-          ...common,
-        },
-      ];
-    });
-}
-
-function isHistoryReply(message: Message | undefined): boolean {
-  return (
-    message?.role === "assistant" &&
-    Boolean((message as Message & { rakazoHistory?: true }).rakazoHistory)
-  );
-}
-
-/**
- * Every provider needs the first message to be the user's (Bedrock rejects anything else, and
- * chat templates assume it), but a window or a trim can start on one of this bot's replies.
- * Called on each model call, so it holds whatever the context policy kept.
- */
-function withLeadingUser(context: Context): Context {
-  const first = context.messages.findIndex((message) => (message.role as string) !== "system");
-  if (first < 0 || context.messages[first]!.role === "user") return context;
-  const start: Message = { role: "user", content: CONVERSATION_START, timestamp: 0 };
-  return {
-    ...context,
-    messages: [...context.messages.slice(0, first), start, ...context.messages.slice(first)],
-  };
-}
-
-function withoutSteeringMessages(
-  history: AgentRunRequest["history"],
-  steering: AgentSteeringMessage[],
-): AgentRunRequest["history"] {
-  if (steering.length === 0) return history;
-  const result = [...history];
-  let beforeIndex = result.length - 1;
-  for (let steeringIndex = steering.length - 1; steeringIndex >= 0; steeringIndex -= 1) {
-    const steeringMessage = steering[steeringIndex];
-    for (let index = beforeIndex; index >= 0; index -= 1) {
-      const message = result[index];
-      if (
-        message?.role !== "user" ||
-        (message.id
-          ? message.id !== steeringMessage?.messageId
-          : message.content !== (steeringMessage?.historyText ?? steeringMessage?.text))
-      ) {
-        continue;
-      }
-      result.splice(index, 1);
-      beforeIndex = index - 1;
-      break;
-    }
-  }
-  return result;
-}
-
-function createGate(max: number) {
-  let active = 0;
-  const waiters: Array<() => void> = [];
-  return {
-    async acquire() {
-      if (active >= max) {
-        await new Promise<void>((resolve) => {
-          waiters.push(resolve);
-        });
-      }
-      active += 1;
-    },
-    release() {
-      active = Math.max(0, active - 1);
-      waiters.shift()?.();
-    },
-  };
-}
-
-function createQueue(): EventQueue {
-  const items: AgentRuntimeEvent[] = [];
-  let wake: (() => void) | undefined;
-  let closed = false;
-  let failure: Error | undefined;
-  return {
-    push(event) {
-      items.push(event);
-      wake?.();
-    },
-    fail(error) {
-      failure = error;
-      closed = true;
-      wake?.();
-    },
-    close() {
-      closed = true;
-      wake?.();
-    },
-    async *iterate() {
-      while (true) {
-        if (items.length) {
-          yield items.shift()!;
-          continue;
-        }
-        if (failure) throw failure;
-        if (closed) return;
-        await new Promise<void>((resolve) => {
-          wake = resolve;
-        });
-      }
-    },
-  };
 }

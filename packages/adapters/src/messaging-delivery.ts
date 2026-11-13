@@ -1,36 +1,54 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import type {
   AdapterContext,
   ArtifactStore,
+  BackgroundJobAttempt,
   JobPublisher,
   MessagingOutboundAttachment,
   MessagingOutboundStatus,
   MessagingSurface,
 } from "@rakazo/adapter-kit";
-import { messagingDeliverJob, runContinueJob } from "@rakazo/adapter-kit";
+import {
+  messagingReplyJobKey,
+  messagingSendJob,
+  messagingSendJobKey,
+  RetryJobLaterError,
+  runContinueJob,
+} from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
 import {
   botMessageHopExhausted,
+  botMessageMaxHops,
   chatAppAskText,
   chatAppTakeoverText,
   nextBotMessageHop,
   pageLinksAsTitles,
+  teamChatResponseText,
 } from "@rakazo/core";
-import type { PrismaClient, ThreadEvents } from "@rakazo/db";
+import type { DatabaseOutage, Prisma, PrismaClient, ThreadEvents } from "@rakazo/db";
 import {
+  accountDeactivated,
   appendEventInTransaction,
   CrossSpaceCommunicationBlockedError,
   createThreadMessageInTransaction,
   crossSpaceCommunicationAllowed,
+  databaseCapacityBackoffMs,
+  databaseOutage,
+  isDatabaseUnavailable,
   runAsSystem,
+  SpaceDeletionInProgressError,
+  THREAD_LOCK_TRANSACTION_OPTIONS,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import { MessagingSendError } from "./chat-sdk-surface.js";
 import { outboundPartLimit, splitOutboundBody } from "./messaging-platforms.js";
+import { resolveMessagingThreadId } from "./team-chat-messaging.js";
+import { isUserProgressClientNonce } from "./user-progress.js";
 
 /**
  * Margin under vendor consecutive-outbound caps (sendblue enforces one hard):
- * past this many DMs without a reply from the owner, mirror rows stay pending
- * until the next inbound resets the counter.
+ * past this many DMs without a reply from the owner, rows stay pending until
+ * the next inbound resets the counter.
  */
 export const MESSAGING_DM_OUTBOUND_CAP = 140;
 
@@ -44,35 +62,99 @@ export const WECHAT_REPLY_BUDGET = 8;
 const PROGRESS_RESERVE = 3;
 
 /** DMs a provider takes between two messages from the owner, when it limits them. */
-function outboundCap(provider: string): number | undefined {
+export function outboundCap(provider: string): number | undefined {
   if (provider === "sendblue") return MESSAGING_DM_OUTBOUND_CAP;
   if (provider === "wechat") return WECHAT_REPLY_BUDGET;
   return undefined;
 }
 
-/** Provider-send attempts before a mirrored row is declared lost. */
-export const MESSAGING_OUTBOUND_MAX_ATTEMPTS = 5;
+/**
+ * How long one send may take, file upload included. Providers that take the abort signal stop
+ * there; the vendor clients Rakazo configures (Slack, Sendblue) already give up well before it.
+ */
+export const MESSAGING_SEND_TIMEOUT_MS = 60_000;
 
-/** The outbox columns a drain reads and updates. */
-type MessagingOutboundRow = {
+/**
+ * When a claimed send counts as dead and its backup job may send the message again: strictly
+ * longer than the timeout, and the same window the previous release gives its own claims. The
+ * sender waits for a provider call it cannot abort until just before it, and records a call that
+ * lands later still against its own claim, so only a crash, or a call that lands after its
+ * backup job took over, can lead to a second post.
+ */
+export const MESSAGING_SEND_STALE_MS = 2 * MESSAGING_SEND_TIMEOUT_MS;
+const STALE_MARGIN_MS = 10_000;
+
+/** When a recorded message's backup job is due: once its send's claim would be stale. */
+export const MESSAGING_SEND_BACKUP_MS = MESSAGING_SEND_STALE_MS + 30_000;
+
+/**
+ * A claimed row: marked sent before its handle is known, as the previous release marks its own,
+ * so either release sees the other's sends in flight. A finished send always gets a handle (an
+ * empty one when the provider gives none).
+ */
+const IN_FLIGHT = { status: "sent", providerHandle: null } as const;
+
+/** How soon a message held behind the sendblue cap checks again, should no reply arrive. */
+const DM_CAP_RECHECK_MS = 15 * 60_000;
+
+/** A message still unsent this long after its last change has lost its backup job. */
+const STALLED_OUTBOUND_MS = 5 * 60_000;
+const SWEEP_BATCH = 100;
+
+/** Statuses of a message waiting for a send. */
+const WAITING = ["pending", "retry"];
+const TERMINAL_RUN = ["completed", "failed", "cancelled"];
+
+/**
+ * The send order every sender agrees on: rows carry explicit per-part createdAt values, and id
+ * breaks the ties that remain so two senders never order one conversation's rows differently.
+ */
+const SEND_ORDER: Prisma.MessagingOutboundOrderByWithRelationInput[] = [
+  { createdAt: "asc" },
+  { id: "asc" },
+];
+
+/** One conversation's queue: a person's direct messages, or one provider thread. */
+export type OutboundLane = { identityId: string } | { identityId: null; threadId: string };
+
+export type OutboundRow = Omit<Prisma.MessagingOutboundCreateManyInput, "createdAt">;
+
+type LaneRow = {
   id: string;
   idempotencyKey: string;
   kind: string;
   identityId: string | null;
   threadId: string | null;
   body: string;
-  attempts: number | null;
-  nextAttemptAt: Date | null;
+  status: string;
+  providerHandle: string | null;
   sourceMessageId: string | null;
   createdAt: Date;
+  updatedAt: Date;
 };
+
+const LANE_ROW = {
+  id: true,
+  idempotencyKey: true,
+  kind: true,
+  identityId: true,
+  threadId: true,
+  body: true,
+  status: true,
+  providerHandle: true,
+  sourceMessageId: true,
+  createdAt: true,
+  updatedAt: true,
+} as const;
 
 export interface MessagingDeliveryDeps {
   prisma: PrismaClient;
   messaging: MessagingSurface;
   events: Pick<ThreadEvents, "sendUserMessage" | "notify">;
-  jobs: Pick<JobPublisher, "enqueue">;
+  jobs: Pick<JobPublisher, "enqueue" | "enqueueIn" | "cancel" | "cancelIn">;
   artifacts: Pick<ArtifactStore, "get">;
+  /** The process's database outage streak; defaults to the shared one. */
+  outage?: DatabaseOutage;
 }
 
 type IdentityRow = {
@@ -81,124 +163,722 @@ type IdentityRow = {
   address: string;
   dmThreadId: string | null;
   outboundSinceInbound: number;
+  spaceId: string;
 };
 
+/** What became of one claimed row's send. */
+type SendOutcome =
+  | { kind: "sent"; handle: string }
+  | { kind: "failed" }
+  /** Not sent and not failed: the conversation waits (the sendblue cap). */
+  | { kind: "held" }
+  /** The provider call is still running past its time; the backup job takes the row over. */
+  | { kind: "unsettled" }
+  | { kind: "error"; error: unknown; attachmentName: string | null };
+
 /**
- * Automatic mirror, not a send tool, so delivery does not depend on prompt
- * compliance. Agent-to-agent fan-out stays internal and never transits the
- * messaging provider. Also drains outbox rows the channels slice enqueued.
+ * Every outgoing chat message, for 1:1 chats, groups and team chat alike: recorded with a
+ * backup job in one transaction, sent straight away by the process that recorded it, and sent
+ * by the backup job only when that process could not. A clean failure moves the job up to now,
+ * or to the provider's retry-after, and the job's own retries carry on from there.
  */
-export async function deliverMessagingOutbound(
-  deps: MessagingDeliveryDeps,
-  input: { runId?: string },
-  context: AdapterContext,
-): Promise<void> {
-  if (input.runId) {
-    await mirrorMessagingOutbound(deps, input.runId);
+export class MessagingDelivery {
+  private readonly outage: DatabaseOutage;
+
+  constructor(private readonly deps: MessagingDeliveryDeps) {
+    this.outage = deps.outage ?? databaseOutage;
   }
-  await drain(deps, context);
-}
 
-export async function mirrorMessagingOutbound(
-  deps: MessagingDeliveryDeps,
-  runId: string,
-): Promise<void> {
-  await mirrorRun(deps, runId);
-  await deps.prisma.run.updateMany({
-    where: { id: runId, trigger: "messaging" },
-    data: { messagingMirroredAt: new Date() },
-  });
-}
-
-/**
- * Queues what a 1:1 chat-app run has posted so far (a message_user heads-up) while it is still
- * going. The run is not marked mirrored: that still means its reply is out. The outbox keys rows
- * by message, so the end-of-run mirror never sends these twice. Group channel runs post once.
- */
-export async function mirrorMessagingProgress(
-  deps: MessagingDeliveryDeps,
-  runId: string,
-): Promise<void> {
-  const run = await deps.prisma.run.findUnique({
-    where: { id: runId },
-    include: { sourceMessage: true },
-  });
-  if (run?.trigger !== "messaging") return;
-  const sourceBlocks = (run.sourceMessage?.blocks ?? []) as MessageBlock[];
-  if (sourceBlocks.some((block) => block.kind === "channel_message")) return;
-  if (!(await progressFitsCap(deps, run.botId))) return;
-  await mirrorRun(deps, runId);
-}
-
-/**
- * Whether an interim line still leaves the reply room under the provider's cap. One held back
- * here is not lost: the end-of-run mirror queues it ahead of the reply, and the last send
- * allowed carries both.
- */
-async function progressFitsCap(deps: MessagingDeliveryDeps, botId: string): Promise<boolean> {
-  const identity = await deps.prisma.messagingIdentity.findUnique({ where: { botId } });
-  const cap = identity ? outboundCap(identity.provider) : undefined;
-  if (!identity || cap === undefined) return true;
-  const queued = await deps.prisma.messagingOutbound.count({
-    where: { identityId: identity.id, status: "pending" },
-  });
-  return identity.outboundSinceInbound + queued + PROGRESS_RESERVE < cap;
-}
-
-async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<void> {
-  const run = await deps.prisma.run.findUnique({
-    where: { id: runId },
-    include: { sourceMessage: true },
-  });
-  if (!run) return;
-
-  if (run.trigger === "messaging") {
-    const sourceBlocks = (run.sourceMessage?.blocks ?? []) as MessageBlock[];
-    const channelBlock = sourceBlocks.find(
-      (block): block is Extract<MessageBlock, { kind: "channel_message" }> =>
-        block.kind === "channel_message",
-    );
-    if (channelBlock) {
-      await mirrorChannelRun(deps, run, channelBlock);
-      return;
+  /**
+   * Records rows for one conversation in the caller's transaction. Under the conversation's
+   * lock every writer takes positions after the newest committed row, so two writers' rows
+   * never interleave. `replace` restarts rows a previous cycle left under the same keys.
+   * Returns the ids of the rows it added; `send` the conversation once the transaction commits.
+   */
+  async recordIn(
+    tx: Prisma.TransactionClient,
+    lane: OutboundLane,
+    rows: OutboundRow[],
+    options: { replace?: boolean } = {},
+  ): Promise<string[]> {
+    if (rows.length === 0) return [];
+    await lockLane(tx, lane);
+    if (options.replace) {
+      await tx.messagingOutbound.deleteMany({
+        where: { idempotencyKey: { in: rows.map((row) => row.idempotencyKey) } },
+      });
     }
-  } else if (run.trigger === "routine") {
-    // A scheduled routine speaks first, so its reply goes where the owner reads the bot: the
-    // linked chat. Only routines on the bot's own thread (the one the chat mirrors), never a
-    // group's; a silent run leaves no text, so nothing is queued.
-    if (!run.routineId) return;
-    const ownThread = await deps.prisma.thread.findFirst({
-      where: { id: run.threadId, botId: run.botId },
+    const latest = await tx.messagingOutbound.aggregate({
+      _max: { createdAt: true },
+      where: laneWhere(lane),
+    });
+    const base = Math.max(Date.now(), (latest._max.createdAt?.getTime() ?? 0) + 1);
+    const created = await tx.messagingOutbound.createManyAndReturn({
+      data: rows.map((row, index) => ({ ...row, createdAt: new Date(base + index) })),
+      skipDuplicates: true,
       select: { id: true },
     });
-    if (!ownThread) return;
-  } else if (run.trigger !== "bot_message") {
-    // In-app user runs and follow-ups were written in the app, so their replies stay there.
-    return;
+    const backupAt = new Date(Date.now() + MESSAGING_SEND_BACKUP_MS);
+    for (const { id } of created) {
+      await this.deps.jobs.enqueueIn(tx, messagingSendJob(id, backupAt));
+    }
+    return created.map(({ id }) => id);
   }
 
-  const identity = await deps.prisma.messagingIdentity.findUnique({
-    where: { botId: run.botId },
-  });
-  if (!identity) return;
+  /** Records rows in a transaction of their own and sends them. */
+  async record(
+    lane: OutboundLane,
+    rows: OutboundRow[],
+    options: { replace?: boolean } = {},
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    await this.deps.prisma.$transaction((tx) => this.recordIn(tx, lane, rows, options));
+    await this.send([lane]);
+  }
 
-  // bot_message runs can carry the bot's user-facing reply after a delegate wake.
-  // extractText keeps only text and page titles, so inter-bot chatter blocks never leak out.
+  /**
+   * Sends what the conversations have queued, in order, from this process. Never throws and never
+   * retries here: what this process cannot send stays with its backup job, and a database outage
+   * is logged once for the process, not once per send.
+   */
+  async send(lanes: OutboundLane[]): Promise<void> {
+    const unique = new Map(lanes.map((lane) => [laneKey(lane), lane]));
+    await Promise.all(
+      [...unique.values()].map((lane) =>
+        runAsSystem("send recorded chat messages", () => this.drainLane(lane)).then(
+          () => this.outage.succeeded(),
+          (error) => this.reportFailure("messaging outbound send error", error),
+        ),
+      ),
+    );
+  }
 
-  const messages = await deps.prisma.message.findMany({
-    where: { runId: run.id, role: "bot" },
-    orderBy: { seq: "asc" },
-  });
-  const sendsFiles = deps.messaging
-    .platforms()
-    .some((platform) => platform.provider === identity.provider && platform.capabilities.files);
-  // One row per platform-sized part, then one per image or file, so a retry
-  // re-sends only the parts that failed and never repeats delivered text.
-  // Explicit createdAt keeps the parts in order for the drain.
-  const createdAt = Date.now();
-  const linkedPages = linkedPageIds(messages);
-  const rows = messages
-    .flatMap((message) => {
+  /** Logs a failure of the direct path, or counts it in the outage when the database is down. */
+  reportFailure(message: string, error: unknown): void {
+    if (!this.outage.failed(error, "messaging delivery")) getLogger().error(message, error);
+  }
+
+  /**
+   * The backup job for one outgoing message. It runs only when the send that recorded the
+   * message did not finish in time, failed cleanly, or found the conversation busy.
+   */
+  async sendJob(outboundId: string, attempt?: BackgroundJobAttempt): Promise<void> {
+    await runAsSystem("send a recorded chat message", async () => {
+      const row = await this.deps.prisma.messagingOutbound.findUnique({
+        where: { id: outboundId },
+        select: LANE_ROW,
+      });
+      if (!row) return;
+      const inFlight = row.status === "sent" && row.providerHandle === null;
+      if (!WAITING.includes(row.status) && !inFlight) return;
+      const lane = laneOf(row);
+      if (!lane) {
+        await this.deps.prisma.messagingOutbound.updateMany({
+          where: { id: row.id, status: { in: WAITING } },
+          data: { status: "failed" },
+        });
+        return;
+      }
+      await this.drainLane(lane, { rowId: row.id, attempt });
+    });
+  }
+
+  /**
+   * Records and sends what a run said where its turn came from: a 1:1 chat or group, the
+   * team-chat thread that started it, or the thread a delegation chain started in. `progress`
+   * sends a running 1:1 run's interim messages; everything else waits for the run to pause or end.
+   */
+  async deliverRun(runId: string, options: { progress?: boolean } = {}): Promise<void> {
+    await runAsSystem("deliver what a run said", async () => {
+      const run = await this.deps.prisma.run.findUnique({
+        where: { id: runId },
+        include: {
+          sourceMessage: true,
+          bot: { select: { name: true } },
+          thread: { select: { externalConversation: { select: { botId: true } } } },
+          externalMessage: { include: { externalConversation: true } },
+        },
+      });
+      if (!run) return;
+      const terminal = TERMINAL_RUN.includes(run.status);
+      const lanes: OutboundLane[] = [];
+      if (run.externalMessage) {
+        // Team chat answers once, when the run ends; nothing of it goes to a linked 1:1 chat.
+        if (!options.progress && terminal) {
+          const lane = await this.recordTeamChatReply({
+            ...run,
+            externalMessage: run.externalMessage,
+          });
+          if (lane) lanes.push(lane);
+        }
+      } else if (run.trigger === "messaging") {
+        const channelBlock = ((run.sourceMessage?.blocks ?? []) as MessageBlock[]).find(
+          (block): block is Extract<MessageBlock, { kind: "channel_message" }> =>
+            block.kind === "channel_message",
+        );
+        if (channelBlock) {
+          if (!options.progress) {
+            const lane = await this.recordChannelRun(run, channelBlock);
+            if (lane) lanes.push(lane);
+          }
+        } else {
+          const lane = await this.recordDirectRun(run, options.progress ?? false);
+          if (lane) lanes.push(lane);
+        }
+      } else if (run.trigger === "routine" && !options.progress) {
+        // A scheduled routine speaks first, so its reply goes where the owner reads the bot: the
+        // linked chat. Only routines on the bot's own thread (the one the chat mirrors), never a
+        // group's; a silent run leaves no text, so nothing is recorded.
+        if (run.routineId && (await this.onOwnThread(run))) {
+          const lane = await this.recordDirectRun(run, false);
+          if (lane) lanes.push(lane);
+        }
+      } else if (run.trigger === "bot_message" && !options.progress) {
+        // A delegated run answers its owner's 1:1 chat, and once it ends, the team-chat thread
+        // the delegation started in. Only a run in that conversation's own thread, by its bot,
+        // runs with the shared chat's privacy: a continuation in the bot's private thread may
+        // have read its owner's memory and stays in the app.
+        const direct = await this.recordDirectRun(run, false);
+        if (direct) lanes.push(direct);
+        if (
+          (run.status === "completed" || run.status === "failed") &&
+          run.thread.externalConversation?.botId === run.botId
+        ) {
+          const delegated = await this.recordDelegatedReply(run);
+          if (delegated) lanes.push(delegated);
+        }
+      }
+      if (!options.progress) {
+        if (run.trigger === "messaging") {
+          await this.deps.prisma.run.updateMany({
+            where: { id: runId },
+            data: { messagingMirroredAt: new Date() },
+          });
+        }
+        // Recorded: the rows carry their own backups now. Only chat runs get a reply job.
+        if (terminal && (run.trigger === "messaging" || run.trigger === "bot_message"))
+          await this.deps.jobs.cancel(messagingReplyJobKey(runId));
+      }
+      await this.send(lanes);
+    });
+  }
+
+  /**
+   * The previous release's whole-outbox drain: sends every conversation that has unsent rows,
+   * so its queued jobs finish under this release.
+   */
+  async drainAll(): Promise<void> {
+    const rows = await runAsSystem("find conversations with unsent chat messages", () =>
+      this.deps.prisma.messagingOutbound.findMany({
+        where: { status: { in: WAITING } },
+        distinct: ["identityId", "threadId"],
+        select: { identityId: true, threadId: true },
+      }),
+    );
+    await this.send(rows.flatMap((row) => laneOf(row) ?? []));
+  }
+
+  /**
+   * Safety sweep, one page per call: a message waiting long after its last change whose backup
+   * job is gone, or held by a worker that died, gets a fresh one. A job still waiting out a retry
+   * or a busy conversation is left alone. Rows recorded by the previous release have no job. A
+   * send in flight is left to its own job: the previous release's stale claims look the same and
+   * must never be sent again.
+   */
+  async sweepStalled(now = new Date()): Promise<void> {
+    const before = new Date(now.getTime() - STALLED_OUTBOUND_MS);
+    const cursor = this.sweepCursor;
+    const stalled = await this.deps.prisma.messagingOutbound.findMany({
+      where: {
+        status: { in: WAITING },
+        updatedAt: { lt: before },
+        ...(cursor
+          ? {
+              OR: [
+                { updatedAt: { gt: cursor.at } },
+                { updatedAt: cursor.at, id: { gt: cursor.id } },
+              ],
+            }
+          : {}),
+      },
+      orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+      take: SWEEP_BATCH,
+      select: { id: true, updatedAt: true },
+    });
+    for (const { id } of stalled) {
+      await this.deps.jobs.enqueue({
+        ...messagingSendJob(id, now),
+        keepExisting: true,
+        replaceLockedBefore: before,
+      });
+    }
+    const last = stalled.at(-1);
+    this.sweepCursor =
+      stalled.length === SWEEP_BATCH && last ? { at: last.updatedAt, id: last.id } : undefined;
+  }
+
+  private sweepCursor: { at: Date; id: string } | undefined;
+
+  /** Sends one conversation's rows in order until it is empty or has to wait. */
+  private async drainLane(
+    lane: OutboundLane,
+    job?: { rowId: string; attempt?: BackgroundJobAttempt },
+  ): Promise<void> {
+    for (;;) {
+      const claim = await this.claimHead(lane, job?.rowId);
+      if (claim.kind === "empty") return;
+      if (claim.kind === "blocked") {
+        // Someone else owns the head; check back once they had their time.
+        if (job) await this.deps.jobs.enqueue(messagingSendJob(job.rowId, claim.retryAt));
+        return;
+      }
+      const { row, claimedAt } = claim;
+      // The claim's last moment: past it, the backup job may send the row again.
+      const deadline = claimedAt.getTime() + MESSAGING_SEND_STALE_MS - STALE_MARGIN_MS;
+      const own = job?.rowId === row.id;
+      const outcome = await this.sendRow(row, deadline, (late) =>
+        // A call that lands after the deadline is still recorded against its own claim, and the
+        // conversation carries on, so the backup job sends nothing more.
+        this.settleLate(row, claimedAt, late, lane),
+      );
+      if (outcome.kind === "unsettled") {
+        getLogger().warn("messaging send still running past its time; its backup job takes over");
+        if (own)
+          await this.deps.jobs.enqueue(
+            messagingSendJob(row.id, new Date(deadline + STALE_MARGIN_MS + 5_000)),
+          );
+        return;
+      }
+      if (outcome.kind === "held") {
+        await this.deps.prisma.messagingOutbound.updateMany({
+          where: { id: row.id, ...IN_FLIGHT, updatedAt: claimedAt },
+          data: { status: "pending" },
+        });
+        if (own) {
+          await this.deps.jobs.enqueue(
+            messagingSendJob(row.id, new Date(Date.now() + DM_CAP_RECHECK_MS)),
+          );
+        }
+        return;
+      }
+      if (outcome.kind === "error") {
+        const failure = outcome.error instanceof MessagingSendError ? outcome.error : null;
+        const attempt = own ? job?.attempt : undefined;
+        const last = attempt !== undefined && attempt.number >= attempt.max;
+        if (!failure?.permanent && !last) {
+          await this.retryLater(row, claimedAt, failure?.retryAfterMs ?? null, own, outcome.error);
+          return;
+        }
+        getLogger().warn("messaging outbound failed", {
+          reason: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+        });
+        await this.settle(row, claimedAt, { kind: "failed" }, outcome.attachmentName);
+        continue;
+      }
+      await this.settle(row, claimedAt, outcome);
+    }
+  }
+
+  /**
+   * Records how a claimed send ended, retrying the write while the claim is still this sender's:
+   * a message that went out must not be left claimed for its backup job to send again. Returns
+   * false when the claim was lost, to a backup job that took over a stale one.
+   */
+  private async settle(
+    row: LaneRow,
+    claimedAt: Date,
+    outcome: { kind: "sent"; handle: string } | { kind: "failed" },
+    attachmentName: string | null = null,
+  ): Promise<boolean> {
+    const giveUpAt = claimedAt.getTime() + MESSAGING_SEND_STALE_MS + 60_000;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.finish(row, claimedAt, outcome, attachmentName);
+      } catch (error) {
+        const wait = databaseCapacityBackoffMs(attempt);
+        if (Date.now() + wait >= giveUpAt) throw error;
+        await sleep(wait);
+      }
+    }
+  }
+
+  /** A send that outlived its deadline and then went out: record it, and carry on. */
+  private async settleLate(row: LaneRow, claimedAt: Date, late: SendOutcome, lane: OutboundLane) {
+    if (late.kind !== "sent") return;
+    try {
+      if (await this.settle(row, claimedAt, late)) await this.send([lane]);
+    } catch (error) {
+      this.reportFailure("messaging late send bookkeeping error", error);
+    }
+  }
+
+  /**
+   * Claims the conversation's first waiting row for this process, under the conversation's lock.
+   * Any send in flight holds the conversation, this release's or the previous one's. Anyone may
+   * take a pending head; a head waiting on a retry belongs to its backup job, and so does a send
+   * whose claim went stale.
+   */
+  private async claimHead(
+    lane: OutboundLane,
+    ownRowId: string | undefined,
+  ): Promise<
+    | { kind: "empty" }
+    | { kind: "blocked"; retryAt: Date }
+    | { kind: "claimed"; row: LaneRow; claimedAt: Date }
+  > {
+    return this.deps.prisma.$transaction(async (tx) => {
+      await lockLane(tx, lane);
+      const now = Date.now();
+      const staleBefore = new Date(now - MESSAGING_SEND_STALE_MS);
+      const inFlight = await tx.messagingOutbound.findFirst({
+        where: { ...laneWhere(lane), ...IN_FLIGHT, updatedAt: { gt: staleBefore } },
+        orderBy: { updatedAt: "desc" },
+        select: { updatedAt: true },
+      });
+      if (inFlight)
+        return {
+          kind: "blocked" as const,
+          retryAt: new Date(inFlight.updatedAt.getTime() + MESSAGING_SEND_STALE_MS + 5_000),
+        };
+      const head = await tx.messagingOutbound.findFirst({
+        where: {
+          ...laneWhere(lane),
+          OR: [{ status: { in: WAITING } }, ...(ownRowId ? [{ id: ownRowId, ...IN_FLIGHT }] : [])],
+        },
+        orderBy: SEND_ORDER,
+        select: LANE_ROW,
+      });
+      if (!head) return { kind: "empty" as const };
+      const mine = head.id === ownRowId;
+      if (head.status !== "pending" && !mine)
+        return { kind: "blocked" as const, retryAt: new Date(now + MESSAGING_SEND_BACKUP_MS) };
+      // Compare-and-set on what was read here, under the lock the previous release takes too, so
+      // its drain and this one can never both claim the row. The claim's time identifies it.
+      const claimedAt = new Date(now);
+      const claimed = await tx.messagingOutbound.updateMany({
+        where: {
+          id: head.id,
+          status: head.status,
+          providerHandle: null,
+          updatedAt: head.updatedAt,
+        },
+        data: { status: "sent", updatedAt: claimedAt },
+      });
+      if (claimed.count !== 1) return { kind: "blocked" as const, retryAt: new Date(now + 5_000) };
+      return { kind: "claimed" as const, row: head, claimedAt };
+    });
+  }
+
+  /**
+   * Settles a row that went out, or that will never go out, and removes its backup job, if the
+   * claim is still this sender's. Returns false when another sender took it over.
+   */
+  private async finish(
+    row: LaneRow,
+    claimedAt: Date,
+    outcome: { kind: "sent"; handle: string } | { kind: "failed" },
+    attachmentName: string | null = null,
+  ): Promise<boolean> {
+    return this.deps.prisma.$transaction(async (tx) => {
+      const settled = await tx.messagingOutbound.updateMany({
+        where: { id: row.id, ...IN_FLIGHT, updatedAt: claimedAt },
+        data:
+          outcome.kind === "sent" ? { providerHandle: outcome.handle ?? "" } : { status: "failed" },
+      });
+      if (settled.count !== 1) return false;
+      await this.deps.jobs.cancelIn(tx, messagingSendJobKey(row.id));
+      if (outcome.kind === "failed" && attachmentName) {
+        // The reply's text went out on its own rows; say the file did not follow instead of
+        // dropping it silently. Keyed so it is recorded once, and given the file's place so the
+        // rows queued behind the file still wait for it.
+        const notice = await tx.messagingOutbound.createManyAndReturn({
+          data: [
+            {
+              idempotencyKey: `${row.idempotencyKey}:notice`,
+              kind: row.kind,
+              identityId: row.identityId,
+              threadId: row.threadId,
+              body: `Could not send "${attachmentName}".`,
+              sourceMessageId: row.sourceMessageId,
+              createdAt: row.createdAt,
+            },
+          ],
+          skipDuplicates: true,
+          select: { id: true },
+        });
+        for (const { id } of notice) {
+          await this.deps.jobs.enqueueIn(
+            tx,
+            messagingSendJob(id, new Date(Date.now() + MESSAGING_SEND_BACKUP_MS)),
+          );
+        }
+      }
+      return true;
+    });
+  }
+
+  /**
+   * A clean, retryable failure. The row waits for its backup job, which runs now or at the
+   * provider's retry-after. Inside that job the error goes back to the queue, so its attempt
+   * count and backoff apply.
+   */
+  private async retryLater(
+    row: LaneRow,
+    claimedAt: Date,
+    retryAfterMs: number | null,
+    own: boolean,
+    error: unknown,
+  ): Promise<void> {
+    const claim = { id: row.id, ...IN_FLIGHT, updatedAt: claimedAt };
+    if (own) {
+      await this.deps.prisma.messagingOutbound.updateMany({
+        where: claim,
+        data: { status: "retry" },
+      });
+      if (retryAfterMs) throw new RetryJobLaterError(retryAfterMs, { cause: error });
+      throw error;
+    }
+    await this.deps.prisma.$transaction(async (tx) => {
+      const released = await tx.messagingOutbound.updateMany({
+        where: claim,
+        data: { status: "retry" },
+      });
+      if (released.count !== 1) return;
+      await this.deps.jobs.enqueueIn(
+        tx,
+        messagingSendJob(row.id, new Date(Date.now() + (retryAfterMs ?? 0))),
+      );
+    });
+  }
+
+  /**
+   * Sends one claimed row. The provider gets the send timeout as its abort signal; a call that
+   * cannot be aborted is waited for until the claim's deadline, and handed to `late` if it
+   * settles after that, rather than abandoned.
+   */
+  private async sendRow(
+    row: LaneRow,
+    deadline: number,
+    late: (outcome: SendOutcome) => Promise<void>,
+  ): Promise<SendOutcome> {
+    let attachmentName: string | null = null;
+    const context: AdapterContext = {
+      operationId: `messaging.send:${row.id}`,
+      traceId: `messaging.send:${row.id}`,
+      spaceId: "",
+      userId: "",
+      signal: AbortSignal.timeout(MESSAGING_SEND_TIMEOUT_MS),
+    };
+    const work = (async (): Promise<SendOutcome> => {
+      if (row.kind !== "dm") return this.sendToThread(row, context);
+      const identity = row.identityId
+        ? await this.deps.prisma.messagingIdentity.findUnique({ where: { id: row.identityId } })
+        : null;
+      // Nothing more reaches a deactivated person's chat app, including what was queued before.
+      if (!identity || (await accountDeactivated(this.deps.prisma, identity.userId)))
+        return { kind: "failed" };
+      // Vendor caps on sends between two owner messages (sendblue, WeChat); other providers
+      // have no equivalent limit, so do not hold Slack/WhatsApp/Telegram DMs.
+      const cap = outboundCap(identity.provider);
+      if (cap !== undefined && identity.outboundSinceInbound >= cap) return { kind: "held" };
+      const threadId = await this.resolveDirectThread(identity, context);
+      const invitePair = connectInvitePair(row.idempotencyKey);
+      if (invitePair) {
+        const result = await this.sendConnectInvite(row, threadId, invitePair, context);
+        if (result.kind === "sent") await this.countOutbound(identity);
+        return result;
+      }
+      // The last send the cap allows carries what is queued behind it.
+      const folded =
+        cap !== undefined && identity.outboundSinceInbound + 1 >= cap
+          ? await this.foldQueuedRows(identity, row)
+          : null;
+      let attachment: MessagingOutboundAttachment | undefined;
+      const artifactId = folded ? null : fileArtifactId(row.idempotencyKey);
+      if (artifactId) {
+        // Scoped to the identity's Space: delivery runs across every Space.
+        const artifact = await this.deps.prisma.artifact.findFirst({
+          where: { id: artifactId, spaceId: identity.spaceId },
+          select: { name: true, mimeType: true, storageKey: true, userId: true },
+        });
+        // Deleted since the reply was recorded, or not in this Space.
+        if (!artifact) return { kind: "failed" };
+        attachmentName = artifact.name;
+        const data = await this.deps.artifacts.get(artifact.storageKey, {
+          ...context,
+          spaceId: identity.spaceId,
+          userId: artifact.userId,
+        });
+        attachment = { name: artifact.name, mimeType: artifact.mimeType, data };
+      }
+      let sent: { handle: string };
+      try {
+        sent = await this.deps.messaging.sendToThread(
+          {
+            threadId,
+            body: folded?.body ?? row.body,
+            idempotencyKey: row.idempotencyKey,
+            ...(attachment ? { attachment } : {}),
+          },
+          context,
+        );
+      } catch (error) {
+        // The rows this send would have carried go back in line behind it.
+        if (folded) await this.unfold(folded);
+        throw error;
+      }
+      if (folded) await this.settleFolded(folded, sent.handle);
+      await this.countOutbound(identity);
+      return { kind: "sent", handle: sent.handle };
+    })().catch((error): SendOutcome => {
+      // The message is fine; the database is not. Its backup job sends it once that is back,
+      // and the outage never gives the message up as failed.
+      if (isDatabaseUnavailable(error)) throw error;
+      return { kind: "error", error, attachmentName };
+    });
+    return settleBy(work, deadline, late);
+  }
+
+  /** Group posts, the group intro, and team-chat replies go straight to their provider thread. */
+  private async sendToThread(row: LaneRow, context: AdapterContext): Promise<SendOutcome> {
+    if (!row.threadId) return { kind: "failed" };
+    if (row.kind === "group" || row.kind === "intro") {
+      // A reply a deactivated person's bot queued for a group is not posted after all.
+      const source = row.sourceMessageId
+        ? await this.deps.prisma.message.findUnique({
+            where: { id: row.sourceMessageId },
+            select: { thread: { select: { userId: true } } },
+          })
+        : null;
+      if (source && (await accountDeactivated(this.deps.prisma, source.thread.userId)))
+        return { kind: "failed" };
+    }
+    const sent = await this.deps.messaging.sendToThread(
+      { threadId: row.threadId, body: row.body, idempotencyKey: row.idempotencyKey },
+      context,
+    );
+    return { kind: "sent", handle: sent.handle };
+  }
+
+  /** Never fails the send: the message is already out, so a lost count must not resend it. */
+  private async countOutbound(identity: { id: string }): Promise<void> {
+    await this.deps.prisma.messagingIdentity
+      .update({
+        where: { id: identity.id },
+        data: { outboundSinceInbound: { increment: 1 } },
+      })
+      .catch((error) => this.reportFailure("messaging outbound counter error", error));
+  }
+
+  /**
+   * Delivers a connect invite while holding the connection row lock. Revoke's status update
+   * blocks behind this lock, so it cannot commit (and delete the row) between the pending check
+   * and the send. Only used for rare approval DMs.
+   *
+   * At most once: a provider error, or a failure once the provider call has started, settles the
+   * row as failed, so it is never sent again and a YES or NO never answers a request that may not
+   * have arrived. A lost invite is fine; reconnecting starts a fresh cycle. A database outage
+   * before the provider call leaves the row to its backup job.
+   */
+  private async sendConnectInvite(
+    row: LaneRow,
+    threadId: string,
+    pair: { requesterBotId: string; targetBotId: string },
+    context: AdapterContext,
+  ): Promise<SendOutcome> {
+    let attempted = false;
+    try {
+      return await this.deps.prisma.$transaction(
+        async (tx) => {
+          const communicationAllowed = await crossSpaceCommunicationAllowed(
+            tx,
+            pair.requesterBotId,
+            pair.targetBotId,
+          );
+          const locked = await tx.$queryRaw<Array<{ status: string }>>`
+            SELECT status FROM agent_connections
+            WHERE "requesterBotId" = ${pair.requesterBotId}
+              AND "targetBotId" = ${pair.targetBotId}
+            FOR UPDATE
+          `;
+          // An invite queued before its requester was deactivated is not sent for them.
+          const requester = await tx.bot.findUnique({
+            where: { id: pair.requesterBotId },
+            select: { userId: true },
+          });
+          const requesterDeactivated =
+            requester && (await accountDeactivated(tx, requester.userId));
+          if (locked[0]?.status !== "pending" || !communicationAllowed || requesterDeactivated)
+            return { kind: "failed" as const };
+          const outbound = await tx.messagingOutbound.findUnique({
+            where: { id: row.id },
+            select: { id: true },
+          });
+          // Revoked between the claim and this lock.
+          if (!outbound) return { kind: "failed" as const };
+          attempted = true;
+          const sent = await this.deps.messaging.sendToThread(
+            { threadId, body: row.body },
+            context,
+          );
+          return { kind: "sent" as const, handle: sent.handle };
+        },
+        { maxWait: 5_000, timeout: 20_000 },
+      );
+    } catch (error) {
+      if (!attempted && isDatabaseUnavailable(error)) throw error;
+      return { kind: "failed" };
+    }
+  }
+
+  /**
+   * DM rows address the identity, not a thread: the conversation id is learned from inbound
+   * webhooks and cached, with a provider lookup as fallback for identities that predate it.
+   */
+  private async resolveDirectThread(
+    identity: IdentityRow,
+    context: AdapterContext,
+  ): Promise<string> {
+    if (identity.dmThreadId) return identity.dmThreadId;
+    const threadId = await this.deps.messaging.openDirectThread(
+      identity.provider,
+      identity.address,
+      context,
+    );
+    await this.deps.prisma.messagingIdentity.update({
+      where: { id: identity.id },
+      data: { dmThreadId: threadId },
+    });
+    return threadId;
+  }
+
+  /**
+   * A 1:1 messaging run's messages, and a delegated run's, go to the bot's linked chat. One row
+   * per platform-sized part, then one per image or file, so a retry re-sends only the parts that
+   * failed. `progress` sends a running run's interim messages up to the first other message that
+   * sends anything, such as a card or a file: it waits for the whole reply, and nothing posted
+   * after it goes ahead of it.
+   */
+  private async recordDirectRun(
+    run: { id: string; botId: string; userId: string },
+    progress: boolean,
+  ): Promise<OutboundLane | undefined> {
+    const identity = await this.deps.prisma.messagingIdentity.findUnique({
+      where: { botId: run.botId },
+    });
+    // The linked DM is one person's chat. In a shared Space another member's run on this bot, such
+    // as a reply to their message_bot, stays in the app instead of reaching that person's chat app.
+    if (!identity || identity.userId !== run.userId) return undefined;
+    if (progress && !(await this.progressFitsCap(identity))) return undefined;
+    const messages = await this.deps.prisma.message.findMany({
+      where: { runId: run.id, role: "bot" },
+      orderBy: { seq: "asc" },
+    });
+    const sendsFiles = this.deps.messaging
+      .platforms()
+      .some((platform) => platform.provider === identity.provider && platform.capabilities.files);
+    const linkedPages = linkedPageIds(messages);
+    const rowsByMessage = messages.map((message) => {
       // A 1:1 chat also gets the run's pending questions as text (chat apps cannot show cards).
       const body = extractText(message.blocks, linkedPages, { asks: true });
       const parts = body ? splitOutboundBody(identity.provider, body) : [];
@@ -218,89 +898,95 @@ async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<vo
           sourceMessageId: message.id,
         })),
       ];
-    })
-    .map((row, index) => ({ ...row, createdAt: new Date(createdAt + index) }));
-  if (rows.length === 0) return;
-  // Atomic dedupe: a concurrent messaging.deliver for the same run loses on
-  // the idempotencyKey unique key instead of throwing P2002.
-  await deps.prisma.messagingOutbound.createMany({ data: rows, skipDuplicates: true });
-}
+    });
+    const held = progress
+      ? rowsByMessage.findIndex(
+          (rows, index) =>
+            rows.length > 0 && !isUserProgressClientNonce(messages[index]!.clientNonce),
+        )
+      : -1;
+    const rows = (held === -1 ? rowsByMessage : rowsByMessage.slice(0, held)).flat();
+    if (rows.length === 0) return undefined;
+    const lane = { identityId: identity.id };
+    await this.deps.prisma.$transaction((tx) => this.recordIn(tx, lane, rows));
+    return lane;
+  }
 
-/**
- * Channel runs post to the group with an attribution prefix, then fan the
- * post out internally to peer approved bots: context only by default, a
- * waking run on @-mention, bounded by the shared bot-message hop budget.
- */
-async function mirrorChannelRun(
-  deps: MessagingDeliveryDeps,
-  run: { id: string; botId: string },
-  channelBlock: Extract<MessageBlock, { kind: "channel_message" }>,
-): Promise<void> {
-  const identity = await deps.prisma.messagingIdentity.findUnique({
-    where: { botId: run.botId },
-  });
-  if (!identity) return;
-  const channel = await deps.prisma.messagingChannel.findUnique({
-    where: { id: channelBlock.channelId },
-  });
-  if (!channel) return;
-  const owner = await deps.prisma.user.findUnique({
-    where: { id: identity.userId },
-    select: { name: true },
-  });
-  const firstName = owner?.name.trim().split(/\s+/)[0] || "Owner";
-  const fromLabel = `${firstName}'s agent`;
-
-  const replies = await deps.prisma.message.findMany({
-    select: { id: true, blocks: true },
-    where: { runId: run.id, role: "bot" },
-    orderBy: { seq: "asc" },
-  });
-  // Ask answers are entered privately in the app. Check the same snapshot as
-  // the replies so a resumed run cannot publish an answer-influenced response.
-  if (
-    replies.some((message) =>
-      (message.blocks as MessageBlock[]).some(
-        (block) => block.kind === "ask" && block.status === "answered",
-      ),
+  /**
+   * Channel runs post to the group with an attribution prefix, then fan the post out internally
+   * to peer approved bots: context only by default, a waking run on @-mention, bounded by the
+   * shared bot-message hop budget.
+   */
+  private async recordChannelRun(
+    run: { id: string; botId: string },
+    channelBlock: Extract<MessageBlock, { kind: "channel_message" }>,
+  ): Promise<OutboundLane | undefined> {
+    const { prisma } = this.deps;
+    const identity = await prisma.messagingIdentity.findUnique({ where: { botId: run.botId } });
+    // A deactivated person's bot neither posts to the group nor reaches its other bots.
+    if (!identity || (await accountDeactivated(prisma, identity.userId))) return undefined;
+    const channel = await prisma.messagingChannel.findUnique({
+      where: { id: channelBlock.channelId },
+    });
+    if (!channel) return undefined;
+    const owner = await prisma.user.findUnique({
+      where: { id: identity.userId },
+      select: { name: true },
+    });
+    const firstName = owner?.name.trim().split(/\s+/)[0] || "Owner";
+    const fromLabel = `${firstName}'s agent`;
+    const replies = await prisma.message.findMany({
+      select: { id: true, blocks: true },
+      where: { runId: run.id, role: "bot" },
+      orderBy: { seq: "asc" },
+    });
+    // Ask answers are entered privately in the app. Check the same snapshot as the replies so a
+    // resumed run cannot publish an answer-influenced response.
+    if (
+      replies.some((message) =>
+        (message.blocks as MessageBlock[]).some(
+          (block) => block.kind === "ask" && block.status === "answered",
+        ),
+      )
     )
-  )
-    return;
-  const linkedPages = linkedPageIds(replies);
-  const messages = replies
-    .map((message) => ({ message, text: extractText(message.blocks, linkedPages) }))
-    .filter((entry) => entry.text);
-  if (messages.length === 0) return;
+      return undefined;
+    const linkedPages = linkedPageIds(replies);
+    const messages = replies
+      .map((message) => ({ message, text: extractText(message.blocks, linkedPages) }))
+      .filter((entry) => entry.text);
+    if (messages.length === 0) return undefined;
+    // One row per platform-sized part, like the DM path: the adapter truncates an oversized body
+    // instead of failing, which would drop the reply's tail.
+    const lane = { identityId: null, threadId: channel.threadId };
+    await prisma.$transaction((tx) =>
+      this.recordIn(
+        tx,
+        lane,
+        messages.flatMap(({ message, text }) =>
+          splitOutboundBody(identity.provider, `${fromLabel}: ${text}`).map((part, index) => ({
+            idempotencyKey: index === 0 ? `msg:${message.id}` : `msg:${message.id}:${index + 1}`,
+            kind: "group",
+            threadId: channel.threadId,
+            body: part,
+            sourceMessageId: message.id,
+          })),
+        ),
+      ),
+    );
+    const hop = nextBotMessageHop(channelBlock.hop);
+    const peers = await prisma.messagingChannelMember.findMany({
+      where: {
+        channelId: channel.id,
+        status: "approved",
+        identityId: { not: null },
+        NOT: { identityId: identity.id },
+      },
+    });
+    await this.fanOutToPeers({ identity, channel, channelBlock, fromLabel, hop, peers, messages });
+    return lane;
+  }
 
-  await deps.prisma.messagingOutbound.createMany({
-    data: messages.map(({ message, text }) => ({
-      idempotencyKey: `msg:${message.id}`,
-      kind: "group",
-      threadId: channel.threadId,
-      body: `${fromLabel}: ${text}`,
-      sourceMessageId: message.id,
-    })),
-    skipDuplicates: true,
-  });
-
-  const hop = nextBotMessageHop(channelBlock.hop);
-  const peers = await deps.prisma.messagingChannelMember.findMany({
-    where: {
-      channelId: channel.id,
-      status: "approved",
-      identityId: { not: null },
-      NOT: { identityId: identity.id },
-    },
-  });
-  // Peer bots belong to other members, usually in other Spaces.
-  await runAsSystem("fan a group post out to peer bots in other Spaces", () =>
-    fanOutToPeers(deps, { identity, channel, channelBlock, fromLabel, hop, peers, messages }),
-  );
-}
-
-async function fanOutToPeers(
-  deps: MessagingDeliveryDeps,
-  {
+  private async fanOutToPeers({
     identity,
     channel,
     channelBlock,
@@ -316,91 +1002,456 @@ async function fanOutToPeers(
     hop: number;
     peers: Array<{ identityId: string | null }>;
     messages: Array<{ message: { id: string }; text: string }>;
-  },
-): Promise<void> {
-  for (const { message, text } of messages) {
-    for (const peer of peers) {
-      const peerIdentity = await deps.prisma.messagingIdentity.findUnique({
-        where: { id: peer.identityId! },
-      });
-      if (!peerIdentity) continue;
-      if (!(await crossSpaceCommunicationAllowed(deps.prisma, identity.botId, peerIdentity.botId)))
-        continue;
-      const peerThread = await deps.prisma.thread.findFirst({
-        where: { botId: peerIdentity.botId },
-      });
-      if (!peerThread) continue;
-      const peerBot = await deps.prisma.bot.findUnique({
-        where: { id: peerIdentity.botId },
-        select: { name: true },
-      });
-      const block: MessageBlock = {
-        kind: "channel_message",
-        provider: identity.provider,
-        ...(channelBlock.transport ? { transport: channelBlock.transport } : {}),
-        channelId: channel.id,
-        fromAddress: identity.address,
-        fromLabel,
-        text,
-        hop,
-      };
-      const clientNonce = `messaging-peer:${message.id}:${peerIdentity.botId}`;
-      const mentioned = peerBot?.name
-        ? new RegExp(`@${escapeRegExp(peerBot.name)}\\b`, "i").test(text)
-        : false;
-      if (mentioned && !botMessageHopExhausted(hop)) {
-        const sent = await deps.events
-          .sendUserMessage({
-            spaceId: peerIdentity.spaceId,
-            threadId: peerThread.id,
-            botId: peerIdentity.botId,
-            userId: peerIdentity.userId,
-            blocks: [block],
-            prompt: `[Group "${channel.name ?? "group"}" — ${fromLabel}]: ${text}`,
-            trigger: "messaging",
-            clientNonce,
-            crossSpaceSenderBotId: identity.botId,
-          })
+  }): Promise<void> {
+    const { prisma, events, jobs } = this.deps;
+    for (const { message, text } of messages) {
+      for (const peer of peers) {
+        const peerIdentity = await prisma.messagingIdentity.findUnique({
+          where: { id: peer.identityId! },
+        });
+        if (!peerIdentity || (await accountDeactivated(prisma, peerIdentity.userId))) continue;
+        if (!(await crossSpaceCommunicationAllowed(prisma, identity.botId, peerIdentity.botId)))
+          continue;
+        const peerThread = await prisma.thread.findFirst({ where: { botId: peerIdentity.botId } });
+        if (!peerThread) continue;
+        const peerBot = await prisma.bot.findUnique({
+          where: { id: peerIdentity.botId },
+          select: { name: true },
+        });
+        const block: MessageBlock = {
+          kind: "channel_message",
+          provider: identity.provider,
+          ...(channelBlock.transport ? { transport: channelBlock.transport } : {}),
+          channelId: channel.id,
+          fromAddress: identity.address,
+          fromLabel,
+          text,
+          hop,
+        };
+        const clientNonce = `messaging-peer:${message.id}:${peerIdentity.botId}`;
+        const mentioned = peerBot?.name
+          ? new RegExp(`@${escapeRegExp(peerBot.name)}\\b`, "i").test(text)
+          : false;
+        if (mentioned && !botMessageHopExhausted(hop)) {
+          const sent = await events
+            .sendUserMessage({
+              spaceId: peerIdentity.spaceId,
+              threadId: peerThread.id,
+              botId: peerIdentity.botId,
+              userId: peerIdentity.userId,
+              blocks: [block],
+              prompt: `[Group "${channel.name ?? "group"}" — ${fromLabel}]: ${text}`,
+              trigger: "messaging",
+              clientNonce,
+              crossSpaceSenderBotId: identity.botId,
+            })
+            .catch((error: unknown) => {
+              if (
+                error instanceof CrossSpaceCommunicationBlockedError ||
+                error instanceof SpaceDeletionInProgressError
+              )
+                return null;
+              throw error;
+            });
+          if (sent?.runId) {
+            await jobs.enqueue(runContinueJob(sent.runId)).catch((error) => {
+              getLogger().error("messaging peer wake enqueue error", error);
+            });
+          }
+          continue;
+        }
+        // Context only: the peer sees the post in history without a wake.
+        const existing = await prisma.message.findUnique({
+          where: { threadId_clientNonce: { threadId: peerThread.id, clientNonce } },
+        });
+        if (existing) continue;
+        const event = await prisma
+          .$transaction(async (tx) => {
+            const created = await createThreadMessageInTransaction(tx, {
+              threadId: peerThread.id,
+              role: "user",
+              blocks: [block],
+              clientNonce,
+            });
+            if (!(await crossSpaceCommunicationAllowed(tx, identity.botId, peerIdentity.botId)))
+              throw new CrossSpaceCommunicationBlockedError();
+            return appendEventInTransaction(tx, {
+              spaceId: peerIdentity.spaceId,
+              threadId: peerThread.id,
+              botId: peerIdentity.botId,
+              type: "thread.message.created",
+              payload: { messageId: created.id, role: "user", blocks: [block] },
+            });
+          }, THREAD_LOCK_TRANSACTION_OPTIONS)
           .catch((error: unknown) => {
             if (error instanceof CrossSpaceCommunicationBlockedError) return null;
             throw error;
           });
-        if (sent?.runId) {
-          await deps.jobs.enqueue(runContinueJob(sent.runId)).catch((error) => {
-            getLogger().error("messaging peer wake enqueue error", error);
-          });
-        }
-        continue;
+        if (event) await events.notify(peerThread.id, event.seq).catch(() => undefined);
       }
-      // Context only: the peer sees the post in history without a wake.
-      const existing = await deps.prisma.message.findUnique({
-        where: { threadId_clientNonce: { threadId: peerThread.id, clientNonce } },
-      });
-      if (existing) continue;
-      const event = await deps.prisma
-        .$transaction(async (tx) => {
-          const created = await createThreadMessageInTransaction(tx, {
-            threadId: peerThread.id,
-            role: "user",
-            blocks: [block],
-            clientNonce,
-          });
-          if (!(await crossSpaceCommunicationAllowed(tx, identity.botId, peerIdentity.botId)))
-            throw new CrossSpaceCommunicationBlockedError();
-          return appendEventInTransaction(tx, {
-            spaceId: peerIdentity.spaceId,
-            threadId: peerThread.id,
-            botId: peerIdentity.botId,
-            type: "thread.message.created",
-            payload: { messageId: created.id, role: "user", blocks: [block] },
-          });
-        })
-        .catch((error: unknown) => {
-          if (error instanceof CrossSpaceCommunicationBlockedError) return null;
-          throw error;
-        });
-      if (event) await deps.events.notify(peerThread.id, event.seq).catch(() => undefined);
     }
+  }
+
+  /**
+   * A team-chat run's answer, in the thread its message came from: the reply, silence when an
+   * ambient run chose none, or a short failure notice. Taking the message from running to
+   * delivered and recording the reply commit together, so it is recorded once.
+   */
+  private async recordTeamChatReply(run: {
+    id: string;
+    status: string;
+    sourceMessageId: string | null;
+    bot: { name: string };
+    externalMessage: {
+      id: string;
+      kind: string;
+      replyThreadId: string | null;
+      externalConversation: { conversationId: string };
+    };
+  }): Promise<OutboundLane | undefined> {
+    const message = run.externalMessage;
+    const lane = {
+      identityId: null,
+      threadId: resolveMessagingThreadId(
+        message.externalConversation.conversationId,
+        message.replyThreadId,
+      ),
+    };
+    const reply =
+      run.status === "completed"
+        ? await this.deps.prisma.message.findFirst({
+            where: { runId: run.id, role: "bot" },
+            orderBy: { seq: "desc" },
+            select: { id: true, blocks: true },
+          })
+        : null;
+    const ambient = message.kind === "ambient";
+    const body =
+      run.status === "completed"
+        ? teamChatResponseText(
+            Array.isArray(reply?.blocks) ? (reply.blocks as MessageBlock[]) : [],
+            run.bot.name,
+            ambient,
+          )
+        : ambient
+          ? ""
+          : `${run.bot.name} could not complete that request. Open Rakazo for details.`;
+    const recorded = await this.deps.prisma.$transaction(async (tx) => {
+      const claimed = await tx.externalMessage.updateMany({
+        where: { id: message.id, status: "running" },
+        data: { status: "delivered" },
+      });
+      if (claimed.count !== 1 || !body) return false;
+      await this.recordIn(tx, lane, [
+        {
+          idempotencyKey:
+            run.status === "completed"
+              ? `external-message:${message.id}`
+              : `external-message:${message.id}:failure`,
+          kind: "team",
+          threadId: lane.threadId,
+          body,
+          sourceMessageId: reply?.id ?? run.sourceMessageId,
+        },
+      ]);
+      return true;
+    });
+    return recorded ? lane : undefined;
+  }
+
+  /**
+   * A bot another bot delegated to answers in the team-chat thread the chain started in, found by
+   * walking the delegation back to a run a team-chat message started.
+   */
+  private async recordDelegatedReply(run: {
+    id: string;
+    status: string;
+    sourceMessageId: string | null;
+    bot: { name: string };
+  }): Promise<OutboundLane | undefined> {
+    const origin = await this.findExternalOrigin(run.sourceMessageId);
+    if (!origin) return undefined;
+    const reply =
+      run.status === "completed"
+        ? await this.deps.prisma.message.findFirst({
+            where: { runId: run.id, role: "bot" },
+            orderBy: { seq: "desc" },
+            select: { id: true, blocks: true },
+          })
+        : null;
+    const body =
+      run.status === "failed"
+        ? `${run.bot.name} could not complete the delegated request. Open Rakazo for details.`
+        : teamChatResponseText(
+            Array.isArray(reply?.blocks) ? (reply.blocks as MessageBlock[]) : [],
+            run.bot.name,
+            true,
+          );
+    if (!body) return undefined;
+    const lane = {
+      identityId: null,
+      threadId: resolveMessagingThreadId(
+        origin.externalConversation.conversationId,
+        origin.replyThreadId,
+      ),
+    };
+    const recorded = await this.deps.prisma.$transaction(async (tx) => {
+      if (!(await claimPreviousReleaseRelay(tx, run.id))) return false;
+      await this.recordIn(tx, lane, [
+        {
+          idempotencyKey: `team-chat-run:${run.id}`,
+          kind: "team",
+          threadId: lane.threadId,
+          body,
+          sourceMessageId: reply?.id ?? run.sourceMessageId,
+        },
+      ]);
+      return true;
+    });
+    return recorded ? lane : undefined;
+  }
+
+  /** Whether the run is on its bot's own thread, the one a linked 1:1 chat mirrors. */
+  private async onOwnThread(run: { threadId: string; botId: string }): Promise<boolean> {
+    const own = await this.deps.prisma.thread.findFirst({
+      where: { id: run.threadId, botId: run.botId },
+      select: { id: true },
+    });
+    return Boolean(own);
+  }
+
+  /**
+   * Whether an interim line still leaves the reply room under the provider's cap. One held back
+   * here is not lost: the reply records it ahead of itself, and the last send allowed carries
+   * both.
+   */
+  private async progressFitsCap(identity: {
+    id: string;
+    provider: string;
+    outboundSinceInbound: number;
+  }): Promise<boolean> {
+    const cap = outboundCap(identity.provider);
+    if (cap === undefined) return true;
+    const queued = await this.deps.prisma.messagingOutbound.count({
+      where: { identityId: identity.id, status: { in: WAITING } },
+    });
+    return identity.outboundSinceInbound + queued + PROGRESS_RESERVE < cap;
+  }
+
+  /**
+   * The last send a capped provider allows before the owner writes again carries the rows
+   * queued behind it: their text joined into one message, and their files named in a closing
+   * note instead of sent. Rows that would make the message too long, approval invites, and rows
+   * waiting on a retry stay queued for the owner's next message. The rows it takes are claimed
+   * like the head, so no other sender delivers them. Null when nothing is queued behind the row.
+   */
+  private async foldQueuedRows(
+    identity: { id: string; provider: string; spaceId: string },
+    row: LaneRow,
+  ): Promise<FoldedRows | null> {
+    const lane: OutboundLane = { identityId: identity.id };
+    const fileName = async (artifactId: string) =>
+      (
+        await this.deps.prisma.artifact.findFirst({
+          where: { id: artifactId, spaceId: identity.spaceId },
+          select: { name: true },
+        })
+      )?.name ?? "file";
+    const queued = await this.deps.prisma.messagingOutbound.findMany({
+      where: { ...laneWhere(lane), status: { in: WAITING }, createdAt: { gt: row.createdAt } },
+      orderBy: SEND_ORDER,
+      select: LANE_ROW,
+    });
+    const limit = outboundPartLimit(identity.provider);
+    const texts: string[] = [];
+    const files: string[] = [];
+    const headFile = fileArtifactId(row.idempotencyKey);
+    if (headFile) files.push(await fileName(headFile));
+    else if (row.body) texts.push(row.body);
+    const taken: Array<{ row: LaneRow; file: boolean; name?: string }> = [];
+    for (const next of queued) {
+      if (next.status !== "pending" || connectInvitePair(next.idempotencyKey)) break;
+      const artifactId = fileArtifactId(next.idempotencyKey);
+      const name = artifactId ? await fileName(artifactId) : undefined;
+      if (!artifactId && foldedBody([...texts, next.body], files).length > limit) break;
+      if (name) files.push(name);
+      else if (next.body) texts.push(next.body);
+      taken.push({ row: next, file: Boolean(artifactId), ...(name ? { name } : {}) });
+    }
+    if (taken.length === 0) return null;
+    const claimedAt = new Date();
+    const claimed = await this.deps.prisma.$transaction(async (tx) => {
+      await lockLane(tx, lane);
+      const ids: string[] = [];
+      for (const { row: next } of taken) {
+        const claim = await tx.messagingOutbound.updateMany({
+          where: {
+            id: next.id,
+            status: "pending",
+            providerHandle: null,
+            updatedAt: next.updatedAt,
+          },
+          data: { status: "sent", updatedAt: claimedAt },
+        });
+        if (claim.count !== 1) break;
+        ids.push(next.id);
+      }
+      return ids;
+    });
+    if (claimed.length === 0) return null;
+    const kept = taken.slice(0, claimed.length);
+    const keptTexts = headFile || !row.body ? [] : [row.body];
+    const keptFiles = headFile ? [files[0]!] : [];
+    for (const item of kept) {
+      if (item.name) keptFiles.push(item.name);
+      else if (item.row.body) keptTexts.push(item.row.body);
+    }
+    return {
+      body: foldedBody(keptTexts, keptFiles),
+      claimedAt,
+      textRowIds: kept.filter((item) => !item.file).map((item) => item.row.id),
+      fileRowIds: kept.filter((item) => item.file).map((item) => item.row.id),
+    };
+  }
+
+  /** Folded rows went out with the head: text rows share its handle, file rows were only named. */
+  private async settleFolded(folded: FoldedRows, handle: string): Promise<void> {
+    await this.deps.prisma
+      .$transaction(async (tx) => {
+        const claim = { ...IN_FLIGHT, updatedAt: folded.claimedAt };
+        if (folded.textRowIds.length)
+          await tx.messagingOutbound.updateMany({
+            where: { id: { in: folded.textRowIds }, ...claim },
+            data: { providerHandle: handle },
+          });
+        if (folded.fileRowIds.length)
+          await tx.messagingOutbound.updateMany({
+            where: { id: { in: folded.fileRowIds }, ...claim },
+            data: { status: "failed" },
+          });
+        for (const id of [...folded.textRowIds, ...folded.fileRowIds])
+          await this.deps.jobs.cancelIn(tx, messagingSendJobKey(id));
+      })
+      .catch((error) => this.reportFailure("messaging folded rows bookkeeping error", error));
+  }
+
+  /** A send that failed returns the rows it would have carried to the queue, in their places. */
+  private async unfold(folded: FoldedRows): Promise<void> {
+    await this.deps.prisma.messagingOutbound
+      .updateMany({
+        where: {
+          id: { in: [...folded.textRowIds, ...folded.fileRowIds] },
+          ...IN_FLIGHT,
+          updatedAt: folded.claimedAt,
+        },
+        data: { status: "pending" },
+      })
+      .catch((error) => this.reportFailure("messaging folded rows release error", error));
+  }
+
+  private async findExternalOrigin(sourceMessageId: string | null) {
+    const { prisma } = this.deps;
+    let current: string | null = sourceMessageId;
+    const visited = new Set<string>();
+    const maxHops = botMessageMaxHops();
+    for (let depth = 0; current && depth <= maxHops; depth += 1) {
+      const source = await prisma.message.findUnique({
+        where: { id: current },
+        select: { replyTo: { select: { runId: true } } },
+      });
+      const parentRunId = source?.replyTo?.runId;
+      if (!parentRunId || visited.has(parentRunId)) return null;
+      visited.add(parentRunId);
+      const external = await prisma.externalMessage.findUnique({
+        where: { runId: parentRunId },
+        select: { replyThreadId: true, externalConversation: { select: { conversationId: true } } },
+      });
+      if (external) return external;
+      const parent = await prisma.run.findUnique({
+        where: { id: parentRunId },
+        select: { sourceMessageId: true },
+      });
+      current = parent?.sourceMessageId ?? null;
+    }
+    return null;
+  }
+}
+
+/**
+ * Every writer and sender of one conversation serializes here: on the person's messaging
+ * identity or the group's channel row, which the previous release locks too, and on an advisory
+ * lock for threads with no such row (team chat). Always in that order.
+ */
+async function lockLane(tx: Prisma.TransactionClient, lane: OutboundLane): Promise<void> {
+  if (lane.identityId === null)
+    await tx.$queryRaw`SELECT id FROM messaging_channels WHERE "threadId" = ${lane.threadId} FOR UPDATE`;
+  else
+    await tx.$queryRaw`SELECT id FROM messaging_identities WHERE id = ${lane.identityId} FOR UPDATE`;
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`messaging_outbound:${laneKey(lane)}`}, 0))`;
+}
+
+/**
+ * The previous release relays a delegated reply with no outbound row and then marks the run, so
+ * this release checks that marker and sets it in the transaction that records its own relay:
+ * false when that release already posted the reply. The run's row lock keeps the column until
+ * commit; its deferred drop first carries every marker into a row under the relay's key.
+ */
+async function claimPreviousReleaseRelay(
+  tx: Prisma.TransactionClient,
+  runId: string,
+): Promise<boolean> {
+  const [run] = await tx.$queryRaw<Array<{ tracked: boolean; relayed: boolean }>>`
+    SELECT to_jsonb(r) ? 'teamChatMirroredAt' AS tracked,
+      (to_jsonb(r) ->> 'teamChatMirroredAt') IS NOT NULL AS relayed
+    FROM runs AS r WHERE r.id = ${runId} FOR UPDATE`;
+  if (!run?.tracked) return true;
+  if (run.relayed) return false;
+  await tx.$executeRaw`UPDATE runs SET "teamChatMirroredAt" = now() AT TIME ZONE 'UTC' WHERE id = ${runId}`;
+  return true;
+}
+
+function laneKey(lane: OutboundLane): string {
+  return lane.identityId === null ? `thread:${lane.threadId}` : `dm:${lane.identityId}`;
+}
+
+function laneWhere(lane: OutboundLane): Prisma.MessagingOutboundWhereInput {
+  return lane.identityId === null
+    ? { identityId: null, threadId: lane.threadId }
+    : { identityId: lane.identityId };
+}
+
+function laneOf(row: { identityId: string | null; threadId: string | null }): OutboundLane | null {
+  if (row.identityId) return { identityId: row.identityId };
+  if (row.threadId) return { identityId: null, threadId: row.threadId };
+  return null;
+}
+
+/**
+ * The send's outcome, or `unsettled` when it is still running at the deadline; the outcome of a
+ * call that settles after that goes to `late`.
+ */
+async function settleBy(
+  work: Promise<SendOutcome>,
+  deadline: number,
+  late: (outcome: SendOutcome) => Promise<void>,
+): Promise<SendOutcome> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const expired = new Promise<SendOutcome>((resolve) => {
+    timer = setTimeout(
+      () => {
+        timedOut = true;
+        resolve({ kind: "unsettled" });
+      },
+      Math.max(0, deadline - Date.now()),
+    );
+  });
+  // A late failure is the backup job's to retry once the claim is stale.
+  work.then((outcome) => (timedOut ? late(outcome) : undefined)).catch(() => undefined);
+  try {
+    return await Promise.race([work, expired]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -408,391 +1459,13 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** `connect:{requesterBotId}:{targetBotId}` — agent-connection approval DMs. */
-function connectInvitePair(
-  idempotencyKey: string,
-): { requesterBotId: string; targetBotId: string } | null {
-  const match = /^connect:([^:]+):([^:]+)$/.exec(idempotencyKey);
-  if (!match) return null;
-  return { requesterBotId: match[1]!, targetBotId: match[2]! };
-}
-
-/**
- * Deliver a connect invite while holding the connection row lock.
- * Revoke's status update blocks behind this lock, so it cannot commit
- * (and delete the claim) between the pending check and the send.
- * Only used for rare approval DMs, not for ordinary mirrored traffic.
- *
- * At-most-once: any failure after the provider call (or an ambiguous
- * transport error) keeps the outer claim as `sent` so drain does not
- * restore pending and duplicate the YES/NO DM. A lost invite is fine;
- * reconnect starts a fresh cycle.
- */
-async function sendConnectInvite(
-  deps: MessagingDeliveryDeps,
-  row: { id: string; body: string },
-  threadId: string,
-  pair: { requesterBotId: string; targetBotId: string },
-  context: AdapterContext,
-): Promise<"delivered" | "skipped" | "held"> {
-  try {
-    return await deps.prisma.$transaction(
-      async (tx) => {
-        const communicationAllowed = await crossSpaceCommunicationAllowed(
-          tx,
-          pair.requesterBotId,
-          pair.targetBotId,
-        );
-        const locked = await tx.$queryRaw<Array<{ status: string }>>`
-          SELECT status FROM agent_connections
-          WHERE "requesterBotId" = ${pair.requesterBotId}
-            AND "targetBotId" = ${pair.targetBotId}
-          FOR UPDATE
-        `;
-        if (locked[0]?.status !== "pending" || !communicationAllowed) {
-          await tx.messagingOutbound.updateMany({
-            where: { id: row.id },
-            data: { status: "failed" },
-          });
-          return "skipped";
-        }
-        const outbound = await tx.messagingOutbound.findUnique({
-          where: { id: row.id },
-          select: { id: true },
-        });
-        if (!outbound) return "skipped";
-        try {
-          const sent = await deps.messaging.sendToThread({ threadId, body: row.body }, context);
-          await tx.messagingOutbound.updateMany({
-            where: { id: row.id },
-            data: { providerHandle: sent.handle },
-          });
-          return "delivered";
-        } catch {
-          // Provider error or lost response is ambiguous without an
-          // idempotency key. Do not ask drain to retry.
-          return "held";
-        }
-      },
-      { maxWait: 5_000, timeout: 20_000 },
-    );
-  } catch {
-    // Lock/timeout after a possible accept: keep the outer claim as sent.
-    return "held";
-  }
-}
-
-async function drain(deps: MessagingDeliveryDeps, context: AdapterContext): Promise<void> {
-  const pending = await deps.prisma.messagingOutbound.findMany({
-    where: { status: "pending" },
-    orderBy: { createdAt: "asc" },
-  });
-  // Each conversation is its own lane, so a slow provider holds back only
-  // the replies queued behind it.
-  const heads = new Map<string, MessagingOutboundRow>();
-  for (const row of pending) {
-    const key = row.identityId ?? row.threadId ?? row.id;
-    if (!heads.has(key)) heads.set(key, row);
-  }
-  const lanes = await Promise.allSettled(
-    [...heads.values()].map((head) => deliverLane(deps, context, head)),
-  );
-  const failed = lanes.find((lane) => lane.status === "rejected");
-  if (failed?.status === "rejected") throw failed.reason;
-}
-
-type Conversation = { identityId: string } | { identityId: null; threadId: string };
-
-function conversationOf(row: MessagingOutboundRow): Conversation | null {
-  if (row.identityId) return { identityId: row.identityId };
-  if (row.threadId) return { identityId: null, threadId: row.threadId };
-  return null;
-}
-
-/**
- * Sends one conversation's rows in order, reading each next row after the
- * previous send so a reply queued meanwhile is not left behind. Stops at the
- * first row that has to wait, or that another drain already owns.
- */
-async function deliverLane(
-  deps: MessagingDeliveryDeps,
-  context: AdapterContext,
-  head: MessagingOutboundRow,
-): Promise<void> {
-  const conversation = conversationOf(head);
-  let row: MessagingOutboundRow | null = head;
-  while (row) {
-    const now = Date.now();
-    if (row.nextAttemptAt && row.nextAttemptAt.getTime() > now) return;
-    if (conversation && (await hasUndeliveredEarlierRow(deps, conversation, row.createdAt, now)))
-      return;
-    // Claim before sending: concurrent drains and crash retries must never
-    // deliver the same message twice.
-    const claim = await deps.prisma.messagingOutbound.updateMany({
-      where: { id: row.id, status: "pending" },
-      data: { status: "sent", nextAttemptAt: null },
-    });
-    if (claim.count === 0) return;
-    if (!(await deliverRow(deps, context, row))) return;
-    row = conversation
-      ? await deps.prisma.messagingOutbound.findFirst({
-          where: { status: "pending", ...conversation },
-          orderBy: { createdAt: "asc" },
-        })
-      : null;
-  }
-}
-
-/** Sends one claimed row. Returns false when later rows to the same place must wait. */
-async function deliverRow(
-  deps: MessagingDeliveryDeps,
-  context: AdapterContext,
-  row: MessagingOutboundRow,
-): Promise<boolean> {
-  let attachmentName: string | null = null;
-  let accepted = false;
-  let folded: FoldedRows | null = null;
-  try {
-    if (row.kind === "group" || row.kind === "intro") {
-      if (!row.threadId) {
-        await deps.prisma.messagingOutbound.update({
-          where: { id: row.id },
-          data: { status: "failed" },
-        });
-        return true;
-      }
-      const sent = await deps.messaging.sendToThread(
-        { threadId: row.threadId, body: row.body, idempotencyKey: row.idempotencyKey },
-        context,
-      );
-      accepted = true;
-      await deps.prisma.messagingOutbound.update({
-        where: { id: row.id },
-        data: { providerHandle: sent.handle },
-      });
-      return true;
-    }
-    const identity = row.identityId
-      ? await deps.prisma.messagingIdentity.findUnique({ where: { id: row.identityId } })
-      : null;
-    if (!identity) {
-      await deps.prisma.messagingOutbound.update({
-        where: { id: row.id },
-        data: { status: "failed" },
-      });
-      return true;
-    }
-    // Vendor caps on sends between two owner messages (sendblue, WeChat); other providers
-    // have no equivalent limit, so do not hold Slack/WhatsApp/Telegram DMs.
-    const cap = outboundCap(identity.provider);
-    if (cap !== undefined && identity.outboundSinceInbound >= cap) {
-      // Cap holds are not failures: release the claim back to pending.
-      await deps.prisma.messagingOutbound.update({
-        where: { id: row.id },
-        data: { status: "pending" },
-      });
-      return false;
-    }
-    const threadId = await resolveDirectThread(deps, identity, context);
-    const invitePair = connectInvitePair(row.idempotencyKey);
-    if (invitePair) {
-      const result = await sendConnectInvite(
-        deps,
-        { id: row.id, body: row.body },
-        threadId,
-        invitePair,
-        context,
-      );
-      if (result === "delivered") {
-        accepted = true;
-        await deps.prisma.messagingIdentity.update({
-          where: { id: identity.id },
-          data: { outboundSinceInbound: { increment: 1 } },
-        });
-      }
-      return true;
-    }
-    if (cap !== undefined && identity.outboundSinceInbound + 1 >= cap) {
-      folded = await foldQueuedRows(deps, identity, row);
-    }
-    let attachment: MessagingOutboundAttachment | undefined;
-    const artifactId = folded ? null : fileArtifactId(row.idempotencyKey);
-    if (artifactId) {
-      // Scoped to the identity's Space: the drain runs across every Space.
-      const artifact = await deps.prisma.artifact.findFirst({
-        where: { id: artifactId, spaceId: identity.spaceId },
-        select: { name: true, mimeType: true, storageKey: true, userId: true },
-      });
-      if (!artifact) {
-        // Deleted since the reply was mirrored, or not in this Space.
-        await deps.prisma.messagingOutbound.update({
-          where: { id: row.id },
-          data: { status: "failed" },
-        });
-        return true;
-      }
-      attachmentName = artifact.name;
-      const data = await deps.artifacts.get(artifact.storageKey, {
-        ...context,
-        spaceId: identity.spaceId,
-        userId: artifact.userId,
-      });
-      attachment = { name: artifact.name, mimeType: artifact.mimeType, data };
-    }
-    const sent = await deps.messaging.sendToThread(
-      {
-        threadId,
-        body: folded?.body ?? row.body,
-        idempotencyKey: row.idempotencyKey,
-        ...(attachment ? { attachment } : {}),
-      },
-      context,
-    );
-    accepted = true;
-    await deps.prisma.messagingOutbound.updateMany({
-      where: { id: row.id },
-      data: { providerHandle: sent.handle },
-    });
-    for (const id of folded?.textRowIds ?? []) {
-      await deps.prisma.messagingOutbound.updateMany({
-        where: { id },
-        data: { providerHandle: sent.handle },
-      });
-    }
-    // Named in the message instead of sent.
-    for (const id of folded?.fileRowIds ?? []) {
-      await deps.prisma.messagingOutbound.updateMany({
-        where: { id },
-        data: { status: "failed" },
-      });
-    }
-    await deps.prisma.messagingIdentity.update({
-      where: { id: identity.id },
-      data: { outboundSinceInbound: { increment: 1 } },
-    });
-    return true;
-  } catch (error) {
-    if (accepted) {
-      // Keep the sent claim even if saving the handle or counter fails.
-      getLogger().error("messaging outbound bookkeeping error", error);
-      return true;
-    }
-    // The rows this send would have carried go back in line behind it.
-    for (const id of [...(folded?.textRowIds ?? []), ...(folded?.fileRowIds ?? [])]) {
-      await deps.prisma.messagingOutbound.updateMany({
-        where: { id, status: "sent" },
-        data: { status: "pending" },
-      });
-    }
-    // Transient provider errors go back to pending with a backed-off
-    // retry (no sooner than the provider's retry-after); a permanent error
-    // or an exhausted budget is terminal.
-    const failure = error instanceof MessagingSendError ? error : null;
-    const attempts = (row.attempts ?? 0) + 1;
-    const exhausted = failure?.permanent || attempts >= MESSAGING_OUTBOUND_MAX_ATTEMPTS;
-    const delayMs = Math.max(messagingOutboundRetryDelayMs(attempts), failure?.retryAfterMs ?? 0);
-    const retryAt = exhausted ? null : new Date(Date.now() + delayMs);
-    const outcome = {
-      where: { id: row.id },
-      data: {
-        attempts,
-        status: exhausted ? "failed" : "pending",
-        nextAttemptAt: retryAt,
-      },
-    };
-    if (exhausted && attachmentName) {
-      // The reply's text went out on its own rows; say the file did not
-      // follow instead of dropping it silently. Saved with the failure so
-      // one cannot land without the other, keyed so it is queued once, and
-      // given the file's place so later replies wait behind it.
-      const name = attachmentName;
-      await deps.prisma.$transaction(async (tx) => {
-        await tx.messagingOutbound.updateMany(outcome);
-        await tx.messagingOutbound.createMany({
-          data: [
-            {
-              idempotencyKey: `${row.idempotencyKey}:notice`,
-              kind: row.kind,
-              identityId: row.identityId,
-              threadId: row.threadId,
-              body: `Could not send "${name}".`,
-              sourceMessageId: row.sourceMessageId,
-              createdAt: row.createdAt,
-            },
-          ],
-          skipDuplicates: true,
-        });
-      });
-      await deps.jobs.enqueue(messagingDeliverJob());
-      return false;
-    }
-    await deps.prisma.messagingOutbound.updateMany(outcome);
-    if (!exhausted && retryAt) {
-      // Propagate an enqueue failure: the messaging.deliver job then fails
-      // and the queue's own retry re-runs the drain. Swallowing it would
-      // strand the row in pending — no reconciler reclaims outbox rows.
-      // Re-entry is safe: the row is pending again and nextAttemptAt keeps
-      // other drains from racing the backoff window.
-      await deps.jobs.enqueue(messagingDeliverJob(undefined, retryAt));
-    }
-    return false;
-  }
-}
-
-type FoldedRows = { body: string; textRowIds: string[]; fileRowIds: string[] };
-
-/**
- * The last send a capped provider allows before the owner writes again carries the replies
- * queued behind it: their text joined into one message, and their files named in a closing note
- * instead of sent. Rows that would make the message too long, and approval invites, stay queued
- * for the owner's next message. Null when nothing is queued behind the row.
- */
-async function foldQueuedRows(
-  deps: MessagingDeliveryDeps,
-  identity: IdentityRow & { spaceId: string },
-  row: MessagingOutboundRow,
-): Promise<FoldedRows | null> {
-  const queued = await deps.prisma.messagingOutbound.findMany({
-    where: { identityId: identity.id, status: "pending", createdAt: { gt: row.createdAt } },
-    orderBy: { createdAt: "asc" },
-  });
-  if (queued.length === 0) return null;
-  const limit = outboundPartLimit(identity.provider);
-  const texts: string[] = [];
-  const files: string[] = [];
-  const textRowIds: string[] = [];
-  const fileRowIds: string[] = [];
-  const fileName = async (artifactId: string) =>
-    (
-      await deps.prisma.artifact.findFirst({
-        where: { id: artifactId, spaceId: identity.spaceId },
-        select: { name: true },
-      })
-    )?.name ?? "file";
-  const headFile = fileArtifactId(row.idempotencyKey);
-  if (headFile) files.push(await fileName(headFile));
-  else if (row.body) texts.push(row.body);
-  for (const next of queued) {
-    if (connectInvitePair(next.idempotencyKey)) break;
-    const artifactId = fileArtifactId(next.idempotencyKey);
-    if (!artifactId && foldedBody([...texts, next.body], files).length > limit) break;
-    // Claimed like any send, so a concurrent drain never delivers it a second time.
-    const claim = await deps.prisma.messagingOutbound.updateMany({
-      where: { id: next.id, status: "pending" },
-      data: { status: "sent", nextAttemptAt: null },
-    });
-    if (claim.count === 0) break;
-    if (artifactId) {
-      files.push(await fileName(artifactId));
-      fileRowIds.push(next.id);
-    } else {
-      if (next.body) texts.push(next.body);
-      textRowIds.push(next.id);
-    }
-  }
-  if (textRowIds.length === 0 && fileRowIds.length === 0) return null;
-  return { body: foldedBody(texts, files), textRowIds, fileRowIds };
-}
+type FoldedRows = {
+  body: string;
+  /** When the folded rows were claimed, so only this send settles or releases them. */
+  claimedAt: Date;
+  textRowIds: string[];
+  fileRowIds: string[];
+};
 
 function foldedBody(texts: string[], files: string[]): string {
   const note = files.length
@@ -801,62 +1474,16 @@ function foldedBody(texts: string[], files: string[]): string {
   return [...texts, note].filter(Boolean).join("\n\n");
 }
 
-/** A claimed row still without a handle after this long is treated as abandoned. */
-const MESSAGING_ROW_IN_FLIGHT_MS = 2 * 60_000;
-
-/** True while an earlier row to the conversation is still pending or in flight. */
-async function hasUndeliveredEarlierRow(
-  deps: MessagingDeliveryDeps,
-  conversation: Conversation,
-  createdAt: Date,
-  now: number,
-): Promise<boolean> {
-  const earlier = await deps.prisma.messagingOutbound.findFirst({
-    where: {
-      ...conversation,
-      createdAt: { lt: createdAt },
-      OR: [
-        { status: "pending" },
-        {
-          status: "sent",
-          providerHandle: null,
-          updatedAt: { gt: new Date(now - MESSAGING_ROW_IN_FLIGHT_MS) },
-        },
-      ],
-    },
-    select: { id: true },
-  });
-  return earlier !== null;
+/** `connect:{requesterBotId}:{targetBotId}`: agent-connection approval DMs. */
+function connectInvitePair(
+  idempotencyKey: string,
+): { requesterBotId: string; targetBotId: string } | null {
+  const match = /^connect:([^:]+):([^:]+)$/.exec(idempotencyKey);
+  if (!match) return null;
+  return { requesterBotId: match[1]!, targetBotId: match[2]! };
 }
 
-/**
- * DM rows address the identity, not a thread: the conversation id is learned
- * from inbound webhooks and cached, with a provider lookup as fallback for
- * identities that predate the cache (or the multi-platform migration).
- */
-async function resolveDirectThread(
-  deps: MessagingDeliveryDeps,
-  identity: IdentityRow,
-  context: AdapterContext,
-): Promise<string> {
-  if (identity.dmThreadId) return identity.dmThreadId;
-  const threadId = await deps.messaging.openDirectThread(
-    identity.provider,
-    identity.address,
-    context,
-  );
-  await deps.prisma.messagingIdentity.update({
-    where: { id: identity.id },
-    data: { dmThreadId: threadId },
-  });
-  return threadId;
-}
-
-function messagingOutboundRetryDelayMs(attempts: number): number {
-  return Math.min(2 ** attempts * 1000, 60_000);
-}
-
-/** Outbound status webhooks update outbox rows by provider handle. */
+/** Outbound status webhooks update rows by provider handle. */
 export async function applyMessagingOutboundStatus(
   prisma: PrismaClient,
   event: MessagingOutboundStatus,

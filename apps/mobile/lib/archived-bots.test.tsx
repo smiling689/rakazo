@@ -1,15 +1,13 @@
 // @vitest-environment jsdom
 
-import type { ComputerStatus } from "@rakazo/contracts";
 import type { ReactNode } from "react";
 import { act, createElement, useEffect } from "react";
 import type { Root } from "react-dom/client";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ArchivedBots from "../app/(settings)/archived-bots";
-import { ComputerMaintenanceActions } from "../components/computer-maintenance-actions";
-import type { MobileBot, MobileGroup } from "./api";
 import { onArchivedChatsChanged } from "./archived-chats";
+import type { MobileBot, MobileGroup } from "./mobile-types";
 import { registerSettingsSheet } from "./settings-sheet";
 
 const { rpc, groupRpc, alert, push, closeSettingsSheet, navigation, focus, selectSpace } =
@@ -27,15 +25,19 @@ const { rpc, groupRpc, alert, push, closeSettingsSheet, navigation, focus, selec
 const bot = { id: "bot-fixture", name: "Fixture", spaceId: "space-a" } as MobileBot;
 const group = { id: "group-fixture", name: "Crew", spaceId: "space-a" } as MobileGroup;
 vi.mock("./side-insets", () => ({ useSideInsets: () => ({}) }));
+vi.mock("./api-auth", () => ({}));
+vi.mock("./api-live", () => ({}));
 vi.mock("./api", () => ({
   captureApiRequestContext: async () => ({ apiBase: "https://example.test", headers: {} }),
-  selectSpace,
   rpc: (procedure: string, ...args: unknown[]) =>
     procedure === "spaces/list"
       ? Promise.resolve({ spaces: [{ id: "space-a" }] })
       : procedure.startsWith("groups/")
         ? groupRpc(procedure, ...args)
         : rpc(procedure, ...args),
+}));
+vi.mock("./api-server", () => ({
+  selectSpace,
 }));
 vi.mock("expo-router", () => ({
   useRouter: () => ({ push }),
@@ -64,17 +66,11 @@ vi.mock("./search-inbox", () => ({
   searchInboxSession: () => ({ generation: 3, apiBase: "http://api.test" }),
 }));
 vi.mock("./native-controls", () => ({ iosAtLeast: () => true }));
-vi.mock("./computer-updates", () => ({ computerUpdates: { start: vi.fn() } }));
-vi.mock("@expo/ui/community/menu", () => ({ MenuView: () => null }));
 vi.mock("../components/native-symbol", () => ({ NativeSymbol: () => null }));
 vi.mock("../components/native-action-button", () => ({
   NativeActionButton: ({ label, onPress }: { label: string; onPress: () => void }) =>
     createElement("button", { type: "button", onClick: onPress }, label),
 }));
-vi.mock("./i18n", () => {
-  const t = (text: string) => text;
-  return { t, useI18n: () => ({ t }) };
-});
 vi.mock("../components/archived-bot-list", () => ({
   ArchivedBotList: ({
     bots,
@@ -664,19 +660,4 @@ describe("archived chat read failures", () => {
       expect(alert).toHaveBeenCalledTimes(alerts);
     },
   );
-
-  it("clears a computer's native header menu when its actions unmount", async () => {
-    await act(async () =>
-      root.render(
-        <ComputerMaintenanceActions
-          botId="bot-fixture"
-          computer={{ state: "running" } as ComputerStatus}
-          onChanged={async () => {}}
-        />,
-      ),
-    );
-    expect(navigation.setOptions.mock.lastCall![0].unstable_headerRightItems()).toHaveLength(1);
-    await act(async () => root.render(null));
-    expect(navigation.setOptions.mock.lastCall![0].unstable_headerRightItems()).toEqual([]);
-  });
 });
