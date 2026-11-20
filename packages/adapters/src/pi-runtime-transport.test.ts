@@ -127,6 +127,22 @@ describe("Pi runtime transport", () => {
     },
   );
 
+  it("keys the session per model so a gateway pin for one model cannot capture another", () => {
+    const options = { sessionId: "thread-1:bot-1" };
+    const modelA = { provider: "openai-compatible", api: "openai-responses", id: "gpt-a" };
+    const modelB = { ...modelA, id: "gpt-b" };
+
+    const first = reliableStreamOptions(modelA as Model<Api>, options);
+    expect(first.sessionId).toBe("thread-1:bot-1:gpt-a");
+    expect(reliableStreamOptions(modelB as Model<Api>, options).sessionId).toBe(
+      "thread-1:bot-1:gpt-b",
+    );
+    expect(reliableStreamOptions(modelA as Model<Api>, first).sessionId).toBe(
+      "thread-1:bot-1:gpt-a",
+    );
+    expect(reliableStreamOptions(modelA as Model<Api>, {}).sessionId).toBeUndefined();
+  });
+
   it("generates an OpenCode session id when the agent did not provide one", () => {
     const model = { provider: "opencode-go", api: "openai-completions" } as Model<Api>;
     const result = reliableStreamOptions(model, { transport: "auto" });
