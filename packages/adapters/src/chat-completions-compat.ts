@@ -11,6 +11,7 @@ export function withChatCompletionsCompatibility<O extends SimpleStreamOptions>(
   model: Pick<Model<Api>, "api" | "id" | "baseUrl">,
   options: O,
 ): O {
+  if (model.api === "openai-responses") return withResponsesToolCompatibility(options);
   if (model.api !== "openai-completions") return options;
   const previous = options.onPayload;
   const stringContent = requiresStringContent(model);
@@ -21,6 +22,36 @@ export function withChatCompletionsCompatibility<O extends SimpleStreamOptions>(
       return normalizeChatCompletionsPayload(replaced ?? payload, { stringContent }) ?? replaced;
     },
   };
+}
+
+/**
+ * Responses gateways compile tool schemas strictly as well (Copilot answers 400 "Unimplemented keys:
+ * [uniqueItems]" for ask_user's options), so their function tools get the same keyword cleanup.
+ */
+function withResponsesToolCompatibility<O extends SimpleStreamOptions>(options: O): O {
+  const previous = options.onPayload;
+  return {
+    ...options,
+    async onPayload(payload, requestModel) {
+      const replaced = await previous?.(payload, requestModel);
+      const current = replaced ?? payload;
+      if (!isRecord(current) || !Array.isArray(current.tools)) return replaced;
+      const tools = normalizeResponsesTools(current.tools);
+      return tools ? { ...current, tools } : replaced;
+    },
+  };
+}
+
+function normalizeResponsesTools(tools: unknown[]): unknown[] | undefined {
+  let changed = false;
+  const next = tools.map((tool) => {
+    if (!isRecord(tool) || tool.type !== "function" || !("parameters" in tool)) return tool;
+    const parameters = withoutUnsupportedKeywords(tool.parameters);
+    if (parameters === tool.parameters) return tool;
+    changed = true;
+    return { ...tool, parameters };
+  });
+  return changed ? next : undefined;
 }
 
 /** Workers AI validates every message's content as a string, including tool-call turns. */
