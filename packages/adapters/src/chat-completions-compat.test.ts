@@ -255,3 +255,31 @@ it("leaves other protocols to their own adapters", () => {
     ),
   ).toBe(options);
 });
+
+it("drops unsupported keywords from Responses function tools and keeps other tools", async () => {
+  const options = withChatCompletionsCompatibility(
+    { api: "openai-responses", id: "fixture", baseUrl: "https://model.example.test/v1" },
+    { apiKey: "fixture-key" } as SimpleStreamOptions,
+  );
+  const options_ = { type: "array", items: { type: "string" }, maxItems: 4, uniqueItems: true };
+  const payload = {
+    input: [],
+    tools: [
+      {
+        type: "function",
+        name: "ask_user",
+        strict: false,
+        parameters: { type: "object", properties: { options: options_ } },
+      },
+      { type: "web_search" },
+    ],
+  };
+  const sent = (await options.onPayload?.(payload, {} as Model<Api>)) as typeof payload;
+  expect(sent.tools[0]).toMatchObject({
+    name: "ask_user",
+    parameters: { properties: { options: { maxItems: 4 } } },
+  });
+  expect(JSON.stringify(sent.tools)).not.toContain("uniqueItems");
+  expect(sent.tools[1]).toBe(payload.tools[1]);
+  expect(await options.onPayload?.({ input: [] }, {} as Model<Api>)).toBeUndefined();
+});
