@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const summarize = vi.hoisted(() => vi.fn(async () => "## Goals and requests\n- 新摘要"));
+const summarize = vi.hoisted(() =>
+  vi.fn(async (..._args: unknown[]) => "## Goals and requests\n- 新摘要"),
+);
 vi.mock("./history-compaction.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   summarizeConversation: summarize,
@@ -227,6 +229,39 @@ describe("compactSessionHistory", () => {
       historyCompactionSummary: "## Goals and requests\n- 新摘要",
     });
     expect(done.runCreate).not.toHaveBeenCalled();
+  });
+
+  it("shortens an oversized summary once before saving it", async () => {
+    const h = harness({
+      messages: 30,
+      charsEach: 1_000,
+      minutesSinceLast: 90,
+      flush: { seq: 9, status: "completed" },
+    });
+    summarize.mockResolvedValueOnce("长".repeat(21_000)).mockResolvedValueOnce("## Done\n- 短");
+    await compactSessionHistory(h.deps as never, { threadId: "thread-1" }, now);
+    expect(summarize).toHaveBeenCalledTimes(2);
+    expect(summarize.mock.calls[1]![2]).toMatchObject({
+      prompt: expect.stringContaining("长".repeat(100)),
+      operationKey: "-1:shorten",
+    });
+    expect(h.thread).toMatchObject({
+      historyCompactedUpToSeq: 9,
+      historyCompactionSummary: "## Done\n- 短",
+    });
+  });
+
+  it("keeps the old summary and backs off when the shortened one is still too long", async () => {
+    const h = harness({
+      messages: 30,
+      charsEach: 1_000,
+      minutesSinceLast: 90,
+      flush: { seq: 9, status: "completed" },
+    });
+    summarize.mockResolvedValueOnce("长".repeat(21_000)).mockResolvedValueOnce("长".repeat(20_001));
+    await compactSessionHistory(h.deps as never, { threadId: "thread-1" }, now);
+    expect(summarize).toHaveBeenCalledTimes(2);
+    expect(h.thread.historyCompactedUpToSeq).not.toBe(9);
   });
 
   it("folds a large range in several passes and folds even after a stuck flush", async () => {
