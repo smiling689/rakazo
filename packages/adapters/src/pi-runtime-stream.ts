@@ -255,7 +255,7 @@ function hasHeader(headers: ProviderHeaders | undefined, name: string): boolean 
 
 export function reliableStreamOptions(
   model: Pick<Model<Api>, "api" | "provider" | "maxTokens" | "reasoning"> &
-    Partial<Pick<Model<Api>, "contextWindow">>,
+    Partial<Pick<Model<Api>, "contextWindow" | "id">>,
   options?: ModelsSimpleStreamOptions,
   configuredMaxTokens?: number,
   accessToken?: string | (() => string | undefined),
@@ -275,6 +275,14 @@ export function reliableStreamOptions(
       operatorMaxTokens(model),
     ),
   };
+
+  // The session id becomes the provider's cache key (prompt_cache_key, session headers). A
+  // gateway may pin that key to the upstream that first served it, so one key shared by every
+  // model sends a switch to a model only another upstream serves (a backup, a new default) to
+  // the pinned one, which refuses it. Prompt caches are per model anyway.
+  const sessionId = next.sessionId?.trim();
+  if (sessionId && model.id && !sessionId.endsWith(`:${model.id}`))
+    next = { ...next, sessionId: `${sessionId}:${model.id}` };
 
   if (isCodexModel(model)) {
     // Pi cannot fall back after a WebSocket has emitted its start event. Long tool
